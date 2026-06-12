@@ -18,6 +18,14 @@ VPS 一键搭建代理节点脚本，基于 [sing-box](https://github.com/SagerN
 
 ## 快速开始
 
+一键运行（远程拉取）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/0nevps/main/onevps.sh)
+```
+
+或下载后本地运行：
+
 ```bash
 sudo bash onevps.sh
 ```
