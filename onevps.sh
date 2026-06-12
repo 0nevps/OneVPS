@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # OneVPS — sing-box 节点搭建脚本
-# 协议: VLESS (Reality / WS+CF)  /  Hysteria2
+# 协议: VLESS (Reality / WS+CF)  /  Hysteria2  /  SOCKS5
 # 特性: 可选 Cloudflare CDN  /  可选 SOCKS5 落地
 #
 set -euo pipefail
@@ -279,6 +279,7 @@ rebuild_config() {
     case "$type" in
       vless)     ib=$(build_vless_inbound "$n" "$email") ;;
       hysteria2) ib=$(build_hy2_inbound   "$n" "$email") ;;
+      socks5)    ib=$(build_socks5_inbound "$n") ;;
       *) continue ;;
     esac
     inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds")
@@ -410,6 +411,20 @@ build_hy2_inbound() {
       type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
       users:[{password:$pass}],
       tls:$tls
+    }'
+}
+
+# --- SOCKS5 inbound ---
+build_socks5_inbound() {
+  local n="$1"
+  jq -n \
+    --arg tag "$(jq -r '.tag' <<<"$n")" \
+    --argjson port "$(jq -r '.port' <<<"$n")" \
+    --arg user "$(jq -r '.username' <<<"$n")" \
+    --arg pass "$(jq -r '.password' <<<"$n")" '
+    {
+      type:"socks", tag:$tag, listen:"::", listen_port:$port,
+      users:[{username:$user, password:$pass}]
     }'
 }
 
@@ -634,6 +649,56 @@ add_hysteria2() {
 }
 
 # ----------------------------------------------------------------------------
+# [6] 添加 SOCKS5 节点
+# ----------------------------------------------------------------------------
+add_socks5() {
+  require_must
+  echo; info "添加 SOCKS5 节点"
+  local name port user pass socks5
+
+  name=$(ask "节点名称" "socks5-$(openssl rand -hex 2)")
+
+  while :; do
+    port=$(ask "监听端口" "1080")
+    [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
+    if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
+    if port_in_use "$port"; then
+      confirm "端口 $port 似乎已被占用,仍使用?" n || continue
+    fi
+    break
+  done
+
+  user=$(ask "认证用户名" "user-$(openssl rand -hex 2)")
+  pass=$(rand_pass)
+
+  socks5=$(ask_socks5)
+
+  local id; id=$(openssl rand -hex 4)
+  local node
+  node=$(jq -n \
+    --arg id "$id" --arg name "$name" --arg tag "socks5-$id" \
+    --argjson port "$port" --arg user "$user" --arg pass "$pass" '
+    {id:$id,type:"socks5",name:$name,tag:$tag,port:$port,
+     username:$user,password:$pass,enabled:true}')
+  if [[ -n "$socks5" ]]; then
+    node=$(jq -c --argjson s "$socks5" '. + {socks5:$s}' <<<"$node")
+  fi
+
+  tmp_nodes ".nodes += [$node]"
+  open_port "$port" tcp
+
+  if rebuild_config; then
+    ok "SOCKS5 节点已添加"
+    node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
+  else
+    err "配置生成失败,已回滚"
+    tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
+    rebuild_config || true
+  fi
+  pause
+}
+
+# ----------------------------------------------------------------------------
 # 分享链接
 # ----------------------------------------------------------------------------
 urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
@@ -645,8 +710,14 @@ node_link() {
   name=$(jq -r '.name' <<<"$n")
   local transport; transport=$(jq -r '.transport // ""' <<<"$n")
 
-  local link
-  if [[ "$type" == vless ]]; then
+  local link=""
+  if [[ "$type" == socks5 ]]; then
+    addr="$(pub_ip)"
+    local user pass
+    user=$(jq -r '.username' <<<"$n")
+    pass=$(jq -r '.password' <<<"$n")
+    link="socks5://${user}:${pass}@${addr}:${port}#$(urlenc "$name")"
+  elif [[ "$type" == vless ]]; then
     local uuid
     uuid=$(jq -r '.uuid' <<<"$n")
 
@@ -677,9 +748,10 @@ node_link() {
   fi
 
   echo
-  printf '%s── %s (%s%s) ──%s\n' "$c_grn" "$name" "$type" \
-    "$([[ "$transport" == "reality" ]] && echo "+reality" || ([[ "$transport" == "ws" ]] && echo "+ws+cf" || echo ""))" \
-    "$c_rst"
+  local suffix=""
+  [[ "$transport" == "reality" ]] && suffix="+reality"
+  [[ "$transport" == "ws" ]] && suffix="+ws+cf"
+  printf '%s── %s (%s%s) ──%s\n' "$c_grn" "$name" "$type" "$suffix" "$c_rst"
   echo "$link"
   if jq -e '.socks5' <<<"$n" >/dev/null 2>&1; then
     printf '%sSOCKS5 落地: %s:%s%s\n' "$c_ylw" \
@@ -705,9 +777,12 @@ list_nodes() {
     local en st tp
     en=$(jq -r '.enabled' <<<"$n"); st="启用"; [[ "$en" == true ]] || st="停用"
     tp=$(jq -r '.transport // ""' <<<"$n")
+    local mode=""
+    [[ "$tp" == "reality" ]] && mode="reality"
+    [[ "$tp" == "ws" ]] && mode="ws+cf"
     printf '  %d) %-16s %-9s %-8s 端口:%-6s %s\n' \
       "$i" "$(jq -r '.name' <<<"$n")" "$(jq -r '.type' <<<"$n")" \
-      "$([[ "$tp" == "reality" ]] && echo "reality" || ([[ "$tp" == "ws" ]] && echo "ws+cf" || echo ""))" \
+      "$mode" \
       "$(jq -r '.port' <<<"$n")" \
       "$([[ "$en" == true ]] && echo "$st" || echo "${c_ylw}$st${c_rst}")"
   done < <(jq -c '.nodes[]' "$SB_NODES")
@@ -806,13 +881,17 @@ edit_port() {
 reset_secret() {
   local id="$1" type
   type=$(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|.type' "$SB_NODES")
-  if [[ "$type" == vless ]]; then
-    tmp_nodes "(.nodes[]|select(.id==\"$id\")).uuid = \"$(rand_uuid)\""
-    ok "UUID 已重置"
-  else
-    tmp_nodes "(.nodes[]|select(.id==\"$id\")).password = \"$(rand_pass)\""
-    ok "密码已重置"
-  fi
+  case "$type" in
+    vless)
+      tmp_nodes "(.nodes[]|select(.id==\"$id\")).uuid = \"$(rand_uuid)\""
+      ok "UUID 已重置" ;;
+    socks5)
+      tmp_nodes "(.nodes[]|select(.id==\"$id\")).password = \"$(rand_pass)\""
+      ok "密码已重置 (用户名不变)" ;;
+    *)
+      tmp_nodes "(.nodes[]|select(.id==\"$id\")).password = \"$(rand_pass)\""
+      ok "密码已重置" ;;
+  esac
   rebuild_config && ok "已应用" || err "应用失败"
   pause
 }
@@ -905,20 +984,22 @@ EOF
   1) 安装 / 更新 sing-box
   2) 添加节点 — VLESS (Reality / WS+CF)
   3) 添加节点 — Hysteria2
-  4) 管理节点
-  5) 查看全部分享链接
-  6) 重启服务
-  7) 卸载
+  4) 添加节点 — SOCKS5
+  5) 管理节点
+  6) 查看全部分享链接
+  7) 重启服务
+  8) 卸载
   0) 退出
 EOF
     case "$(ask '选择')" in
       1) install_singbox; pause ;;
       2) add_vless ;;
       3) add_hysteria2 ;;
-      4) manage_nodes ;;
-      5) show_links ;;
-      6) restart_service ;;
-      7) uninstall ;;
+      4) add_socks5 ;;
+      5) manage_nodes ;;
+      6) show_links ;;
+      7) restart_service ;;
+      8) uninstall ;;
       0|"") exit 0 ;;
       *) ;;
     esac
