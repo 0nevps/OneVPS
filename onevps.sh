@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# OneVPS — sing-box 节点搭建脚本
-# 协议: VLESS (Reality / WS+CF)  /  Hysteria2  /  SOCKS5
-# 特性: 可选 Cloudflare CDN  /  可选 SOCKS5 落地
+# OneVPS — sing-box node setup script
+# Protocols: VLESS (Reality / WS+CF)  /  Hysteria2  /  SOCKS5
+# Features: optional Cloudflare CDN  /  optional SOCKS5 egress
 #
 set -euo pipefail
 
 # ----------------------------------------------------------------------------
-# 常量
+# Constants
 # ----------------------------------------------------------------------------
 SB_DIR=/etc/sing-box
 SB_BIN=/usr/local/bin/sing-box
@@ -16,6 +16,7 @@ SB_NODES=$SB_DIR/nodes.json
 SB_CERT_DIR=$SB_DIR/certs
 SB_SERVICE=/etc/systemd/system/sing-box.service
 GH_REPO=SagerNet/sing-box
+TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 
 CF_PORTS=(443 2053 2083 2087 2096 8443)
 REALITY_DESTS=("www.microsoft.com" "www.apple.com" "www.samsung.com" "gateway.icloud.com" "www.lovelive-anime.jp")
@@ -25,7 +26,7 @@ ARCH=""
 PUBIP=""
 
 # ----------------------------------------------------------------------------
-# 输出
+# Output
 # ----------------------------------------------------------------------------
 c_red=$'\e[31m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_blu=$'\e[36m'; c_rst=$'\e[0m'
 info() { printf '%s[*]%s %s\n' "$c_blu" "$c_rst" "$*"; }
@@ -53,10 +54,10 @@ ask() {
   fi
 }
 
-pause() { read -rp $'\n回车继续...' _ || true; }
+pause() { read -rp $'\nPress Enter to continue...' _ || true; }
 
 # ----------------------------------------------------------------------------
-# 随机值
+# Random values
 # ----------------------------------------------------------------------------
 rand_uuid() {
   if [[ -x "$SB_BIN" ]]; then "$SB_BIN" generate uuid; return; fi
@@ -80,7 +81,7 @@ reality_keypair() {
   if [[ -x "$SB_BIN" ]]; then
     "$SB_BIN" generate reality-keypair
   else
-    die "需先安装 sing-box 才能生成 Reality 密钥对"
+    die "sing-box must be installed before generating a Reality keypair"
   fi
 }
 
@@ -92,26 +93,26 @@ pub_ip() {
 }
 
 # ----------------------------------------------------------------------------
-# [1] 环境检测
+# [1] Environment check
 # ----------------------------------------------------------------------------
 check_env() {
-  [[ $EUID -eq 0 ]] || die "需 root 运行 (sudo bash $0)"
-  command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd,本脚本依赖 systemd 管理服务"
+  [[ $EUID -eq 0 ]] || die "must run as root (sudo bash $0)"
+  command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script relies on systemd to manage services"
 
   case "$(uname -m)" in
     x86_64|amd64)        ARCH=amd64 ;;
     aarch64|arm64)       ARCH=arm64 ;;
     armv7l|armv7|armhf)  ARCH=armv7 ;;
-    *) die "不支持的架构: $(uname -m)" ;;
+    *) die "unsupported architecture: $(uname -m)" ;;
   esac
 
   if   command -v apt-get >/dev/null 2>&1; then PKG=apt
   elif command -v dnf     >/dev/null 2>&1; then PKG=dnf
   elif command -v yum     >/dev/null 2>&1; then PKG=yum
   elif command -v apk     >/dev/null 2>&1; then PKG=apk
-  else die "未识别的包管理器 (支持 apt/dnf/yum/apk)"; fi
+  else die "unrecognized package manager (apt/dnf/yum/apk supported)"; fi
 
-  ok "环境 OK — 架构:$ARCH  包管理:$PKG  systemd:yes"
+  ok "environment OK — arch:$ARCH  pkg:$PKG  systemd:yes"
 }
 
 pkg_install() {
@@ -129,13 +130,13 @@ ensure_deps() {
     command -v "$bin" >/dev/null 2>&1 || need+=("$bin")
   done
   if ((${#need[@]})); then
-    info "安装依赖: ${need[*]}"
-    pkg_install "${need[@]}" || die "依赖安装失败: ${need[*]}"
+    info "installing dependencies: ${need[*]}"
+    pkg_install "${need[@]}" || die "failed to install dependencies: ${need[*]}"
   fi
 }
 
 # ----------------------------------------------------------------------------
-# [2] 安装 / 更新 sing-box
+# [2] Install / update sing-box
 # ----------------------------------------------------------------------------
 latest_version() {
   curl -fsSL "https://api.github.com/repos/$GH_REPO/releases/latest" \
@@ -149,29 +150,29 @@ installed_version() {
 install_singbox() {
   ensure_deps
   local latest cur
-  info "查询最新版本..."
-  latest=$(latest_version) || die "无法获取最新版本"
-  [[ -n "$latest" ]] || die "解析最新版本失败"
+  info "checking latest version..."
+  latest=$(latest_version) || die "failed to fetch latest version"
+  [[ -n "$latest" ]] || die "failed to parse latest version"
   cur=$(installed_version)
 
   if [[ -n "$cur" ]]; then
     if [[ "$cur" == "$latest" ]]; then
-      ok "已是最新版 sing-box $cur"
-      confirm "强制重装?" n || return 0
+      ok "sing-box $cur is already the latest version"
+      confirm "Force reinstall?" n || return 0
     else
-      info "当前 $cur → 最新 $latest"
-      confirm "更新?" y || return 0
+      info "current $cur → latest $latest"
+      confirm "Update?" y || return 0
     fi
   else
-    info "将安装 sing-box $latest"
+    info "will install sing-box $latest"
   fi
 
   local url tmp
   url="https://github.com/$GH_REPO/releases/download/v${latest}/sing-box-${latest}-linux-${ARCH}.tar.gz"
   tmp=$(mktemp -d)
-  info "下载 $url"
-  curl -fsSL "$url" -o "$tmp/sb.tar.gz" || { rm -rf "$tmp"; die "下载失败"; }
-  tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || { rm -rf "$tmp"; die "解压失败"; }
+  info "downloading $url"
+  curl -fsSL "$url" -o "$tmp/sb.tar.gz" || { rm -rf "$tmp"; die "download failed"; }
+  tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || { rm -rf "$tmp"; die "extraction failed"; }
   install -m755 "$tmp/sing-box-${latest}-linux-${ARCH}/sing-box" "$SB_BIN"
   rm -rf "$tmp"
 
@@ -180,7 +181,7 @@ install_singbox() {
 
   write_service
   rebuild_config
-  ok "sing-box $(installed_version) 安装完成"
+  ok "sing-box $(installed_version) installed"
 }
 
 write_service() {
@@ -205,7 +206,7 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-# 防火墙 / 端口
+# Firewall / ports
 # ----------------------------------------------------------------------------
 open_port() {
   local p="$1" proto="$2"
@@ -231,10 +232,10 @@ port_taken_by_node() {
   jq -e --argjson p "$1" '.nodes[]|select(.port==$p)' "$SB_NODES" >/dev/null 2>&1
 }
 
-require_must() { command -v "$SB_BIN" >/dev/null 2>&1 || die "请先执行菜单 [1] 安装 sing-box"; }
+require_must() { command -v "$SB_BIN" >/dev/null 2>&1 || die "run menu option [1] to install sing-box first"; }
 
 # ----------------------------------------------------------------------------
-# 证书(仅 WS+CF 和 Hysteria2 用)
+# Certificates (only used by WS+CF and Hysteria2)
 # ----------------------------------------------------------------------------
 gen_self_cert() {
   local cn="$1" crt key
@@ -251,14 +252,14 @@ acme_email() {
   local e
   e=$(jq -r '.acme_email // ""' "$SB_NODES")
   if [[ -z "$e" ]]; then
-    e=$(ask "ACME 注册邮箱(Let's Encrypt 通知用)" "admin@$(hostname -f 2>/dev/null || echo example.com)")
+    e=$(ask "ACME registration email (for Let's Encrypt notices)" "admin@$(hostname -f 2>/dev/null || echo example.com)")
     tmp_nodes ".acme_email=\"$e\""
   fi
   echo "$e"
 }
 
 # ----------------------------------------------------------------------------
-# [3] 节点存储 + config 生成
+# [3] Node storage + config generation
 # ----------------------------------------------------------------------------
 tmp_nodes() {
   local expr="$1"
@@ -323,7 +324,7 @@ rebuild_config() {
 
   if [[ -x "$SB_BIN" ]]; then
     if ! "$SB_BIN" check -c "$SB_CONF" 2>/tmp/sb_check.err; then
-      err "生成的配置校验失败:"; cat /tmp/sb_check.err >&2
+      err "generated config failed validation:"; cat /tmp/sb_check.err >&2
       return 1
     fi
     systemctl restart sing-box 2>/dev/null || true
@@ -438,17 +439,17 @@ build_socks5_inbound() {
 }
 
 # ----------------------------------------------------------------------------
-# SOCKS5 落地交互
+# SOCKS5 egress prompts
 # ----------------------------------------------------------------------------
 ask_socks5() {
-  confirm "追加 SOCKS5 落地(节点全部流量走此 SOCKS5)?" n || { echo ""; return; }
+  confirm "Attach SOCKS5 egress (all traffic of this node exits via the SOCKS5)?" n || { echo ""; return; }
   local srv port user pass
-  srv=$(ask "SOCKS5 服务器地址")
-  [[ -n "$srv" ]] || { warn "地址为空,跳过 SOCKS5"; echo ""; return; }
-  port=$(ask "SOCKS5 端口" "1080")
-  user=$(ask "用户名(无认证留空)" "")
+  srv=$(ask "SOCKS5 server address")
+  [[ -n "$srv" ]] || { warn "address empty, skipping SOCKS5"; echo ""; return; }
+  port=$(ask "SOCKS5 port" "1080")
+  user=$(ask "Username (leave empty for no auth)" "")
   if [[ -n "$user" ]]; then
-    pass=$(ask "密码" "")
+    pass=$(ask "Password" "")
   fi
   jq -n --arg s "$srv" --argjson p "$port" --arg u "$user" --arg w "${pass:-}" '
     {server:$s, port:$p}
@@ -456,18 +457,18 @@ ask_socks5() {
 }
 
 # ----------------------------------------------------------------------------
-# [4] 添加 VLESS 节点
+# [4] Add VLESS node
 # ----------------------------------------------------------------------------
 add_vless() {
   require_must
-  echo; info "添加 VLESS 节点"
+  echo; info "Add VLESS node"
 
   local name uuid id socks5
-  name=$(ask "节点名称" "vless-$(openssl rand -hex 2)")
+  name=$(ask "Node name" "vless-$(openssl rand -hex 2)")
   uuid=$(rand_uuid)
   id=$(openssl rand -hex 4)
 
-  if confirm "启用 Cloudflare CDN?" n; then
+  if confirm "Enable Cloudflare CDN?" n; then
     add_vless_ws "$id" "$name" "$uuid"
   else
     add_vless_reality "$id" "$name" "$uuid"
@@ -476,30 +477,30 @@ add_vless() {
 
 add_vless_reality() {
   local id="$1" name="$2" uuid="$3"
-  info "模式: VLESS + Reality (直连,无需域名/证书)"
+  info "Mode: VLESS + Reality (direct, no domain/cert needed)"
 
   local port sni dest socks5
   while :; do
-    port=$(ask "监听端口(回车随机)" "$(rand_port)")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
-    if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
+    port=$(ask "Listen port (Enter for random)" "$(rand_port)")
+    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
+    if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
     if port_in_use "$port"; then
-      confirm "端口 $port 似乎已被占用,仍使用?" n || continue
+      confirm "Port $port appears to be in use. Use anyway?" n || continue
     fi
     break
   done
 
-  echo; info "Reality 伪装目标站(需为支持 TLS 1.3 和 H2 的大站):"
+  echo; info "Reality handshake target (must be a major site with TLS 1.3 + H2):"
   local i=0
   for d in "${REALITY_DESTS[@]}"; do
     i=$((i+1))
     echo "  $i) $d"
   done
-  echo "  0) 自定义"
+  echo "  0) custom"
   local sel
-  sel=$(ask "选择" "1")
+  sel=$(ask "Select" "1")
   if [[ "$sel" == "0" ]]; then
-    dest=$(ask "目标站域名")
+    dest=$(ask "Target domain")
   elif [[ "$sel" =~ ^[0-9]+$ ]] && ((sel>=1 && sel<=${#REALITY_DESTS[@]})); then
     dest="${REALITY_DESTS[$((sel-1))]}"
   else
@@ -507,7 +508,7 @@ add_vless_reality() {
   fi
   sni="$dest"
 
-  info "生成 Reality 密钥对..."
+  info "generating Reality keypair..."
   local kp pk pubk sid
   kp=$(reality_keypair)
   pk=$(echo "$kp" | awk '/PrivateKey:/{print $2}')
@@ -535,10 +536,10 @@ add_vless_reality() {
   open_port "$port" tcp
 
   if rebuild_config; then
-    ok "VLESS + Reality 节点已添加"
+    ok "VLESS + Reality node added"
     node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
   else
-    err "配置生成失败,已回滚"
+    err "config generation failed, rolled back"
     tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
     rebuild_config || true
   fi
@@ -547,22 +548,22 @@ add_vless_reality() {
 
 add_vless_ws() {
   local id="$1" name="$2" uuid="$3"
-  info "模式: VLESS + WebSocket + CF CDN (需域名)"
+  info "Mode: VLESS + WebSocket + CF CDN (domain required)"
 
   local domain port path socks5
-  domain=$(ask "域名(已在 CF 托管,A 记录指向 VPS,橙云开启)")
-  [[ -n "$domain" ]] || die "域名为空"
+  domain=$(ask "Domain (hosted on CF, A record pointing to this VPS, orange cloud on)")
+  [[ -n "$domain" ]] || die "domain is empty"
 
-  info "CF 回源端口仅支持: ${CF_PORTS[*]}"
+  info "CF origin ports allowed: ${CF_PORTS[*]}"
   while :; do
-    port=$(ask "监听端口" "443")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
+    port=$(ask "Listen port" "443")
+    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
     if ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$port"; then
-      warn "CF 模式端口须为: ${CF_PORTS[*]}"; continue
+      warn "CF mode requires one of: ${CF_PORTS[*]}"; continue
     fi
-    if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
+    if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
     if port_in_use "$port"; then
-      confirm "端口 $port 似乎已被占用,仍使用?" n || continue
+      confirm "Port $port appears to be in use. Use anyway?" n || continue
     fi
     break
   done
@@ -586,11 +587,11 @@ add_vless_ws() {
   open_port "$port" tcp
 
   if rebuild_config; then
-    ok "VLESS + WS + CF 节点已添加"
-    warn "请确保 CF 面板 SSL/TLS 设为 \"完全(Full)\""
+    ok "VLESS + WS + CF node added"
+    warn "Make sure CF dashboard SSL/TLS is set to \"Full\""
     node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
   else
-    err "配置生成失败,已回滚"
+    err "config generation failed, rolled back"
     tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
     rebuild_config || true
   fi
@@ -598,32 +599,32 @@ add_vless_ws() {
 }
 
 # ----------------------------------------------------------------------------
-# [5] 添加 Hysteria2
+# [5] Add Hysteria2
 # ----------------------------------------------------------------------------
 add_hysteria2() {
   require_must
-  echo; info "添加 Hysteria2 节点 (QUIC/UDP, 直连不支持 CF)"
+  echo; info "Add Hysteria2 node (QUIC/UDP, direct only — no CF support)"
   local name domain tls port pass socks5
 
-  name=$(ask "节点名称" "hy2-$(openssl rand -hex 2)")
+  name=$(ask "Node name" "hy2-$(openssl rand -hex 2)")
 
-  if confirm "使用域名?" n; then
-    domain=$(ask "域名(已解析到本机)")
-    [[ -n "$domain" ]] || die "域名为空"
-    if confirm "用 ACME 申请真证书? (需 80 端口可用且域名直连本机)" y; then
+  if confirm "Use a domain?" n; then
+    domain=$(ask "Domain (already resolving to this server)")
+    [[ -n "$domain" ]] || die "domain is empty"
+    if confirm "Request a real cert via ACME? (needs port 80 free and domain pointing directly here)" y; then
       tls=acme
     else
-      tls=self; warn "自签证书,客户端需开启 insecure"
+      tls=self; warn "self-signed cert; client must enable insecure"
     fi
   else
     domain=""; tls=self
-    warn "无域名: 自签证书,客户端需开启 insecure"
+    warn "no domain: self-signed cert; client must enable insecure"
   fi
 
   while :; do
-    port=$(ask "监听端口/UDP(回车随机)" "$(rand_port)")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
-    if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
+    port=$(ask "Listen port/UDP (Enter for random)" "$(rand_port)")
+    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
+    if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
     break
   done
 
@@ -647,10 +648,10 @@ add_hysteria2() {
   open_port "$port" udp
 
   if rebuild_config; then
-    ok "Hysteria2 节点已添加"
+    ok "Hysteria2 node added"
     node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
   else
-    err "配置生成失败,已回滚"
+    err "config generation failed, rolled back"
     tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
     rebuild_config || true
   fi
@@ -658,26 +659,26 @@ add_hysteria2() {
 }
 
 # ----------------------------------------------------------------------------
-# [6] 添加 SOCKS5 节点
+# [6] Add SOCKS5 node
 # ----------------------------------------------------------------------------
 add_socks5() {
   require_must
-  echo; info "添加 SOCKS5 节点"
+  echo; info "Add SOCKS5 node"
   local name port user pass socks5
 
-  name=$(ask "节点名称" "socks5-$(openssl rand -hex 2)")
+  name=$(ask "Node name" "socks5-$(openssl rand -hex 2)")
 
   while :; do
-    port=$(ask "监听端口(回车随机)" "$(rand_port)")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
-    if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
+    port=$(ask "Listen port (Enter for random)" "$(rand_port)")
+    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
+    if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
     if port_in_use "$port"; then
-      confirm "端口 $port 似乎已被占用,仍使用?" n || continue
+      confirm "Port $port appears to be in use. Use anyway?" n || continue
     fi
     break
   done
 
-  user=$(ask "认证用户名" "user-$(openssl rand -hex 2)")
+  user=$(ask "Auth username" "user-$(openssl rand -hex 2)")
   pass=$(rand_pass)
 
   socks5=$(ask_socks5)
@@ -697,10 +698,10 @@ add_socks5() {
   open_port "$port" tcp
 
   if rebuild_config; then
-    ok "SOCKS5 节点已添加"
+    ok "SOCKS5 node added"
     node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
   else
-    err "配置生成失败,已回滚"
+    err "config generation failed, rolled back"
     tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
     rebuild_config || true
   fi
@@ -708,7 +709,7 @@ add_socks5() {
 }
 
 # ----------------------------------------------------------------------------
-# 分享链接
+# Share links
 # ----------------------------------------------------------------------------
 urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
 
@@ -763,33 +764,33 @@ node_link() {
   printf '%s── %s (%s%s) ──%s\n' "$c_grn" "$name" "$type" "$suffix" "$c_rst"
   echo "$link"
   if jq -e '.socks5' <<<"$n" >/dev/null 2>&1; then
-    printf '%sSOCKS5 落地: %s:%s%s\n' "$c_ylw" \
+    printf '%sSOCKS5 egress: %s:%s%s\n' "$c_ylw" \
       "$(jq -r '.socks5.server' <<<"$n")" "$(jq -r '.socks5.port' <<<"$n")" "$c_rst"
   fi
 }
 
 show_links() {
   require_must
-  [[ "$(node_count)" -gt 0 ]] || { warn "无节点"; pause; return; }
+  [[ "$(node_count)" -gt 0 ]] || { warn "no nodes"; pause; return; }
   local n
   while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$SB_NODES")
   pause
 }
 
 # ----------------------------------------------------------------------------
-# 节点管理
+# Node management
 # ----------------------------------------------------------------------------
 list_nodes() {
   local i=0 n
   while IFS= read -r n; do
     i=$((i+1))
     local en st tp
-    en=$(jq -r '.enabled' <<<"$n"); st="启用"; [[ "$en" == true ]] || st="停用"
+    en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
     tp=$(jq -r '.transport // ""' <<<"$n")
     local mode=""
     [[ "$tp" == "reality" ]] && mode="reality"
     [[ "$tp" == "ws" ]] && mode="ws+cf"
-    printf '  %d) %-16s %-9s %-8s 端口:%-6s %s\n' \
+    printf '  %d) %-16s %-9s %-8s port:%-6s %s\n' \
       "$i" "$(jq -r '.name' <<<"$n")" "$(jq -r '.type' <<<"$n")" \
       "$mode" \
       "$(jq -r '.port' <<<"$n")" \
@@ -802,7 +803,7 @@ pick_node() {
   cnt=$(node_count)
   [[ "$cnt" -gt 0 ]] || { echo ""; return; }
   list_nodes >&2
-  sel=$(ask $'选择节点序号(回车返回)' "" )
+  sel=$(ask $'Select node number (Enter to go back)' "" )
   [[ "$sel" =~ ^[0-9]+$ ]] || { echo ""; return; }
   (( sel>=1 && sel<=cnt )) || { echo ""; return; }
   jq -r --argjson i "$((sel-1))" '.nodes[$i].id' "$SB_NODES"
@@ -810,7 +811,7 @@ pick_node() {
 
 manage_nodes() {
   require_must
-  [[ "$(node_count)" -gt 0 ]] || { warn "无节点,先添加"; pause; return; }
+  [[ "$(node_count)" -gt 0 ]] || { warn "no nodes, add one first"; pause; return; }
   local id
   id=$(pick_node)
   [[ -n "$id" ]] || return
@@ -822,17 +823,17 @@ manage_nodes() {
     local tp; tp=$(jq -r '.transport // ""' <<<"$n")
     cat <<EOF
 
-  节点操作:
-   1) 切换 SOCKS5 落地(改/加/删)
-   2) 修改端口
-   3) 重置 UUID / 密码
-   4) 启用/停用
-   5) 删除节点
+  Node actions:
+   1) Change SOCKS5 egress (edit/add/remove)
+   2) Change port
+   3) Reset UUID / password
+   4) Enable/disable
+   5) Delete node
 EOF
-    [[ "$tp" == "reality" ]] && echo "   6) 修改 Reality 伪装站"
-    echo "   0) 返回"
+    [[ "$tp" == "reality" ]] && echo "   6) Change Reality handshake target"
+    echo "   0) Back"
 
-    case "$(ask '选择')" in
+    case "$(ask 'Select')" in
       1) edit_socks5 "$id" ;;
       2) edit_port "$id" ;;
       3) reset_secret "$id" ;;
@@ -852,14 +853,14 @@ edit_socks5() {
   s=$(ask_socks5)
   if [[ -n "$s" ]]; then
     tmp_nodes "(.nodes[]|select(.id==\"$id\")).socks5 |= $s"
-    ok "SOCKS5 已更新"
+    ok "SOCKS5 updated"
   else
-    if confirm "移除该节点 SOCKS5 落地?" n; then
+    if confirm "Remove SOCKS5 egress from this node?" n; then
       tmp_nodes "(.nodes[]|select(.id==\"$id\")) |= del(.socks5)"
-      ok "SOCKS5 已移除"
+      ok "SOCKS5 removed"
     fi
   fi
-  rebuild_config && ok "已应用" || err "应用失败"
+  rebuild_config && ok "applied" || err "apply failed"
   pause
 }
 
@@ -870,20 +871,20 @@ edit_port() {
   tp=$(jq -r '.transport // ""' <<<"$n")
   proto=tcp; [[ "$type" == hysteria2 ]] && proto=udp
   while :; do
-    newp=$(ask "新端口" "$(jq -r '.port' <<<"$n")")
-    [[ "$newp" =~ ^[0-9]+$ ]] || { warn "非法"; continue; }
+    newp=$(ask "New port" "$(jq -r '.port' <<<"$n")")
+    [[ "$newp" =~ ^[0-9]+$ ]] || { warn "invalid"; continue; }
     if [[ "$tp" == "ws" ]] && ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$newp"; then
-      warn "WS+CF 模式端口须为: ${CF_PORTS[*]}"; continue
+      warn "WS+CF mode requires one of: ${CF_PORTS[*]}"; continue
     fi
     if jq -e --argjson p "$newp" --arg id "$id" \
         '.nodes[]|select(.port==$p and .id!=$id)' "$SB_NODES" >/dev/null 2>&1; then
-      warn "端口被其他节点占用"; continue
+      warn "port used by another node"; continue
     fi
     break
   done
   tmp_nodes "(.nodes[]|select(.id==\"$id\")).port = $newp"
   open_port "$newp" "$proto"
-  rebuild_config && ok "端口已改为 $newp" || err "应用失败"
+  rebuild_config && ok "port changed to $newp" || err "apply failed"
   pause
 }
 
@@ -893,93 +894,93 @@ reset_secret() {
   case "$type" in
     vless)
       tmp_nodes "(.nodes[]|select(.id==\"$id\")).uuid = \"$(rand_uuid)\""
-      ok "UUID 已重置" ;;
+      ok "UUID reset" ;;
     socks5)
       tmp_nodes "(.nodes[]|select(.id==\"$id\")).password = \"$(rand_pass)\""
-      ok "密码已重置 (用户名不变)" ;;
+      ok "password reset (username unchanged)" ;;
     *)
       tmp_nodes "(.nodes[]|select(.id==\"$id\")).password = \"$(rand_pass)\""
-      ok "密码已重置" ;;
+      ok "password reset" ;;
   esac
-  rebuild_config && ok "已应用" || err "应用失败"
+  rebuild_config && ok "applied" || err "apply failed"
   pause
 }
 
 toggle_enabled() {
   local id="$1"
   tmp_nodes "(.nodes[]|select(.id==\"$id\")).enabled |= (.|not)"
-  rebuild_config && ok "已切换启用状态" || err "应用失败"
+  rebuild_config && ok "enabled state toggled" || err "apply failed"
   pause
 }
 
 del_node() {
   local id="$1"
-  confirm "确认删除该节点?" n || return
+  confirm "Delete this node?" n || return
   tmp_nodes "del(.nodes[]|select(.id==\"$id\"))"
-  rebuild_config && ok "已删除" || err "应用失败"
+  rebuild_config && ok "deleted" || err "apply failed"
   pause
 }
 
 edit_reality_dest() {
   local id="$1"
-  echo; info "修改 Reality 伪装目标站:"
+  echo; info "Change Reality handshake target:"
   local i=0
   for d in "${REALITY_DESTS[@]}"; do
     i=$((i+1))
     echo "  $i) $d"
   done
-  echo "  0) 自定义"
+  echo "  0) custom"
   local sel dest
-  sel=$(ask "选择" "1")
+  sel=$(ask "Select" "1")
   if [[ "$sel" == "0" ]]; then
-    dest=$(ask "目标站域名")
+    dest=$(ask "Target domain")
   elif [[ "$sel" =~ ^[0-9]+$ ]] && ((sel>=1 && sel<=${#REALITY_DESTS[@]})); then
     dest="${REALITY_DESTS[$((sel-1))]}"
   else
     dest="${REALITY_DESTS[0]}"
   fi
   tmp_nodes "(.nodes[]|select(.id==\"$id\")) |= (.reality_sni=\"$dest\"|.reality_dest=\"$dest\")"
-  rebuild_config && ok "伪装站已改为 $dest" || err "应用失败"
+  rebuild_config && ok "handshake target changed to $dest" || err "apply failed"
   pause
 }
 
 # ----------------------------------------------------------------------------
-# BBR 加速
+# BBR acceleration
 # ----------------------------------------------------------------------------
 bbr_status() {
   local qdisc cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
   qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-  echo "拥塞控制: $cc  队列调度: $qdisc"
+  echo "congestion control: $cc  qdisc: $qdisc"
 }
 
 enable_bbr() {
-  echo; info "BBR 加速设置"
+  echo; info "BBR acceleration"
   local cc qdisc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
   if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
-    ok "BBR 已启用 ($(bbr_status))"
+    ok "BBR already enabled ($(bbr_status))"
     pause; return
   fi
 
-  info "当前状态: $(bbr_status)"
+  info "current state: $(bbr_status)"
 
   local kver kmin
   kver=$(uname -r | cut -d. -f1-2)
   kmin="4.9"
   if ! printf '%s\n%s\n' "$kmin" "$kver" | sort -V -C; then
-    die "内核版本 $kver 不支持 BBR (需 >= $kmin)"
+    die "kernel $kver does not support BBR (requires >= $kmin)"
   fi
 
   if ! modprobe tcp_bbr 2>/dev/null; then
     if ! grep -q tcp_bbr /proc/modules 2>/dev/null; then
-      die "内核不支持 tcp_bbr 模块"
+      die "kernel lacks tcp_bbr module"
     fi
   fi
 
-  confirm "启用 BBR 加速?" y || { pause; return; }
+  confirm "Enable BBR?" y || { pause; return; }
 
   cat > /etc/sysctl.d/99-bbr.conf <<EOF
 net.core.default_qdisc=fq
@@ -989,47 +990,140 @@ EOF
 
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   if [[ "$cc" == "bbr" ]]; then
-    ok "BBR 启用成功 ($(bbr_status))"
+    ok "BBR enabled ($(bbr_status))"
   else
-    err "BBR 启用失败,当前: $(bbr_status)"
+    err "failed to enable BBR, current: $(bbr_status)"
   fi
   pause
 }
 
 # ----------------------------------------------------------------------------
-# 服务 / 卸载
+# System optimization (sysctl tuning / swap / journald cap)
+# ----------------------------------------------------------------------------
+write_tune_conf() {
+  cat > "$TUNE_CONF" <<EOF
+# OneVPS system tuning
+# TCP buffers — high-BDP (long-distance) links
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+# UDP buffers — Hysteria2 (QUIC) throughput
+net.core.rmem_default = 26214400
+net.core.wmem_default = 26214400
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+# many concurrent connections
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 8192
+net.ipv4.tcp_tw_reuse = 1
+vm.swappiness = 10
+EOF
+  if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    echo "net.netfilter.nf_conntrack_max = 262144" >> "$TUNE_CONF"
+  fi
+  sysctl --system >/dev/null 2>&1
+  ok "network tuning applied ($TUNE_CONF)"
+}
+
+create_swap() {
+  local size_mb="$1" f=/swapfile
+  if [[ -f "$f" ]]; then
+    warn "$f already exists, skipping"
+    return
+  fi
+  info "creating ${size_mb}MiB swap file at $f ..."
+  if ! fallocate -l "${size_mb}M" "$f" 2>/dev/null; then
+    dd if=/dev/zero of="$f" bs=1M count="$size_mb" status=none
+  fi
+  chmod 600 "$f"
+  mkswap "$f" >/dev/null
+  swapon "$f"
+  grep -q "^$f " /etc/fstab || echo "$f none swap sw 0 0" >> /etc/fstab
+  ok "swap enabled (${size_mb}MiB)"
+}
+
+optimize_system() {
+  echo; info "System optimization (network sysctl / swap / journald cap)"
+
+  # --- sysctl network tuning ---
+  if [[ -f "$TUNE_CONF" ]]; then
+    ok "network tuning already applied ($TUNE_CONF)"
+    if confirm "Re-apply (overwrite)?" n; then
+      write_tune_conf
+    fi
+  else
+    if confirm "Apply network tuning (TCP/UDP buffers, TFO, backlog)?" y; then
+      write_tune_conf
+    fi
+  fi
+
+  # --- swap ---
+  local swap_kb mem_mb size_mb
+  swap_kb=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
+  if [[ "${swap_kb:-0}" -gt 0 ]]; then
+    ok "swap already present ($((swap_kb/1024)) MiB)"
+  else
+    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    size_mb=512; [[ "$mem_mb" -le 1024 ]] && size_mb=1024
+    if confirm "No swap detected (RAM ${mem_mb}MiB). Create ${size_mb}MiB swap file?" y; then
+      create_swap "$size_mb"
+    fi
+  fi
+
+  # --- journald disk cap ---
+  if [[ -f /etc/systemd/journald.conf.d/onevps.conf ]]; then
+    ok "journald disk cap already set"
+  else
+    if confirm "Cap journald logs at 50MiB?" y; then
+      mkdir -p /etc/systemd/journald.conf.d
+      cat > /etc/systemd/journald.conf.d/onevps.conf <<EOF
+[Journal]
+SystemMaxUse=50M
+EOF
+      systemctl restart systemd-journald 2>/dev/null || true
+      ok "journald capped at 50MiB"
+    fi
+  fi
+  pause
+}
+
+# ----------------------------------------------------------------------------
+# Service / uninstall
 # ----------------------------------------------------------------------------
 restart_service() {
   require_must
-  systemctl restart sing-box && ok "已重启" || err "重启失败"
+  systemctl restart sing-box && ok "restarted" || err "restart failed"
   systemctl --no-pager -l status sing-box 2>/dev/null | head -n 6 || true
   pause
 }
 
 uninstall() {
-  warn "卸载将删除 sing-box 二进制、配置、所有节点与证书"
-  confirm "确认卸载?" n || return
+  warn "Uninstall removes the sing-box binary, config, all nodes and certs"
+  confirm "Confirm uninstall?" n || return
   systemctl stop sing-box 2>/dev/null || true
   systemctl disable sing-box 2>/dev/null || true
   rm -f "$SB_SERVICE"; systemctl daemon-reload
   rm -f "$SB_BIN"
   rm -rf "$SB_DIR"
-  ok "已卸载"
+  ok "uninstalled"
   pause
 }
 
 # ----------------------------------------------------------------------------
-# 主菜单
+# Main menu
 # ----------------------------------------------------------------------------
 status_line() {
   if [[ -x "$SB_BIN" ]]; then
     local v st; v=$(installed_version)
     st=$(systemctl is-active sing-box 2>/dev/null || echo unknown)
     local bbr_cc; bbr_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
-    printf '%ssing-box %s — 服务:%s — 节点:%s — TCP:%s%s\n' \
+    printf '%ssing-box %s — service:%s — nodes:%s — TCP:%s%s\n' \
       "$c_blu" "$v" "$st" "$(node_count 2>/dev/null || echo 0)" "$bbr_cc" "$c_rst"
   else
-    printf '%ssing-box 未安装%s\n' "$c_ylw" "$c_rst"
+    printf '%ssing-box not installed%s\n' "$c_ylw" "$c_rst"
   fi
 }
 
@@ -1038,24 +1132,25 @@ main_menu() {
     clear
     cat <<'EOF'
  ╔══════════════════════════════════╗
- ║   OneVPS — sing-box 节点脚本      ║
+ ║   OneVPS — sing-box node script  ║
  ╚══════════════════════════════════╝
 EOF
     status_line
     cat <<EOF
 
-  1) 安装 / 更新 sing-box
-  2) 添加节点 — VLESS (Reality / WS+CF)
-  3) 添加节点 — Hysteria2
-  4) 添加节点 — SOCKS5
-  5) 管理节点
-  6) 查看全部分享链接
-  7) 重启服务
-  8) BBR 加速
-  9) 卸载
-  0) 退出
+  1) Install / update sing-box
+  2) Add node — VLESS (Reality / WS+CF)
+  3) Add node — Hysteria2
+  4) Add node — SOCKS5
+  5) Manage nodes
+  6) Show all share links
+  7) Restart service
+  8) BBR acceleration
+  9) System optimization
+ 10) Uninstall
+  0) Exit
 EOF
-    case "$(ask '选择')" in
+    case "$(ask 'Select')" in
       1) install_singbox; pause ;;
       2) add_vless ;;
       3) add_hysteria2 ;;
@@ -1064,7 +1159,8 @@ EOF
       6) show_links ;;
       7) restart_service ;;
       8) enable_bbr ;;
-      9) uninstall ;;
+      9) optimize_system ;;
+      10) uninstall ;;
       0|"") exit 0 ;;
       *) ;;
     esac
