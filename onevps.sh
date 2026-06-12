@@ -935,6 +935,59 @@ edit_reality_dest() {
 }
 
 # ----------------------------------------------------------------------------
+# BBR 加速
+# ----------------------------------------------------------------------------
+bbr_status() {
+  local qdisc cc
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+  echo "拥塞控制: $cc  队列调度: $qdisc"
+}
+
+enable_bbr() {
+  echo; info "BBR 加速设置"
+  local cc qdisc
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+  if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+    ok "BBR 已启用 ($(bbr_status))"
+    pause; return
+  fi
+
+  info "当前状态: $(bbr_status)"
+
+  local kver kmin
+  kver=$(uname -r | cut -d. -f1-2)
+  kmin="4.9"
+  if ! printf '%s\n%s\n' "$kmin" "$kver" | sort -V -C; then
+    die "内核版本 $kver 不支持 BBR (需 >= $kmin)"
+  fi
+
+  if ! modprobe tcp_bbr 2>/dev/null; then
+    if ! grep -q tcp_bbr /proc/modules 2>/dev/null; then
+      die "内核不支持 tcp_bbr 模块"
+    fi
+  fi
+
+  confirm "启用 BBR 加速?" y || { pause; return; }
+
+  cat > /etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+  sysctl --system >/dev/null 2>&1
+
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  if [[ "$cc" == "bbr" ]]; then
+    ok "BBR 启用成功 ($(bbr_status))"
+  else
+    err "BBR 启用失败,当前: $(bbr_status)"
+  fi
+  pause
+}
+
+# ----------------------------------------------------------------------------
 # 服务 / 卸载
 # ----------------------------------------------------------------------------
 restart_service() {
@@ -963,8 +1016,9 @@ status_line() {
   if [[ -x "$SB_BIN" ]]; then
     local v st; v=$(installed_version)
     st=$(systemctl is-active sing-box 2>/dev/null || echo unknown)
-    printf '%ssing-box %s — 服务:%s — 节点:%s%s\n' \
-      "$c_blu" "$v" "$st" "$(node_count 2>/dev/null || echo 0)" "$c_rst"
+    local bbr_cc; bbr_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+    printf '%ssing-box %s — 服务:%s — 节点:%s — TCP:%s%s\n' \
+      "$c_blu" "$v" "$st" "$(node_count 2>/dev/null || echo 0)" "$bbr_cc" "$c_rst"
   else
     printf '%ssing-box 未安装%s\n' "$c_ylw" "$c_rst"
   fi
@@ -988,7 +1042,8 @@ EOF
   5) 管理节点
   6) 查看全部分享链接
   7) 重启服务
-  8) 卸载
+  8) BBR 加速
+  9) 卸载
   0) 退出
 EOF
     case "$(ask '选择')" in
@@ -999,7 +1054,8 @@ EOF
       5) manage_nodes ;;
       6) show_links ;;
       7) restart_service ;;
-      8) uninstall ;;
+      8) enable_bbr ;;
+      9) uninstall ;;
       0|"") exit 0 ;;
       *) ;;
     esac

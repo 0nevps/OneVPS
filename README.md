@@ -13,6 +13,7 @@ VPS 一键搭建代理节点脚本，基于 [sing-box](https://github.com/SagerN
 
 - 🟠 **Cloudflare CDN** — VLESS 节点可套 CF（自动切换为 WS 传输）
 - 🧦 **SOCKS5 落地** — 给任意节点挂带认证的 SOCKS5 出口，VPS 当前置
+- 🚀 **BBR 加速** — 一键开启内核 BBR TCP 拥塞控制，提升吞吐
 
 ---
 
@@ -46,7 +47,8 @@ sudo bash onevps.sh
 5) 管理节点
 6) 查看全部分享链接
 7) 重启服务
-8) 卸载
+8) BBR 加速
+9) 卸载
 0) 退出
 ```
 
@@ -174,9 +176,19 @@ journalctl -u sing-box -f
 
 ---
 
+## BBR 加速
+
+菜单 `8` 一键启用 Google BBR TCP 拥塞控制算法（需内核 ≥ 4.9）。
+
+启用后写入 `/etc/sysctl.d/99-bbr.conf`，设置 `fq` 队列调度 + `bbr` 拥塞控制，重启不丢失。
+
+状态栏会显示当前 TCP 拥塞控制算法（如 `TCP:bbr`）。
+
+---
+
 ## 卸载
 
-菜单 `8`，删除二进制、配置、所有节点与证书。
+菜单 `9`，删除二进制、配置、所有节点与证书。
 
 ---
 
