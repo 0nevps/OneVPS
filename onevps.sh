@@ -5,6 +5,7 @@
 # Features: optional Cloudflare CDN  /  optional SOCKS5 egress
 #
 set -euo pipefail
+umask 077
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -70,7 +71,8 @@ rand_short_id() { openssl rand -hex 8; }
 rand_port() {
   local p
   while :; do
-    p=$(( RANDOM % 55535 + 10000 ))
+    # RANDOM alone caps at 32767; combine two draws to cover the full range
+    p=$(( ( (RANDOM << 15) | RANDOM ) % 55535 + 10000 ))
     port_taken_by_node "$p" 2>/dev/null && continue
     port_in_use "$p" && continue
     echo "$p"; return
@@ -152,7 +154,7 @@ install_singbox() {
   local latest cur
   info "checking latest version..."
   latest=$(latest_version) || die "failed to fetch latest version"
-  [[ -n "$latest" ]] || die "failed to parse latest version"
+  [[ -n "$latest" && "$latest" != null ]] || die "failed to parse latest version (GitHub API rate limit?)"
   cur=$(installed_version)
 
   if [[ -n "$cur" ]]; then
@@ -219,10 +221,21 @@ open_port() {
   fi
 }
 
+close_port() {
+  local p="$1" proto="$2"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw delete allow "$p/$proto" >/dev/null 2>&1 || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --remove-port="$p/$proto" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
 port_in_use() {
   local p="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -tunlp 2>/dev/null | grep -qE "[:.]$p\b"
+    ss -tunl 2>/dev/null | awk '{print $5}' | grep -qE ":$p$"
   else
     return 1
   fi
@@ -322,11 +335,16 @@ rebuild_config() {
       route: {rules:$rules, final:"direct"}
     }' > "$SB_CONF"
 
+  chmod 600 "$SB_CONF"
+
   if [[ -x "$SB_BIN" ]]; then
-    if ! "$SB_BIN" check -c "$SB_CONF" 2>/tmp/sb_check.err; then
-      err "generated config failed validation:"; cat /tmp/sb_check.err >&2
+    local chk_err; chk_err=$(mktemp)
+    if ! "$SB_BIN" check -c "$SB_CONF" 2>"$chk_err"; then
+      err "generated config failed validation:"; cat "$chk_err" >&2
+      rm -f "$chk_err"
       return 1
     fi
+    rm -f "$chk_err"
     systemctl restart sing-box 2>/dev/null || true
   fi
 }
@@ -446,7 +464,11 @@ ask_socks5() {
   local srv port user pass
   srv=$(ask "SOCKS5 server address")
   [[ -n "$srv" ]] || { warn "address empty, skipping SOCKS5"; echo ""; return; }
-  port=$(ask "SOCKS5 port" "1080")
+  while :; do
+    port=$(ask "SOCKS5 port" "1080")
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) && break
+    warn "invalid port"
+  done
   user=$(ask "Username (leave empty for no auth)" "")
   if [[ -n "$user" ]]; then
     pass=$(ask "Password" "")
@@ -625,6 +647,9 @@ add_hysteria2() {
     port=$(ask "Listen port/UDP (Enter for random)" "$(rand_port)")
     [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
     if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
+    if port_in_use "$port"; then
+      confirm "Port $port appears to be in use. Use anyway?" n || continue
+    fi
     break
   done
 
@@ -880,9 +905,16 @@ edit_port() {
         '.nodes[]|select(.port==$p and .id!=$id)' "$SB_NODES" >/dev/null 2>&1; then
       warn "port used by another node"; continue
     fi
+    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp"; then
+      confirm "Port $newp appears to be in use. Use anyway?" n || continue
+    fi
     break
   done
+  local oldp; oldp=$(jq -r '.port' <<<"$n")
   tmp_nodes "(.nodes[]|select(.id==\"$id\")).port = $newp"
+  if [[ "$newp" != "$oldp" ]]; then
+    close_port "$oldp" "$proto"
+  fi
   open_port "$newp" "$proto"
   rebuild_config && ok "port changed to $newp" || err "apply failed"
   pause
@@ -916,7 +948,12 @@ toggle_enabled() {
 del_node() {
   local id="$1"
   confirm "Delete this node?" n || return
+  local n port proto
+  n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")
+  port=$(jq -r '.port' <<<"$n")
+  proto=tcp; [[ "$(jq -r '.type' <<<"$n")" == hysteria2 ]] && proto=udp
   tmp_nodes "del(.nodes[]|select(.id==\"$id\"))"
+  close_port "$port" "$proto"
   rebuild_config && ok "deleted" || err "apply failed"
   pause
 }
@@ -1036,11 +1073,16 @@ create_swap() {
   fi
   info "creating ${size_mb}MiB swap file at $f ..."
   if ! fallocate -l "${size_mb}M" "$f" 2>/dev/null; then
-    dd if=/dev/zero of="$f" bs=1M count="$size_mb" status=none
+    if ! dd if=/dev/zero of="$f" bs=1M count="$size_mb" status=none 2>/dev/null; then
+      warn "failed to allocate swap file (disk full?)"
+      rm -f "$f"; return
+    fi
   fi
   chmod 600 "$f"
-  mkswap "$f" >/dev/null
-  swapon "$f"
+  if ! mkswap "$f" >/dev/null 2>&1 || ! swapon "$f" 2>/dev/null; then
+    warn "swap activation failed (note: btrfs needs a NOCOW swapfile); removing $f"
+    rm -f "$f"; return
+  fi
   grep -q "^$f " /etc/fstab || echo "$f none swap sw 0 0" >> /etc/fstab
   ok "swap enabled (${size_mb}MiB)"
 }
@@ -1102,6 +1144,7 @@ restart_service() {
 
 uninstall() {
   warn "Uninstall removes the sing-box binary, config, all nodes and certs"
+  warn "(BBR/system tuning configs and the swap file are kept)"
   confirm "Confirm uninstall?" n || return
   systemctl stop sing-box 2>/dev/null || true
   systemctl disable sing-box 2>/dev/null || true
