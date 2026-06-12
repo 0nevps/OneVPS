@@ -66,6 +66,15 @@ rand_uuid() {
 rand_pass() { openssl rand -base64 16 | tr -d '/+=' | cut -c1-16; }
 rand_path() { echo "/$(openssl rand -hex 6)"; }
 rand_short_id() { openssl rand -hex 8; }
+rand_port() {
+  local p
+  while :; do
+    p=$(( RANDOM % 55535 + 10000 ))
+    port_taken_by_node "$p" 2>/dev/null && continue
+    port_in_use "$p" && continue
+    echo "$p"; return
+  done
+}
 
 reality_keypair() {
   if [[ -x "$SB_BIN" ]]; then
@@ -471,7 +480,7 @@ add_vless_reality() {
 
   local port sni dest socks5
   while :; do
-    port=$(ask "监听端口" "443")
+    port=$(ask "监听端口(回车随机)" "$(rand_port)")
     [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
     if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
     if port_in_use "$port"; then
@@ -612,7 +621,7 @@ add_hysteria2() {
   fi
 
   while :; do
-    port=$(ask "监听端口(UDP)" "8443")
+    port=$(ask "监听端口/UDP(回车随机)" "$(rand_port)")
     [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
     if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
     break
@@ -659,7 +668,7 @@ add_socks5() {
   name=$(ask "节点名称" "socks5-$(openssl rand -hex 2)")
 
   while :; do
-    port=$(ask "监听端口" "1080")
+    port=$(ask "监听端口(回车随机)" "$(rand_port)")
     [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
     if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
     if port_in_use "$port"; then
