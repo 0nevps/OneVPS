@@ -984,6 +984,15 @@ edit_reality_dest() {
 # ----------------------------------------------------------------------------
 # BBR acceleration
 # ----------------------------------------------------------------------------
+# default_qdisc sysctl only affects interfaces created afterwards;
+# apply fq to the live default-route interface as well
+apply_fq_qdisc() {
+  local dev
+  dev=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  [[ -n "$dev" ]] || return 0
+  tc qdisc replace dev "$dev" root fq 2>/dev/null || true
+}
+
 bbr_status() {
   local qdisc cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
@@ -998,6 +1007,7 @@ enable_bbr() {
   qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
   if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+    apply_fq_qdisc
     ok "BBR already enabled ($(bbr_status))"
     pause; return
   fi
@@ -1024,6 +1034,7 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
   sysctl --system >/dev/null 2>&1
+  apply_fq_qdisc
 
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   if [[ "$cc" == "bbr" ]]; then
@@ -1056,6 +1067,11 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
 net.ipv4.tcp_tw_reuse = 1
+# cap unsent buffer per socket — lower latency for multiplexed proxy streams
+net.ipv4.tcp_notsent_lowat = 131072
+# drop dead connections faster
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_fin_timeout = 30
 vm.swappiness = 10
 EOF
   if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
