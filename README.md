@@ -7,6 +7,7 @@ VPS 一键搭建代理节点脚本，基于 [sing-box](https://github.com/SagerN
 - **VLESS + Reality** — 直连，无需域名/证书，伪装真站 TLS 指纹
 - **VLESS + WebSocket + CF CDN** — 套 Cloudflare 橙云代理，隐藏真实 IP
 - **Hysteria2** — QUIC/UDP 高速直连
+- **SOCKS5** — 带认证的 SOCKS5 代理入站
 
 两个可选增强：
 
@@ -23,7 +24,7 @@ sudo bash onevps.sh
 
 脚本启动先做环境检测（root / 架构 / 包管理器 / systemd），通过后进入菜单。
 
-首次使用：先跑 `1` 安装 sing-box，再 `2`/`3` 添加节点。
+首次使用：先跑 `1` 安装 sing-box，再 `2`/`3`/`4` 添加节点。
 
 ---
 
@@ -33,10 +34,11 @@ sudo bash onevps.sh
 1) 安装 / 更新 sing-box
 2) 添加节点 — VLESS (Reality / WS+CF)
 3) 添加节点 — Hysteria2
-4) 管理节点
-5) 查看全部分享链接
-6) 重启服务
-7) 卸载
+4) 添加节点 — SOCKS5
+5) 管理节点
+6) 查看全部分享链接
+7) 重启服务
+8) 卸载
 0) 退出
 ```
 
@@ -49,6 +51,7 @@ sudo bash onevps.sh
 | VLESS 不套 CF | VLESS + Reality | TCP 直连 | 不需要 | 不需要（Reality 伪装） |
 | VLESS 套 CF | VLESS + WS | WebSocket 经 CF | 必须 | 自签（CF 终结 TLS） |
 | Hysteria2 | Hysteria2 | QUIC/UDP | 可选 | ACME 或 自签 |
+| SOCKS5 | SOCKS5 | TCP | 不需要 | 不需要 |
 
 ### VLESS + Reality
 
@@ -72,6 +75,13 @@ sudo bash onevps.sh
 - QUIC/UDP 直连，CF 不支持代理 UDP
 - 有域名可用 ACME 真证书；无域名用自签（客户端需开 `insecure`）
 
+### SOCKS5
+
+- 带用户名/密码认证的 SOCKS5 代理
+- 无需域名或证书，最轻量的节点类型
+- 可选挂 SOCKS5 落地出口（套娃：客户端 → VPS SOCKS5 入站 → 远端 SOCKS5 出站）
+- 分享链接格式：`socks5://user:pass@ip:port#name`
+
 ---
 
 ## SOCKS5 落地
@@ -93,7 +103,7 @@ SOCKS5 端口: 1080
 
 ## 节点管理
 
-菜单 `4` 选择节点后：
+菜单 `5` 选择节点后：
 
 ```
 1) 切换 SOCKS5 落地(改/加/删)
@@ -138,7 +148,7 @@ journalctl -u sing-box -f
 
 ## 卸载
 
-菜单 `7`，删除二进制、配置、所有节点与证书。
+菜单 `8`，删除二进制、配置、所有节点与证书。
 
 ---
 
