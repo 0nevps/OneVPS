@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # OneVPS — sing-box 节点搭建脚本
-# 协议: VLESS+WS  /  Hysteria2
+# 协议: VLESS (Reality / WS+CF)  /  Hysteria2
 # 特性: 可选 Cloudflare CDN  /  可选 SOCKS5 落地
 #
 set -euo pipefail
@@ -17,12 +17,12 @@ SB_CERT_DIR=$SB_DIR/certs
 SB_SERVICE=/etc/systemd/system/sing-box.service
 GH_REPO=SagerNet/sing-box
 
-# Cloudflare 代理(橙云)允许的回源 HTTPS 端口
 CF_PORTS=(443 2053 2083 2087 2096 8443)
+REALITY_DESTS=("www.microsoft.com" "www.apple.com" "www.samsung.com" "gateway.icloud.com" "www.lovelive-anime.jp")
 
-PKG=""          # apt | dnf | yum | apk
-ARCH=""         # amd64 | arm64 | armv7
-PUBIP=""        # 公网 IP(惰性获取)
+PKG=""
+ARCH=""
+PUBIP=""
 
 # ----------------------------------------------------------------------------
 # 输出
@@ -34,7 +34,7 @@ warn() { printf '%s[!]%s %s\n' "$c_ylw" "$c_rst" "$*"; }
 err()  { printf '%s[x]%s %s\n' "$c_red" "$c_rst" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
-confirm() { # confirm "问题" [默认y]  -> 返回 0=yes
+confirm() {
   local q="$1" def="${2:-n}" ans
   local hint="[y/N]"; [[ "$def" == y ]] && hint="[Y/n]"
   read -rp "$q $hint " ans || true
@@ -42,7 +42,7 @@ confirm() { # confirm "问题" [默认y]  -> 返回 0=yes
   [[ "$ans" =~ ^[Yy]$ ]]
 }
 
-ask() { # ask "提示" 默认值 -> echo 输入
+ask() {
   local q="$1" def="${2:-}" ans
   if [[ -n "$def" ]]; then
     read -rp "$q [$def]: " ans || true
@@ -65,6 +65,15 @@ rand_uuid() {
 }
 rand_pass() { openssl rand -base64 16 | tr -d '/+=' | cut -c1-16; }
 rand_path() { echo "/$(openssl rand -hex 6)"; }
+rand_short_id() { openssl rand -hex 8; }
+
+reality_keypair() {
+  if [[ -x "$SB_BIN" ]]; then
+    "$SB_BIN" generate reality-keypair
+  else
+    die "需先安装 sing-box 才能生成 Reality 密钥对"
+  fi
+}
 
 pub_ip() {
   [[ -n "$PUBIP" ]] && { echo "$PUBIP"; return; }
@@ -78,7 +87,6 @@ pub_ip() {
 # ----------------------------------------------------------------------------
 check_env() {
   [[ $EUID -eq 0 ]] || die "需 root 运行 (sudo bash $0)"
-
   command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd,本脚本依赖 systemd 管理服务"
 
   case "$(uname -m)" in
@@ -97,7 +105,7 @@ check_env() {
   ok "环境 OK — 架构:$ARCH  包管理:$PKG  systemd:yes"
 }
 
-pkg_install() { # pkg_install pkg...
+pkg_install() {
   case "$PKG" in
     apt) DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq "$@" ;;
     dnf) dnf install -y -q "$@" ;;
@@ -188,9 +196,9 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-# 防火墙放行
+# 防火墙 / 端口
 # ----------------------------------------------------------------------------
-open_port() { # open_port port tcp|udp
+open_port() {
   local p="$1" proto="$2"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "$p/$proto" >/dev/null 2>&1 || true
@@ -201,7 +209,7 @@ open_port() { # open_port port tcp|udp
   fi
 }
 
-port_in_use() { # 0=被占用
+port_in_use() {
   local p="$1"
   if command -v ss >/dev/null 2>&1; then
     ss -tunlp 2>/dev/null | grep -qE "[:.]$p\b"
@@ -210,17 +218,16 @@ port_in_use() { # 0=被占用
   fi
 }
 
-# 校验端口未被本脚本其他节点占用(同协议族)
-port_taken_by_node() { # port
+port_taken_by_node() {
   jq -e --argjson p "$1" '.nodes[]|select(.port==$p)' "$SB_NODES" >/dev/null 2>&1
 }
 
 require_must() { command -v "$SB_BIN" >/dev/null 2>&1 || die "请先执行菜单 [1] 安装 sing-box"; }
 
 # ----------------------------------------------------------------------------
-# 证书
+# 证书(仅 WS+CF 和 Hysteria2 用)
 # ----------------------------------------------------------------------------
-gen_self_cert() { # gen_self_cert cn  -> 写 certs/cn.{crt,key},echo "crt key"
+gen_self_cert() {
   local cn="$1" crt key
   cn="${cn:-bing.com}"
   crt="$SB_CERT_DIR/${cn}.crt"; key="$SB_CERT_DIR/${cn}.key"
@@ -244,7 +251,7 @@ acme_email() {
 # ----------------------------------------------------------------------------
 # [3] 节点存储 + config 生成
 # ----------------------------------------------------------------------------
-tmp_nodes() { # 对 nodes.json 应用 jq 表达式
+tmp_nodes() {
   local expr="$1"
   local t; t=$(mktemp)
   jq "$expr" "$SB_NODES" > "$t" && mv "$t" "$SB_NODES"
@@ -252,7 +259,6 @@ tmp_nodes() { # 对 nodes.json 应用 jq 表达式
 
 node_count() { jq '.nodes|length' "$SB_NODES"; }
 
-# 由 nodes.json 生成 sing-box config.json,然后重启
 rebuild_config() {
   [[ -f "$SB_NODES" ]] || echo '{"nodes":[],"acme_email":""}' > "$SB_NODES"
   local email; email=$(jq -r '.acme_email // ""' "$SB_NODES")
@@ -262,7 +268,7 @@ rebuild_config() {
   outbounds='[{"type":"direct","tag":"direct"}]'
   rules='[]'
 
-  local n type tag port enabled
+  local n type tag enabled
   while IFS= read -r n; do
     enabled=$(jq -r '.enabled' <<<"$n")
     [[ "$enabled" == "true" ]] || continue
@@ -277,7 +283,6 @@ rebuild_config() {
     esac
     inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds")
 
-    # SOCKS5 落地
     if jq -e '.socks5' <<<"$n" >/dev/null 2>&1; then
       local sid sob
       sid=$(jq -r '.id' <<<"$n")
@@ -315,31 +320,53 @@ rebuild_config() {
   fi
 }
 
-# 构造 TLS 块(供 vless/hy2 共用): echo json
-build_tls() { # build_tls node email [alpn_json]
-  local n="$1" email="$2" alpn="${3:-}"
-  local domain tlsmode crt key
-  domain=$(jq -r '.domain // ""' <<<"$n")
-  tlsmode=$(jq -r '.tls' <<<"$n")   # acme | self
+# --- VLESS inbound ---
+build_vless_inbound() {
+  local n="$1" email="$2"
+  local transport; transport=$(jq -r '.transport' <<<"$n")
 
-  if [[ "$tlsmode" == "acme" ]]; then
-    jq -n --arg sn "$domain" --arg email "$email" --argjson alpn "${alpn:-null}" '
-      {enabled:true, server_name:$sn,
-       acme:{domain:[$sn], email:$email}}
-      + (if $alpn!=null then {alpn:$alpn} else {} end)'
+  if [[ "$transport" == "reality" ]]; then
+    build_vless_reality_inbound "$n"
   else
-    read -r crt key < <(gen_self_cert "${domain:-bing.com}")
-    jq -n --arg sn "${domain:-bing.com}" --arg crt "$crt" --arg key "$key" \
-          --argjson alpn "${alpn:-null}" '
-      {enabled:true, server_name:$sn,
-       certificate_path:$crt, key_path:$key}
-      + (if $alpn!=null then {alpn:$alpn} else {} end)'
+    build_vless_ws_inbound "$n" "$email"
   fi
 }
 
-build_vless_inbound() { # node email
+build_vless_reality_inbound() {
+  local n="$1"
+  jq -n \
+    --arg tag "$(jq -r '.tag' <<<"$n")" \
+    --argjson port "$(jq -r '.port' <<<"$n")" \
+    --arg uuid "$(jq -r '.uuid' <<<"$n")" \
+    --arg sni "$(jq -r '.reality_sni' <<<"$n")" \
+    --arg dest "$(jq -r '.reality_dest' <<<"$n")" \
+    --argjson dest_port "$(jq -r '.reality_dest_port // 443' <<<"$n")" \
+    --arg pk "$(jq -r '.reality_private_key' <<<"$n")" \
+    --arg sid "$(jq -r '.reality_short_id' <<<"$n")" '
+    {
+      type:"vless", tag:$tag, listen:"::", listen_port:$port,
+      users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
+      tls:{
+        enabled:true,
+        server_name:$sni,
+        reality:{
+          enabled:true,
+          handshake:{server:$dest, server_port:$dest_port},
+          private_key:$pk,
+          short_id:[$sid]
+        }
+      }
+    }'
+}
+
+build_vless_ws_inbound() {
   local n="$1" email="$2" tls
-  tls=$(build_tls "$n" "$email")
+  local domain; domain=$(jq -r '.domain // ""' <<<"$n")
+  local crt key
+  read -r crt key < <(gen_self_cert "${domain:-bing.com}")
+  tls=$(jq -n --arg sn "${domain:-bing.com}" --arg crt "$crt" --arg key "$key" '
+    {enabled:true, server_name:$sn, certificate_path:$crt, key_path:$key}')
+
   jq -n \
     --arg tag "$(jq -r '.tag' <<<"$n")" \
     --argjson port "$(jq -r '.port' <<<"$n")" \
@@ -356,9 +383,24 @@ build_vless_inbound() { # node email
     }'
 }
 
-build_hy2_inbound() { # node email
+# --- Hysteria2 inbound ---
+build_hy2_inbound() {
   local n="$1" email="$2" tls
-  tls=$(build_tls "$n" "$email" '["h3"]')
+  local domain tlsmode crt key
+  domain=$(jq -r '.domain // ""' <<<"$n")
+  tlsmode=$(jq -r '.tls' <<<"$n")
+
+  if [[ "$tlsmode" == "acme" ]]; then
+    tls=$(jq -n --arg sn "$domain" --arg email "$email" '
+      {enabled:true, server_name:$sn, alpn:["h3"],
+       acme:{domain:[$sn], email:$email}}')
+  else
+    read -r crt key < <(gen_self_cert "${domain:-bing.com}")
+    tls=$(jq -n --arg sn "${domain:-bing.com}" --arg crt "$crt" --arg key "$key" '
+      {enabled:true, server_name:$sn, alpn:["h3"],
+       certificate_path:$crt, key_path:$key}')
+  fi
+
   jq -n \
     --arg tag "$(jq -r '.tag' <<<"$n")" \
     --argjson port "$(jq -r '.port' <<<"$n")" \
@@ -372,7 +414,7 @@ build_hy2_inbound() { # node email
 }
 
 # ----------------------------------------------------------------------------
-# SOCKS5 落地交互 -> echo socks5 json 或空
+# SOCKS5 落地交互
 # ----------------------------------------------------------------------------
 ask_socks5() {
   confirm "追加 SOCKS5 落地(节点全部流量走此 SOCKS5)?" n || { echo ""; return; }
@@ -390,69 +432,138 @@ ask_socks5() {
 }
 
 # ----------------------------------------------------------------------------
-# [4] 添加 VLESS+WS
+# [4] 添加 VLESS 节点
 # ----------------------------------------------------------------------------
 add_vless() {
   require_must
-  echo; info "添加 VLESS + WebSocket 节点"
-  local name domain cf tls port path uuid socks5
+  echo; info "添加 VLESS 节点"
 
+  local name uuid id socks5
   name=$(ask "节点名称" "vless-$(openssl rand -hex 2)")
+  uuid=$(rand_uuid)
+  id=$(openssl rand -hex 4)
 
-  if confirm "使用域名? (套 CF CDN 必须有域名)" y; then
-    domain=$(ask "域名(已解析到本机或 CF)")
-    [[ -n "$domain" ]] || die "域名为空"
-    if confirm "启用 Cloudflare CDN(橙云代理)?" n; then
-      cf=true; tls=self
-      warn "CF 模式: 回源用自签证书,请在 CF 面板把 SSL/TLS 设为 \"完全(Full)\""
-    else
-      cf=false; tls=acme
-    fi
+  if confirm "启用 Cloudflare CDN?" n; then
+    add_vless_ws "$id" "$name" "$uuid"
   else
-    domain=""; cf=false; tls=self
-    warn "无域名: 自签证书,客户端需开启 allowInsecure"
+    add_vless_reality "$id" "$name" "$uuid"
   fi
+}
 
-  # 端口
-  local defport=443
-  if [[ "$cf" == true ]]; then
-    info "CF 回源端口仅支持: ${CF_PORTS[*]}"
-  fi
+add_vless_reality() {
+  local id="$1" name="$2" uuid="$3"
+  info "模式: VLESS + Reality (直连,无需域名/证书)"
+
+  local port sni dest socks5
   while :; do
-    port=$(ask "监听端口" "$defport")
+    port=$(ask "监听端口" "443")
     [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
-    if [[ "$cf" == true ]] && ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$port"; then
-      warn "CF 模式端口须为: ${CF_PORTS[*]}"; continue
-    fi
     if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
     if port_in_use "$port"; then
-      confirm "端口 $port 似乎已被系统其他进程占用,仍使用?" n || continue
+      confirm "端口 $port 似乎已被占用,仍使用?" n || continue
     fi
     break
   done
 
-  uuid=$(rand_uuid)
-  path=$(rand_path)
+  echo; info "Reality 伪装目标站(需为支持 TLS 1.3 和 H2 的大站):"
+  local i=0
+  for d in "${REALITY_DESTS[@]}"; do
+    i=$((i+1))
+    echo "  $i) $d"
+  done
+  echo "  0) 自定义"
+  local sel
+  sel=$(ask "选择" "1")
+  if [[ "$sel" == "0" ]]; then
+    dest=$(ask "目标站域名")
+  elif [[ "$sel" =~ ^[0-9]+$ ]] && ((sel>=1 && sel<=${#REALITY_DESTS[@]})); then
+    dest="${REALITY_DESTS[$((sel-1))]}"
+  else
+    dest="${REALITY_DESTS[0]}"
+  fi
+  sni="$dest"
+
+  info "生成 Reality 密钥对..."
+  local kp pk pubk sid
+  kp=$(reality_keypair)
+  pk=$(echo "$kp" | awk '/PrivateKey:/{print $2}')
+  pubk=$(echo "$kp" | awk '/PublicKey:/{print $2}')
+  sid=$(rand_short_id)
+
   socks5=$(ask_socks5)
 
-  local id; id=$(openssl rand -hex 4)
   local node
   node=$(jq -n \
     --arg id "$id" --arg name "$name" --arg tag "vless-$id" \
-    --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
-    --arg domain "$domain" --arg tls "$tls" --argjson cf "$cf" '
+    --argjson port "$port" --arg uuid "$uuid" \
+    --arg transport "reality" \
+    --arg sni "$sni" --arg dest "$dest" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
     {id:$id,type:"vless",name:$name,tag:$tag,port:$port,uuid:$uuid,
-     ws_path:$path,domain:$domain,tls:$tls,cf:$cf,enabled:true}')
+     transport:$transport,cf:false,
+     reality_sni:$sni,reality_dest:$dest,reality_dest_port:443,
+     reality_private_key:$pk,reality_public_key:$pubk,reality_short_id:$sid,
+     enabled:true}')
   if [[ -n "$socks5" ]]; then
     node=$(jq -c --argjson s "$socks5" '. + {socks5:$s}' <<<"$node")
   fi
 
-  [[ "$tls" == acme ]] && acme_email >/dev/null
   tmp_nodes ".nodes += [$node]"
   open_port "$port" tcp
 
   if rebuild_config; then
-    ok "VLESS 节点已添加"
+    ok "VLESS + Reality 节点已添加"
+    node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
+  else
+    err "配置生成失败,已回滚"
+    tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
+    rebuild_config || true
+  fi
+  pause
+}
+
+add_vless_ws() {
+  local id="$1" name="$2" uuid="$3"
+  info "模式: VLESS + WebSocket + CF CDN (需域名)"
+
+  local domain port path socks5
+  domain=$(ask "域名(已在 CF 托管,A 记录指向 VPS,橙云开启)")
+  [[ -n "$domain" ]] || die "域名为空"
+
+  info "CF 回源端口仅支持: ${CF_PORTS[*]}"
+  while :; do
+    port=$(ask "监听端口" "443")
+    [[ "$port" =~ ^[0-9]+$ ]] || { warn "端口非法"; continue; }
+    if ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$port"; then
+      warn "CF 模式端口须为: ${CF_PORTS[*]}"; continue
+    fi
+    if port_taken_by_node "$port"; then warn "端口 $port 已被其他节点占用"; continue; fi
+    if port_in_use "$port"; then
+      confirm "端口 $port 似乎已被占用,仍使用?" n || continue
+    fi
+    break
+  done
+
+  path=$(rand_path)
+  socks5=$(ask_socks5)
+
+  local node
+  node=$(jq -n \
+    --arg id "$id" --arg name "$name" --arg tag "vless-$id" \
+    --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
+    --arg domain "$domain" --arg transport "ws" '
+    {id:$id,type:"vless",name:$name,tag:$tag,port:$port,uuid:$uuid,
+     transport:$transport,ws_path:$path,domain:$domain,tls:"self",cf:true,
+     enabled:true}')
+  if [[ -n "$socks5" ]]; then
+    node=$(jq -c --argjson s "$socks5" '. + {socks5:$s}' <<<"$node")
+  fi
+
+  tmp_nodes ".nodes += [$node]"
+  open_port "$port" tcp
+
+  if rebuild_config; then
+    ok "VLESS + WS + CF 节点已添加"
+    warn "请确保 CF 面板 SSL/TLS 设为 \"完全(Full)\""
     node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
   else
     err "配置生成失败,已回滚"
@@ -527,34 +638,48 @@ add_hysteria2() {
 # ----------------------------------------------------------------------------
 urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
 
-node_link() { # node json -> echo 分享链接
-  local n="$1" type addr port domain name
+node_link() {
+  local n="$1" type addr port name
   type=$(jq -r '.type' <<<"$n")
   port=$(jq -r '.port' <<<"$n")
-  domain=$(jq -r '.domain // ""' <<<"$n")
   name=$(jq -r '.name' <<<"$n")
-  addr="$domain"; [[ -z "$addr" ]] && addr="$(pub_ip)"
+  local transport; transport=$(jq -r '.transport // ""' <<<"$n")
 
   local link
   if [[ "$type" == vless ]]; then
-    local uuid path host sni insecure
+    local uuid
     uuid=$(jq -r '.uuid' <<<"$n")
-    path=$(jq -r '.ws_path' <<<"$n")
-    host="$domain"; sni="$domain"
-    insecure=""
-    [[ "$(jq -r '.tls' <<<"$n")" == self ]] && insecure="&allowInsecure=1"
-    [[ -z "$sni" ]] && sni="$addr"
-    link="vless://${uuid}@${addr}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${host}&path=$(urlenc "$path")${insecure}#$(urlenc "$name")"
+
+    if [[ "$transport" == "reality" ]]; then
+      addr="$(pub_ip)"
+      local sni pubk sid
+      sni=$(jq -r '.reality_sni' <<<"$n")
+      pubk=$(jq -r '.reality_public_key' <<<"$n")
+      sid=$(jq -r '.reality_short_id' <<<"$n")
+      link="vless://${uuid}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubk}&sid=${sid}&type=tcp#$(urlenc "$name")"
+    else
+      local domain path host sni
+      domain=$(jq -r '.domain // ""' <<<"$n")
+      path=$(jq -r '.ws_path' <<<"$n")
+      addr="$domain"; [[ -z "$addr" ]] && addr="$(pub_ip)"
+      host="$domain"; sni="$domain"
+      [[ -z "$sni" ]] && sni="$addr"
+      link="vless://${uuid}@${addr}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${host}&path=$(urlenc "$path")&allowInsecure=1#$(urlenc "$name")"
+    fi
   else
-    local pass sni insecure
+    local pass domain sni insecure
     pass=$(jq -r '.password' <<<"$n")
+    domain=$(jq -r '.domain // ""' <<<"$n")
+    addr="$domain"; [[ -z "$addr" ]] && addr="$(pub_ip)"
     sni="$domain"; [[ -z "$sni" ]] && sni="$addr"
     insecure=0; [[ "$(jq -r '.tls' <<<"$n")" == self ]] && insecure=1
     link="hysteria2://${pass}@${addr}:${port}?sni=${sni}&insecure=${insecure}#$(urlenc "$name")"
   fi
 
   echo
-  printf '%s── %s (%s) ──%s\n' "$c_grn" "$name" "$type" "$c_rst"
+  printf '%s── %s (%s%s) ──%s\n' "$c_grn" "$name" "$type" \
+    "$([[ "$transport" == "reality" ]] && echo "+reality" || ([[ "$transport" == "ws" ]] && echo "+ws+cf" || echo ""))" \
+    "$c_rst"
   echo "$link"
   if jq -e '.socks5' <<<"$n" >/dev/null 2>&1; then
     printf '%sSOCKS5 落地: %s:%s%s\n' "$c_ylw" \
@@ -573,21 +698,22 @@ show_links() {
 # ----------------------------------------------------------------------------
 # 节点管理
 # ----------------------------------------------------------------------------
-list_nodes() { # 打印带序号列表
+list_nodes() {
   local i=0 n
   while IFS= read -r n; do
     i=$((i+1))
-    local en st
+    local en st tp
     en=$(jq -r '.enabled' <<<"$n"); st="启用"; [[ "$en" == true ]] || st="停用"
-    printf '  %d) %-16s %-9s 端口:%-6s %s%s\n' \
+    tp=$(jq -r '.transport // ""' <<<"$n")
+    printf '  %d) %-16s %-9s %-8s 端口:%-6s %s\n' \
       "$i" "$(jq -r '.name' <<<"$n")" "$(jq -r '.type' <<<"$n")" \
+      "$([[ "$tp" == "reality" ]] && echo "reality" || ([[ "$tp" == "ws" ]] && echo "ws+cf" || echo ""))" \
       "$(jq -r '.port' <<<"$n")" \
-      "$([[ "$(jq -r '.cf//false' <<<"$n")" == true ]] && echo '[CF] ')" \
       "$([[ "$en" == true ]] && echo "$st" || echo "${c_ylw}$st${c_rst}")"
   done < <(jq -c '.nodes[]' "$SB_NODES")
 }
 
-pick_node() { # echo 选中 node id 或空
+pick_node() {
   local cnt sel
   cnt=$(node_count)
   [[ "$cnt" -gt 0 ]] || { echo ""; return; }
@@ -609,28 +735,29 @@ manage_nodes() {
   while :; do
     clear
     node_link "$n"
+    local tp; tp=$(jq -r '.transport // ""' <<<"$n")
     cat <<EOF
 
   节点操作:
    1) 切换 SOCKS5 落地(改/加/删)
-   2) 切换 Cloudflare CDN(仅 VLESS+域名)
-   3) 修改端口
-   4) 重置 UUID / 密码
-   5) 启用/停用
-   6) 删除节点
-   0) 返回
+   2) 修改端口
+   3) 重置 UUID / 密码
+   4) 启用/停用
+   5) 删除节点
 EOF
+    [[ "$tp" == "reality" ]] && echo "   6) 修改 Reality 伪装站"
+    echo "   0) 返回"
+
     case "$(ask '选择')" in
       1) edit_socks5 "$id" ;;
-      2) toggle_cf "$id" ;;
-      3) edit_port "$id" ;;
-      4) reset_secret "$id" ;;
-      5) toggle_enabled "$id" ;;
-      6) del_node "$id"; return ;;
+      2) edit_port "$id" ;;
+      3) reset_secret "$id" ;;
+      4) toggle_enabled "$id" ;;
+      5) del_node "$id"; return ;;
+      6) [[ "$tp" == "reality" ]] && edit_reality_dest "$id" ;;
       0|"") return ;;
       *) continue ;;
     esac
-    # 刷新内存中的 node
     n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES") || return
     [[ -n "$n" ]] || return
   done
@@ -652,41 +779,17 @@ edit_socks5() {
   pause
 }
 
-toggle_cf() {
-  local id="$1" n type domain cf
-  n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")
-  type=$(jq -r '.type' <<<"$n"); domain=$(jq -r '.domain//""' <<<"$n")
-  cf=$(jq -r '.cf//false' <<<"$n")
-  [[ "$type" == vless ]] || { warn "仅 VLESS 支持 CF"; pause; return; }
-  [[ -n "$domain" ]] || { warn "无域名,无法启用 CF"; pause; return; }
-
-  if [[ "$cf" == true ]]; then
-    confirm "当前 CF 已启用,关闭并改用 ACME 真证书?" n || { pause; return; }
-    tmp_nodes "(.nodes[]|select(.id==\"$id\")) |= (.cf=false|.tls=\"acme\")"
-    acme_email >/dev/null
-  else
-    confirm "启用 CF? 端口须为 ${CF_PORTS[*]},证书改自签" n || { pause; return; }
-    local p; p=$(jq -r '.port' <<<"$n")
-    if ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$p"; then
-      warn "当前端口 $p 不在 CF 允许列表,请先改端口(操作 3)"; pause; return
-    fi
-    tmp_nodes "(.nodes[]|select(.id==\"$id\")) |= (.cf=true|.tls=\"self\")"
-    warn "记得在 CF 面板把 SSL/TLS 设为 \"完全(Full)\""
-  fi
-  rebuild_config && ok "已应用" || err "应用失败"
-  pause
-}
-
 edit_port() {
-  local id="$1" n type cf proto newp
+  local id="$1" n type cf tp newp proto
   n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")
   type=$(jq -r '.type' <<<"$n"); cf=$(jq -r '.cf//false' <<<"$n")
+  tp=$(jq -r '.transport // ""' <<<"$n")
   proto=tcp; [[ "$type" == hysteria2 ]] && proto=udp
   while :; do
     newp=$(ask "新端口" "$(jq -r '.port' <<<"$n")")
     [[ "$newp" =~ ^[0-9]+$ ]] || { warn "非法"; continue; }
-    if [[ "$cf" == true ]] && ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$newp"; then
-      warn "CF 模式端口须为: ${CF_PORTS[*]}"; continue
+    if [[ "$tp" == "ws" ]] && ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$newp"; then
+      warn "WS+CF 模式端口须为: ${CF_PORTS[*]}"; continue
     fi
     if jq -e --argjson p "$newp" --arg id "$id" \
         '.nodes[]|select(.port==$p and .id!=$id)' "$SB_NODES" >/dev/null 2>&1; then
@@ -726,6 +829,29 @@ del_node() {
   confirm "确认删除该节点?" n || return
   tmp_nodes "del(.nodes[]|select(.id==\"$id\"))"
   rebuild_config && ok "已删除" || err "应用失败"
+  pause
+}
+
+edit_reality_dest() {
+  local id="$1"
+  echo; info "修改 Reality 伪装目标站:"
+  local i=0
+  for d in "${REALITY_DESTS[@]}"; do
+    i=$((i+1))
+    echo "  $i) $d"
+  done
+  echo "  0) 自定义"
+  local sel dest
+  sel=$(ask "选择" "1")
+  if [[ "$sel" == "0" ]]; then
+    dest=$(ask "目标站域名")
+  elif [[ "$sel" =~ ^[0-9]+$ ]] && ((sel>=1 && sel<=${#REALITY_DESTS[@]})); then
+    dest="${REALITY_DESTS[$((sel-1))]}"
+  else
+    dest="${REALITY_DESTS[0]}"
+  fi
+  tmp_nodes "(.nodes[]|select(.id==\"$id\")) |= (.reality_sni=\"$dest\"|.reality_dest=\"$dest\")"
+  rebuild_config && ok "伪装站已改为 $dest" || err "应用失败"
   pause
 }
 
@@ -777,7 +903,7 @@ EOF
     cat <<EOF
 
   1) 安装 / 更新 sing-box
-  2) 添加节点 — VLESS + WS
+  2) 添加节点 — VLESS (Reality / WS+CF)
   3) 添加节点 — Hysteria2
   4) 管理节点
   5) 查看全部分享链接
