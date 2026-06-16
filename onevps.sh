@@ -674,10 +674,22 @@ add_hysteria2() {
     case "$tlschoice" in
       1) tls=acme ;;
       2) tls=caddy
+         local caddyfile="/etc/caddy/Caddyfile"
+         if [[ -f "$caddyfile" ]] && ! grep -q "^${domain}" "$caddyfile"; then
+           printf '\n%s {\n    respond "OK" 200\n}\n' "$domain" >> "$caddyfile"
+           info "Added $domain to $caddyfile"
+           if systemctl is-active caddy >/dev/null 2>&1; then
+             systemctl reload caddy
+             info "Caddy reloaded — waiting for cert..."
+             sleep 5
+           else
+             warn "Caddy not running — start it to obtain cert"
+           fi
+         fi
          local caddy_cert_dir="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}"
          if [[ ! -d "$caddy_cert_dir" ]]; then
-           warn "Caddy cert dir not found: $caddy_cert_dir"
-           warn "Make sure Caddy is serving this domain so certs exist"
+           warn "Caddy cert not found yet — Caddy may still be obtaining it"
+           warn "If sing-box fails to start, wait a moment and restart"
          fi ;;
       3) tls=self; warn "self-signed cert; client must enable insecure" ;;
       *) die "invalid TLS mode: $tlschoice" ;;
