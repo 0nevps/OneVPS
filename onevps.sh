@@ -278,8 +278,8 @@ acme_email() {
   local e
   e=$(jq -r '.acme_email // ""' "$SB_NODES")
   if [[ -z "$e" ]]; then
-    e=$(ask "ACME registration email (for Let's Encrypt notices)" "admin@$(hostname -f 2>/dev/null || echo example.com)")
-    tmp_nodes ".acme_email=\"$e\""
+    e=$(ask "ACME email (Enter to skip)" "")
+    [[ -n "$e" ]] && tmp_nodes ".acme_email=\"$e\""
   fi
   echo "$e"
 }
@@ -436,6 +436,12 @@ build_hy2_inbound() {
     tls=$(jq -n --arg sn "$domain" --arg email "$email" '
       {enabled:true, server_name:$sn, alpn:["h3"],
        acme:{domain:[$sn], email:$email}}')
+  elif [[ "$tlsmode" == "caddy" ]]; then
+    local caddy_cert="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}/${domain}.crt"
+    local caddy_key="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}/${domain}.key"
+    tls=$(jq -n --arg sn "$domain" --arg crt "$caddy_cert" --arg key "$caddy_key" '
+      {enabled:true, server_name:$sn, alpn:["h3"],
+       certificate_path:$crt, key_path:$key}')
   else
     read -r crt key < <(gen_self_cert "${domain:-bing.com}")
     tls=$(jq -n --arg sn "${domain:-bing.com}" --arg crt "$crt" --arg key "$key" '
@@ -646,11 +652,23 @@ add_hysteria2() {
   if confirm "Use a domain?" n; then
     domain=$(ask "Domain (already resolving to this server)")
     [[ -n "$domain" ]] || die "domain is empty"
-    if confirm "Request a real cert via ACME? (needs port 80 free and domain pointing directly here)" y; then
-      tls=acme
-    else
-      tls=self; warn "self-signed cert; client must enable insecure"
-    fi
+    info "TLS certificate mode:"
+    info "  1) ACME — sing-box requests cert from Let's Encrypt (needs port 443 free)"
+    info "  2) Caddy — use certs managed by Caddy (Caddy must be running for this domain)"
+    info "  3) Self-signed — client must enable insecure"
+    local tlschoice
+    tlschoice=$(ask "TLS mode [1/2/3]" "1")
+    case "$tlschoice" in
+      1) tls=acme ;;
+      2) tls=caddy
+         local caddy_cert_dir="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}"
+         if [[ ! -d "$caddy_cert_dir" ]]; then
+           warn "Caddy cert dir not found: $caddy_cert_dir"
+           warn "Make sure Caddy is serving this domain so certs exist"
+         fi ;;
+      3) tls=self; warn "self-signed cert; client must enable insecure" ;;
+      *) die "invalid TLS mode: $tlschoice" ;;
+    esac
   else
     domain=""; tls=self
     warn "no domain: self-signed cert; client must enable insecure"

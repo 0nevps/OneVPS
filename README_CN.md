@@ -62,7 +62,7 @@ sudo bash onevps.sh
 |------|------|------|------|------|
 | VLESS 不套 CF | VLESS + Reality | TCP 直连 | 不需要 | 不需要（Reality 伪装） |
 | VLESS 套 CF | VLESS + WS | WebSocket 经 CF | 必须 | 自签（CF 终结 TLS） |
-| Hysteria2 | Hysteria2 | QUIC/UDP | 可选 | ACME 或 自签 |
+| Hysteria2 | Hysteria2 | QUIC/UDP | 可选 | ACME、Caddy 或 自签 |
 | SOCKS5 | SOCKS5 | TCP | 不需要 | 不需要 |
 
 ### VLESS + Reality
@@ -105,7 +105,11 @@ sudo bash onevps.sh
 ### Hysteria2
 
 - QUIC/UDP 直连，CF 不支持代理 UDP
-- 有域名可用 ACME 真证书；无域名用自签（客户端需开 `insecure`）
+- TLS 证书模式：
+  - **ACME** — sing-box 向 Let's Encrypt 申请证书（需 443 端口空闲）
+  - **Caddy** — 使用 Caddy 管理的证书（适合 Caddy 已占用 443 端口的场景）
+  - **自签** — 无需域名，客户端需开 `insecure`
+- 无域名时仅支持自签
 
 ### SOCKS5
 

@@ -62,7 +62,7 @@ First time: run `1` to install sing-box, then `2`/`3`/`4` to add nodes.
 |----------|----------|-----------|--------|-------------|
 | VLESS direct | VLESS + Reality | TCP direct | Not needed | Not needed (Reality camouflage) |
 | VLESS via CF | VLESS + WS | WebSocket via CF | Required | Self-signed (CF terminates TLS) |
-| Hysteria2 | Hysteria2 | QUIC/UDP | Optional | ACME or self-signed |
+| Hysteria2 | Hysteria2 | QUIC/UDP | Optional | ACME, Caddy, or self-signed |
 | SOCKS5 | SOCKS5 | TCP | Not needed | Not needed |
 
 ### VLESS + Reality
@@ -105,7 +105,11 @@ First time: run `1` to install sing-box, then `2`/`3`/`4` to add nodes.
 ### Hysteria2
 
 - QUIC/UDP direct connection, CF cannot proxy UDP
-- With domain: use ACME for real cert; without domain: use self-signed (client needs `insecure` flag)
+- TLS certificate modes:
+  - **ACME** — sing-box requests cert from Let's Encrypt (needs port 443 free)
+  - **Caddy** — use certs managed by Caddy (ideal when Caddy already holds port 443)
+  - **Self-signed** — no domain needed, client must enable `insecure` flag
+- Without domain: self-signed only
 
 ### SOCKS5
 
