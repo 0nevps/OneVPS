@@ -65,6 +65,19 @@ rand_uuid() {
   if [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid; return; fi
   python3 -c 'import uuid;print(uuid.uuid4())'
 }
+is_valid_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+ask_uuid() {
+  local input default
+  default=$(rand_uuid)
+  input=$(ask "UUID (Enter for random)" "$default")
+  while ! is_valid_uuid "$input"; do
+    warn "invalid UUID format (expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+    input=$(ask "UUID (Enter for random)" "$default")
+  done
+  echo "$input"
+}
 rand_pass() { openssl rand -base64 16 | tr -d '/+=' | cut -c1-16; }
 rand_path() { echo "/$(openssl rand -hex 6)"; }
 rand_short_id() { openssl rand -hex 8; }
@@ -487,7 +500,7 @@ add_vless() {
 
   local name uuid id socks5
   name=$(ask "Node name" "vless-$(openssl rand -hex 2)")
-  uuid=$(rand_uuid)
+  uuid=$(ask_uuid)
   id=$(openssl rand -hex 4)
 
   if confirm "Enable Cloudflare CDN?" n; then
@@ -925,7 +938,9 @@ reset_secret() {
   type=$(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|.type' "$SB_NODES")
   case "$type" in
     vless)
-      tmp_nodes "(.nodes[]|select(.id==\"$id\")).uuid = \"$(rand_uuid)\""
+      local new_uuid
+      new_uuid=$(ask_uuid)
+      tmp_nodes "(.nodes[]|select(.id==\"$id\")).uuid = \"$new_uuid\""
       ok "UUID reset" ;;
     socks5)
       tmp_nodes "(.nodes[]|select(.id==\"$id\")).password = \"$(rand_pass)\""
