@@ -595,12 +595,25 @@ add_vless_ws() {
   domain=$(ask "Domain (hosted on CF, A record pointing to this VPS, orange cloud on)")
   [[ -n "$domain" ]] || die "domain is empty"
 
-  info "CF origin ports allowed: ${CF_PORTS[*]}"
+  info "CF origin ports (pick one):"
+  local i=1
+  for p in "${CF_PORTS[@]}"; do
+    local mark=""
+    if port_taken_by_node "$p"; then mark=" [node]"
+    elif port_in_use "$p"; then mark=" [in use]"
+    fi
+    printf '    %d) %s%s\n' "$i" "$p" "$mark"
+    ((i++))
+  done
   while :; do
-    port=$(ask "Listen port" "443")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
-    if ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$port"; then
-      warn "CF mode requires one of: ${CF_PORTS[*]}"; continue
+    local choice
+    choice=$(ask "Port number or selection [1-${#CF_PORTS[@]}]" "1")
+    if [[ "$choice" =~ ^[1-${#CF_PORTS[@]}]$ ]]; then
+      port="${CF_PORTS[$((choice-1))]}"
+    elif printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$choice"; then
+      port="$choice"
+    else
+      warn "pick from list: ${CF_PORTS[*]}"; continue
     fi
     if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
     if port_in_use "$port"; then
@@ -926,11 +939,32 @@ edit_port() {
   type=$(jq -r '.type' <<<"$n"); cf=$(jq -r '.cf//false' <<<"$n")
   tp=$(jq -r '.transport // ""' <<<"$n")
   proto=tcp; [[ "$type" == hysteria2 ]] && proto=udp
+  if [[ "$tp" == "ws" ]]; then
+    info "CF origin ports (pick one):"
+    local i=1
+    for p in "${CF_PORTS[@]}"; do
+      local mark=""
+      if port_taken_by_node "$p"; then mark=" [node]"
+      elif port_in_use "$p"; then mark=" [in use]"
+      fi
+      printf '    %d) %s%s\n' "$i" "$p" "$mark"
+      ((i++))
+    done
+  fi
   while :; do
-    newp=$(ask "New port" "$(jq -r '.port' <<<"$n")")
-    [[ "$newp" =~ ^[0-9]+$ ]] || { warn "invalid"; continue; }
-    if [[ "$tp" == "ws" ]] && ! printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$newp"; then
-      warn "WS+CF mode requires one of: ${CF_PORTS[*]}"; continue
+    if [[ "$tp" == "ws" ]]; then
+      local choice
+      choice=$(ask "Port number or selection [1-${#CF_PORTS[@]}]" "$(jq -r '.port' <<<"$n")")
+      if [[ "$choice" =~ ^[1-${#CF_PORTS[@]}]$ ]]; then
+        newp="${CF_PORTS[$((choice-1))]}"
+      elif printf '%s\n' "${CF_PORTS[@]}" | grep -qx "$choice"; then
+        newp="$choice"
+      else
+        warn "pick from list: ${CF_PORTS[*]}"; continue
+      fi
+    else
+      newp=$(ask "New port" "$(jq -r '.port' <<<"$n")")
+      [[ "$newp" =~ ^[0-9]+$ ]] || { warn "invalid"; continue; }
     fi
     if jq -e --argjson p "$newp" --arg id "$id" \
         '.nodes[]|select(.port==$p and .id!=$id)' "$SB_NODES" >/dev/null 2>&1; then
