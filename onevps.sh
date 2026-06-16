@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # OneVPS — sing-box node setup script
-# Protocols: VLESS (Reality / WS+CF)  /  Hysteria2  /  SOCKS5
+# Protocols: VLESS (Reality / WS+CF)  /  SOCKS5
 # Features: optional Cloudflare CDN  /  optional SOCKS5 egress
 #
 set -euo pipefail
@@ -192,7 +192,7 @@ install_singbox() {
   rm -rf "$tmp"
 
   mkdir -p "$SB_DIR" "$SB_CERT_DIR"
-  [[ -f "$SB_NODES" ]] || echo '{"nodes":[],"acme_email":""}' > "$SB_NODES"
+  [[ -f "$SB_NODES" ]] || echo '{"nodes":[]}' > "$SB_NODES"
 
   write_service
   rebuild_config
@@ -261,7 +261,7 @@ port_taken_by_node() {
 require_must() { command -v "$SB_BIN" >/dev/null 2>&1 || die "run menu option [1] to install sing-box first"; }
 
 # ----------------------------------------------------------------------------
-# Certificates (only used by WS+CF and Hysteria2)
+# Certificates (used by WS+CF)
 # ----------------------------------------------------------------------------
 gen_self_cert() {
   local cn="$1" crt key
@@ -274,15 +274,6 @@ gen_self_cert() {
   echo "$crt $key"
 }
 
-acme_email() {
-  local e
-  e=$(jq -r '.acme_email // ""' "$SB_NODES")
-  if [[ -z "$e" ]]; then
-    e=$(ask "ACME email (Enter to skip)" "")
-    [[ -n "$e" ]] && tmp_nodes ".acme_email=\"$e\""
-  fi
-  echo "$e"
-}
 
 # ----------------------------------------------------------------------------
 # [3] Node storage + config generation
@@ -296,8 +287,7 @@ tmp_nodes() {
 node_count() { jq '.nodes|length' "$SB_NODES"; }
 
 rebuild_config() {
-  [[ -f "$SB_NODES" ]] || echo '{"nodes":[],"acme_email":""}' > "$SB_NODES"
-  local email; email=$(jq -r '.acme_email // ""' "$SB_NODES")
+  [[ -f "$SB_NODES" ]] || echo '{"nodes":[]}' > "$SB_NODES"
 
   local inbounds outbounds rules
   inbounds=$(jq -c '[]' <<<'[]')
@@ -313,9 +303,8 @@ rebuild_config() {
 
     local ib
     case "$type" in
-      vless)     ib=$(build_vless_inbound "$n" "$email") ;;
-      hysteria2) ib=$(build_hy2_inbound   "$n" "$email") ;;
-      socks5)    ib=$(build_socks5_inbound "$n") ;;
+      vless)  ib=$(build_vless_inbound "$n") ;;
+      socks5) ib=$(build_socks5_inbound "$n") ;;
       *) continue ;;
     esac
     inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds")
@@ -358,32 +347,19 @@ rebuild_config() {
       return 1
     fi
     rm -f "$chk_err"
-    # Fix Caddy cert permissions for any caddy-mode hy2 nodes
-    while IFS= read -r n; do
-      [[ "$(jq -r '.tls' <<<"$n")" == "caddy" ]] || continue
-      local d; d=$(jq -r '.domain' <<<"$n")
-      local cdir="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${d}"
-      if [[ -d "$cdir" ]]; then
-        chmod 755 /var/lib/caddy/ /var/lib/caddy/.local/ /var/lib/caddy/.local/share/ \
-          /var/lib/caddy/.local/share/caddy/ /var/lib/caddy/.local/share/caddy/certificates/ \
-          /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/ \
-          "$cdir" 2>/dev/null
-        chmod 644 "${cdir}/${d}.crt" "${cdir}/${d}.key" 2>/dev/null
-      fi
-    done < <(jq -c '.nodes[] | select(.type=="hysteria2")' "$SB_NODES")
     systemctl restart sing-box 2>/dev/null || true
   fi
 }
 
 # --- VLESS inbound ---
 build_vless_inbound() {
-  local n="$1" email="$2"
+  local n="$1"
   local transport; transport=$(jq -r '.transport' <<<"$n")
 
   if [[ "$transport" == "reality" ]]; then
     build_vless_reality_inbound "$n"
   else
-    build_vless_ws_inbound "$n" "$email"
+    build_vless_ws_inbound "$n"
   fi
 }
 
@@ -415,7 +391,7 @@ build_vless_reality_inbound() {
 }
 
 build_vless_ws_inbound() {
-  local n="$1" email="$2" tls
+  local n="$1" tls
   local domain; domain=$(jq -r '.domain // ""' <<<"$n")
   local crt key
   read -r crt key < <(gen_self_cert "${domain:-bing.com}")
@@ -438,41 +414,6 @@ build_vless_ws_inbound() {
     }'
 }
 
-# --- Hysteria2 inbound ---
-build_hy2_inbound() {
-  local n="$1" email="$2" tls
-  local domain tlsmode crt key
-  domain=$(jq -r '.domain // ""' <<<"$n")
-  tlsmode=$(jq -r '.tls' <<<"$n")
-
-  if [[ "$tlsmode" == "acme" ]]; then
-    tls=$(jq -n --arg sn "$domain" --arg email "$email" '
-      {enabled:true, server_name:$sn, alpn:["h3"],
-       acme:{domain:[$sn], email:$email}}')
-  elif [[ "$tlsmode" == "caddy" ]]; then
-    local caddy_cert="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}/${domain}.crt"
-    local caddy_key="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}/${domain}.key"
-    tls=$(jq -n --arg sn "$domain" --arg crt "$caddy_cert" --arg key "$caddy_key" '
-      {enabled:true, server_name:$sn, alpn:["h3"],
-       certificate_path:$crt, key_path:$key}')
-  else
-    read -r crt key < <(gen_self_cert "${domain:-bing.com}")
-    tls=$(jq -n --arg sn "${domain:-bing.com}" --arg crt "$crt" --arg key "$key" '
-      {enabled:true, server_name:$sn, alpn:["h3"],
-       certificate_path:$crt, key_path:$key}')
-  fi
-
-  jq -n \
-    --arg tag "$(jq -r '.tag' <<<"$n")" \
-    --argjson port "$(jq -r '.port' <<<"$n")" \
-    --arg pass "$(jq -r '.password' <<<"$n")" \
-    --argjson tls "$tls" '
-    {
-      type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
-      users:[{password:$pass}],
-      tls:$tls
-    }'
-}
 
 # --- SOCKS5 inbound ---
 build_socks5_inbound() {
@@ -665,99 +606,6 @@ add_vless_ws() {
   pause
 }
 
-# ----------------------------------------------------------------------------
-# [5] Add Hysteria2
-# ----------------------------------------------------------------------------
-add_hysteria2() {
-  require_must
-  echo; info "Add Hysteria2 node (QUIC/UDP, direct only — no CF support)"
-  local name domain tls port pass socks5
-
-  name=$(ask "Node name" "hy2-$(openssl rand -hex 2)")
-
-  if confirm "Use a domain?" n; then
-    domain=$(ask "Domain (already resolving to this server)")
-    [[ -n "$domain" ]] || die "domain is empty"
-    info "TLS certificate mode:"
-    info "  1) ACME — sing-box requests cert from Let's Encrypt (needs port 443 free)"
-    info "  2) Caddy — use certs managed by Caddy (Caddy must be running for this domain)"
-    info "  3) Self-signed — client must enable insecure"
-    local tlschoice
-    tlschoice=$(ask "TLS mode [1/2/3]" "1")
-    case "$tlschoice" in
-      1) tls=acme ;;
-      2) tls=caddy
-         local caddyfile="/etc/caddy/Caddyfile"
-         if [[ -f "$caddyfile" ]] && ! grep -q "^${domain}" "$caddyfile"; then
-           printf '\n%s {\n    respond "OK" 200\n}\n' "$domain" >> "$caddyfile"
-           info "Added $domain to $caddyfile"
-           if systemctl is-active caddy >/dev/null 2>&1; then
-             systemctl reload caddy
-             info "Caddy reloaded — waiting for cert..."
-             sleep 5
-           else
-             warn "Caddy not running — start it to obtain cert"
-           fi
-         fi
-         local caddy_cert_dir="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}"
-         if [[ -d "$caddy_cert_dir" ]]; then
-           chmod 755 /var/lib/caddy/ /var/lib/caddy/.local/ /var/lib/caddy/.local/share/ \
-             /var/lib/caddy/.local/share/caddy/ /var/lib/caddy/.local/share/caddy/certificates/ \
-             /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/ \
-             "$caddy_cert_dir" 2>/dev/null
-           chmod 644 "${caddy_cert_dir}/${domain}.crt" "${caddy_cert_dir}/${domain}.key" 2>/dev/null
-           info "Fixed cert permissions for sing-box access"
-         else
-           warn "Caddy cert not found yet — Caddy may still be obtaining it"
-           warn "If sing-box fails to start, wait a moment and restart"
-         fi ;;
-      3) tls=self; warn "self-signed cert; client must enable insecure" ;;
-      *) die "invalid TLS mode: $tlschoice" ;;
-    esac
-  else
-    domain=""; tls=self
-    warn "no domain: self-signed cert; client must enable insecure"
-  fi
-
-  while :; do
-    port=$(ask "Listen port/UDP (Enter for random)" "$(rand_port)")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
-    if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
-    if port_in_use "$port"; then
-      confirm "Port $port appears to be in use. Use anyway?" n || continue
-    fi
-    break
-  done
-
-  pass=$(rand_pass)
-  socks5=$(ask_socks5)
-
-  local id; id=$(openssl rand -hex 4)
-  local node
-  node=$(jq -n \
-    --arg id "$id" --arg name "$name" --arg tag "hy2-$id" \
-    --argjson port "$port" --arg pass "$pass" \
-    --arg domain "$domain" --arg tls "$tls" '
-    {id:$id,type:"hysteria2",name:$name,tag:$tag,port:$port,password:$pass,
-     domain:$domain,tls:$tls,enabled:true}')
-  if [[ -n "$socks5" ]]; then
-    node=$(jq -c --argjson s "$socks5" '. + {socks5:$s}' <<<"$node")
-  fi
-
-  [[ "$tls" == acme ]] && acme_email >/dev/null
-  tmp_nodes ".nodes += [$node]"
-  open_port "$port" udp
-
-  if rebuild_config; then
-    ok "Hysteria2 node added"
-    node_link "$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")"
-  else
-    err "config generation failed, rolled back"
-    tmp_nodes "del(.nodes[] | select(.id==\"$id\"))"
-    rebuild_config || true
-  fi
-  pause
-}
 
 # ----------------------------------------------------------------------------
 # [6] Add SOCKS5 node
@@ -848,23 +696,6 @@ node_link() {
       [[ -z "$sni" ]] && sni="$addr"
       link="vless://${uuid}@${addr}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${host}&path=$(urlenc "$path")&allowInsecure=1#$(urlenc "$name")"
     fi
-  else
-    local pass domain sni insecure tlsmode pin
-    pass=$(jq -r '.password' <<<"$n")
-    domain=$(jq -r '.domain // ""' <<<"$n")
-    tlsmode=$(jq -r '.tls' <<<"$n")
-    addr="$domain"; [[ -z "$addr" ]] && addr="$(pub_ip)"
-    sni="$domain"; [[ -z "$sni" ]] && sni="$addr"
-    insecure=0; [[ "$tlsmode" == self ]] && insecure=1
-    link="hysteria2://${pass}@${addr}:${port}?alpn=h3&sni=${sni}&insecure=${insecure}"
-    if [[ "$tlsmode" == "self" ]]; then
-      local certfile="$SB_CERT_DIR/${domain:-bing.com}.crt"
-      if [[ -f "$certfile" ]]; then
-        pin=$(openssl x509 -noout -fingerprint -sha256 -in "$certfile" 2>/dev/null | sed 's/.*=//;s/://g')
-        [[ -n "$pin" ]] && link="${link}&pinSHA256=${pin}"
-      fi
-    fi
-    link="${link}#$(urlenc "$name")"
   fi
 
   echo
@@ -979,7 +810,7 @@ edit_port() {
   n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")
   type=$(jq -r '.type' <<<"$n"); cf=$(jq -r '.cf//false' <<<"$n")
   tp=$(jq -r '.transport // ""' <<<"$n")
-  proto=tcp; [[ "$type" == hysteria2 ]] && proto=udp
+  proto=tcp
   if [[ "$tp" == "ws" ]]; then
     info "CF origin ports (pick one):"
     local i=1
@@ -1059,7 +890,7 @@ del_node() {
   local n port proto
   n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$SB_NODES")
   port=$(jq -r '.port' <<<"$n")
-  proto=tcp; [[ "$(jq -r '.type' <<<"$n")" == hysteria2 ]] && proto=udp
+  proto=tcp
   tmp_nodes "del(.nodes[]|select(.id==\"$id\"))"
   close_port "$port" "$proto"
   rebuild_config && ok "deleted" || err "apply failed"
@@ -1164,7 +995,7 @@ net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
-# UDP buffers — Hysteria2 (QUIC) throughput
+# UDP buffers
 net.core.rmem_default = 26214400
 net.core.wmem_default = 26214400
 net.ipv4.tcp_fastopen = 3
@@ -1307,27 +1138,25 @@ EOF
 
   1) Install / update sing-box
   2) Add node — VLESS (Reality / WS+CF)
-  3) Add node — Hysteria2
-  4) Add node — SOCKS5
-  5) Manage nodes
-  6) Show all share links
-  7) Restart service
-  8) BBR acceleration
-  9) System optimization
- 10) Uninstall
+  3) Add node — SOCKS5
+  4) Manage nodes
+  5) Show all share links
+  6) Restart service
+  7) BBR acceleration
+  8) System optimization
+  9) Uninstall
   0) Exit
 EOF
     case "$(ask 'Select')" in
       1) install_singbox; pause ;;
       2) add_vless ;;
-      3) add_hysteria2 ;;
-      4) add_socks5 ;;
-      5) manage_nodes ;;
-      6) show_links ;;
-      7) restart_service ;;
-      8) enable_bbr ;;
-      9) optimize_system ;;
-      10) uninstall ;;
+      3) add_socks5 ;;
+      4) manage_nodes ;;
+      5) show_links ;;
+      6) restart_service ;;
+      7) enable_bbr ;;
+      8) optimize_system ;;
+      9) uninstall ;;
       0|"") exit 0 ;;
       *) ;;
     esac

@@ -8,7 +8,6 @@ VPS 一键搭建代理节点脚本，基于 [sing-box](https://github.com/SagerN
 
 - **VLESS + Reality** — 直连，无需域名/证书，伪装真站 TLS 指纹
 - **VLESS + WebSocket + CF CDN** — 套 Cloudflare 橙云代理，隐藏真实 IP
-- **Hysteria2** — QUIC/UDP 高速直连
 - **SOCKS5** — 带认证的 SOCKS5 代理入站
 
 两个可选增强：
@@ -35,7 +34,7 @@ sudo bash onevps.sh
 
 脚本启动先做环境检测（root / 架构 / 包管理器 / systemd），通过后进入菜单。
 
-首次使用：先跑 `1` 安装 sing-box，再 `2`/`3`/`4` 添加节点。
+首次使用：先跑 `1` 安装 sing-box，再 `2`/`3` 添加节点。
 
 ---
 
@@ -44,12 +43,12 @@ sudo bash onevps.sh
 ```
 1) 安装 / 更新 sing-box
 2) 添加节点 — VLESS (Reality / WS+CF)
-3) 添加节点 — Hysteria2
-4) 添加节点 — SOCKS5
-5) 管理节点
-6) 查看全部分享链接
-7) 重启服务
-8) BBR 加速
+3) 添加节点 — SOCKS5
+4) 管理节点
+5) 查看全部分享链接
+6) 重启服务
+7) BBR 加速
+8) 系统优化
 9) 卸载
 0) 退出
 ```
@@ -62,7 +61,6 @@ sudo bash onevps.sh
 |------|------|------|------|------|
 | VLESS 不套 CF | VLESS + Reality | TCP 直连 | 不需要 | 不需要（Reality 伪装） |
 | VLESS 套 CF | VLESS + WS | WebSocket 经 CF | 必须 | 自签（CF 终结 TLS） |
-| Hysteria2 | Hysteria2 | QUIC/UDP | 可选 | ACME、Caddy 或 自签 |
 | SOCKS5 | SOCKS5 | TCP | 不需要 | 不需要 |
 
 ### VLESS + Reality
@@ -101,15 +99,6 @@ sudo bash onevps.sh
 
 > **为什么套 CF 用自签？** CF 橙云会拦截 ACME 的 HTTP-01 验证，签不出真证书。
 > 回源用自签 + CF "完全(Full)" 模式，VPS↔CF 之间仍加密。
-
-### Hysteria2
-
-- QUIC/UDP 直连，CF 不支持代理 UDP
-- TLS 证书模式：
-  - **ACME** — sing-box 向 Let's Encrypt 申请证书（需 443 端口空闲）
-  - **Caddy** — 使用 Caddy 管理的证书（适合 Caddy 已占用 443 端口的场景）
-  - **自签** — 无需域名，客户端需开 `insecure`
-- 无域名时仅支持自签
 
 ### SOCKS5
 

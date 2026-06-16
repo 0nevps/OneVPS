@@ -8,7 +8,6 @@ Supported protocols:
 
 - **VLESS + Reality** — Direct connection, no domain/certificate needed, TLS fingerprint camouflage
 - **VLESS + WebSocket + CF CDN** — Route through Cloudflare CDN, hide real IP
-- **Hysteria2** — High-speed QUIC/UDP direct connection
 - **SOCKS5** — Authenticated SOCKS5 proxy inbound
 
 Optional enhancements:
@@ -35,7 +34,7 @@ sudo bash onevps.sh
 
 The script runs environment checks (root / architecture / package manager / systemd) before entering the menu.
 
-First time: run `1` to install sing-box, then `2`/`3`/`4` to add nodes.
+First time: run `1` to install sing-box, then `2`/`3` to add nodes.
 
 ---
 
@@ -44,12 +43,12 @@ First time: run `1` to install sing-box, then `2`/`3`/`4` to add nodes.
 ```
 1) Install / Update sing-box
 2) Add Node — VLESS (Reality / WS+CF)
-3) Add Node — Hysteria2
-4) Add Node — SOCKS5
-5) Manage Nodes
-6) View All Share Links
-7) Restart Service
-8) BBR Acceleration
+3) Add Node — SOCKS5
+4) Manage Nodes
+5) View All Share Links
+6) Restart Service
+7) BBR Acceleration
+8) System Optimization
 9) Uninstall
 0) Exit
 ```
@@ -62,7 +61,6 @@ First time: run `1` to install sing-box, then `2`/`3`/`4` to add nodes.
 |----------|----------|-----------|--------|-------------|
 | VLESS direct | VLESS + Reality | TCP direct | Not needed | Not needed (Reality camouflage) |
 | VLESS via CF | VLESS + WS | WebSocket via CF | Required | Self-signed (CF terminates TLS) |
-| Hysteria2 | Hysteria2 | QUIC/UDP | Optional | ACME, Caddy, or self-signed |
 | SOCKS5 | SOCKS5 | TCP | Not needed | Not needed |
 
 ### VLESS + Reality
@@ -101,15 +99,6 @@ First time: run `1` to install sing-box, then `2`/`3`/`4` to add nodes.
 
 > **Why self-signed with CF?** CF's orange cloud intercepts ACME HTTP-01 validation, preventing real cert issuance.
 > Self-signed + CF "Full" mode keeps VPS↔CF traffic encrypted.
-
-### Hysteria2
-
-- QUIC/UDP direct connection, CF cannot proxy UDP
-- TLS certificate modes:
-  - **ACME** — sing-box requests cert from Let's Encrypt (needs port 443 free)
-  - **Caddy** — use certs managed by Caddy (ideal when Caddy already holds port 443)
-  - **Self-signed** — no domain needed, client must enable `insecure` flag
-- Without domain: self-signed only
 
 ### SOCKS5
 
