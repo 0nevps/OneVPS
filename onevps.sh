@@ -849,13 +849,22 @@ node_link() {
       link="vless://${uuid}@${addr}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${host}&path=$(urlenc "$path")&allowInsecure=1#$(urlenc "$name")"
     fi
   else
-    local pass domain sni insecure
+    local pass domain sni insecure tlsmode pin
     pass=$(jq -r '.password' <<<"$n")
     domain=$(jq -r '.domain // ""' <<<"$n")
+    tlsmode=$(jq -r '.tls' <<<"$n")
     addr="$domain"; [[ -z "$addr" ]] && addr="$(pub_ip)"
     sni="$domain"; [[ -z "$sni" ]] && sni="$addr"
-    insecure=0; [[ "$(jq -r '.tls' <<<"$n")" == self ]] && insecure=1
-    link="hysteria2://${pass}@${addr}:${port}?sni=${sni}&insecure=${insecure}#$(urlenc "$name")"
+    insecure=0; [[ "$tlsmode" == self ]] && insecure=1
+    link="hysteria2://${pass}@${addr}:${port}?alpn=h3&sni=${sni}&insecure=${insecure}"
+    if [[ "$tlsmode" == "self" ]]; then
+      local certfile="$SB_CERT_DIR/${domain:-bing.com}.crt"
+      if [[ -f "$certfile" ]]; then
+        pin=$(openssl x509 -noout -fingerprint -sha256 -in "$certfile" 2>/dev/null | sed 's/.*=//;s/://g')
+        [[ -n "$pin" ]] && link="${link}&pinSHA256=${pin}"
+      fi
+    fi
+    link="${link}#$(urlenc "$name")"
   fi
 
   echo
