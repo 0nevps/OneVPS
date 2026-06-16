@@ -358,6 +358,19 @@ rebuild_config() {
       return 1
     fi
     rm -f "$chk_err"
+    # Fix Caddy cert permissions for any caddy-mode hy2 nodes
+    while IFS= read -r n; do
+      [[ "$(jq -r '.tls' <<<"$n")" == "caddy" ]] || continue
+      local d; d=$(jq -r '.domain' <<<"$n")
+      local cdir="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${d}"
+      if [[ -d "$cdir" ]]; then
+        chmod 755 /var/lib/caddy/ /var/lib/caddy/.local/ /var/lib/caddy/.local/share/ \
+          /var/lib/caddy/.local/share/caddy/ /var/lib/caddy/.local/share/caddy/certificates/ \
+          /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/ \
+          "$cdir" 2>/dev/null
+        chmod 644 "${cdir}/${d}.crt" "${cdir}/${d}.key" 2>/dev/null
+      fi
+    done < <(jq -c '.nodes[] | select(.type=="hysteria2")' "$SB_NODES")
     systemctl restart sing-box 2>/dev/null || true
   fi
 }
@@ -687,7 +700,14 @@ add_hysteria2() {
            fi
          fi
          local caddy_cert_dir="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${domain}"
-         if [[ ! -d "$caddy_cert_dir" ]]; then
+         if [[ -d "$caddy_cert_dir" ]]; then
+           chmod 755 /var/lib/caddy/ /var/lib/caddy/.local/ /var/lib/caddy/.local/share/ \
+             /var/lib/caddy/.local/share/caddy/ /var/lib/caddy/.local/share/caddy/certificates/ \
+             /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/ \
+             "$caddy_cert_dir" 2>/dev/null
+           chmod 644 "${caddy_cert_dir}/${domain}.crt" "${caddy_cert_dir}/${domain}.key" 2>/dev/null
+           info "Fixed cert permissions for sing-box access"
+         else
            warn "Caddy cert not found yet — Caddy may still be obtaining it"
            warn "If sing-box fails to start, wait a moment and restart"
          fi ;;
