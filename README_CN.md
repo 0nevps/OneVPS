@@ -2,25 +2,29 @@
 
 [English](README.md)
 
-VPS 一键搭建代理节点脚本，基于 [sing-box](https://github.com/SagerNet/sing-box)。
+VPS 一键搭建 Xray 节点脚本，主线配置为 **VLESS + TCP + REALITY + XTLS Vision + uTLS**。
 
-支持协议：
+这个版本从 sing-box 改为 [Xray-core](https://github.com/XTLS/Xray-core)，使用社区常见的 Reality + Vision 组合：无需域名、无需证书，客户端使用 uTLS 指纹。
 
-- **VLESS + Reality** — 直连，无需域名/证书，伪装真站 TLS 指纹
-- **VLESS + WebSocket + CF CDN** — 套 Cloudflare 橙云代理，隐藏真实 IP
-- **SOCKS5** — 带认证的 SOCKS5 代理入站
+---
 
-两个可选增强：
+## 特性
 
-- 🟠 **Cloudflare CDN** — VLESS 节点可套 CF（自动切换为 WS 传输）
-- 🧦 **SOCKS5 落地** — 给任意节点挂带认证的 SOCKS5 出口，VPS 当前置
-- 🚀 **BBR 加速** — 一键开启内核 BBR TCP 拥塞控制，提升吞吐
+- **Xray-core 官方安装器**：通过 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 安装/更新核心与 geodata
+- **VLESS + TCP + REALITY**：直连 VPS，Reality 借用目标站 TLS 握手特征
+- **XTLS Vision**：服务端用户固定 `flow: xtls-rprx-vision`
+- **uTLS**：分享链接固定 `fp=chrome`，兼容主流客户端
+- **安全默认值**：随机 UUID、X25519 密钥、16 位 shortId，阻断私网地址、BT 协议和 UDP/443
+- **服务加固**：systemd 使用 `nobody` 运行，仅保留绑定低端口所需能力
+- **运维能力**：节点管理、分享链接、BBR、基础系统优化
+
+> 旧版 sing-box 节点不会自动迁移。新版脚本使用 `/usr/local/etc/xray/` 作为配置目录。
 
 ---
 
 ## 快速开始
 
-一键运行（远程拉取）：
+一键运行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
@@ -32,112 +36,80 @@ bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 sudo bash onevps.sh
 ```
 
-脚本启动先做环境检测（root / 架构 / 包管理器 / systemd），通过后进入菜单。
-
-首次使用：先跑 `1` 安装 sing-box，再 `2`/`3` 添加节点。
+首次使用：先运行 `1` 安装/更新 Xray-core，再运行 `2` 添加 Reality 节点。
 
 ---
 
 ## 菜单
 
-```
-1) 安装 / 更新 sing-box
-2) 添加节点 — VLESS (Reality / WS+CF)
-3) 添加节点 — SOCKS5
-4) 管理节点
-5) 查看全部分享链接
-6) 重启服务
-7) BBR 加速
-8) 系统优化
-9) 卸载
-0) 退出
+```text
+1) Install / update Xray-core
+2) Add node - VLESS + Reality + Vision + uTLS
+3) Manage nodes
+4) Show all share links
+5) Restart service
+6) BBR acceleration
+7) System optimization
+8) Uninstall
+0) Exit
 ```
 
 ---
 
-## 协议与模式
+## 节点配置
 
-| 场景 | 协议 | 传输 | 域名 | 证书 |
-|------|------|------|------|------|
-| VLESS 不套 CF | VLESS + Reality | TCP 直连 | 不需要 | 不需要（Reality 伪装） |
-| VLESS 套 CF | VLESS + WS | WebSocket 经 CF | 必须 | 自签（CF 终结 TLS） |
-| SOCKS5 | SOCKS5 | TCP | 不需要 | 不需要 |
+| 项目 | 默认值 |
+|------|--------|
+| 协议 | VLESS |
+| 传输 | TCP |
+| 传输安全 | REALITY |
+| 流控 | `xtls-rprx-vision` |
+| uTLS 指纹 | `chrome` |
+| 加密 | `none` |
+| 默认端口 | `443`，被占用时改随机端口 |
 
-### VLESS + Reality
+分享链接格式：
 
-- 直连 VPS，无需域名或证书
-- 伪装目标站需支持 TLS 1.3 + H2（预设：microsoft.com、apple.com 等）
-- 客户端使用 `flow: xtls-rprx-vision`
-- 分享链接格式：`vless://...?security=reality&fp=chrome&pbk=...&sid=...`
-
-### VLESS + WS + CF CDN
-
-- 分享链接格式：`vless://...?security=tls&type=ws&host=...&path=...`
-
-#### Cloudflare 配置步骤
-
-1. **域名托管到 CF** — 域名的 NS 记录指向 Cloudflare（在注册商处修改）
-2. **添加 DNS 记录** — CF 面板 → DNS → 添加 A 记录：
-   - 名称：`你的域名`（如 `proxy.example.com`）
-   - 内容：`VPS 真实 IP`
-   - 代理状态：**已代理**（橙云 ☁️ 开启）
-3. **SSL/TLS 加密模式** — CF 面板 → SSL/TLS → 概述 → 选 **完全(Full)**
-   - ⚠️ 不要选「完全(严格)」— 本脚本用自签证书，严格模式会拒绝
-   - ⚠️ 不要选「灵活」— 灵活模式回源走明文 HTTP，不安全
-4. **WebSocket** — CF 默认已启用，无需额外设置
-5. **回源端口** — CF 免费版仅代理以下 HTTPS 端口，脚本会强制校验：
-   ```
-   443  2053  2083  2087  2096  8443
-   ```
-
-#### 注意事项
-
-- **生效时间**：DNS 记录改为「已代理」后，通常几分钟生效，偶尔需等数小时
-- **真实 IP 泄露**：开启橙云前确保没有其他 DNS 记录（如 MX、未代理的子域名）暴露 VPS IP
-- **CF 免费版限制**：无 WebSocket 连接数硬性限制，但高流量可能触发 CF 安全规则（如 Under Attack 模式、Rate Limiting）
-- **客户端 SNI/Host**：必须填域名（非 IP），脚本生成的分享链接已自动处理
-
-> **为什么套 CF 用自签？** CF 橙云会拦截 ACME 的 HTTP-01 验证，签不出真证书。
-> 回源用自签 + CF "完全(Full)" 模式，VPS↔CF 之间仍加密。
-
-### SOCKS5
-
-- 带用户名/密码认证的 SOCKS5 代理
-- 无需域名或证书，最轻量的节点类型
-- 可选挂 SOCKS5 落地出口（套娃：客户端 → VPS SOCKS5 入站 → 远端 SOCKS5 出站）
-- 分享链接格式：`socks5://user:pass@ip:port#name`
+```text
+vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=TARGET&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&spx=%2F&type=tcp#NAME
+```
 
 ---
 
-## SOCKS5 落地
+## Reality 目标站
 
-添加节点时或在「管理节点」里可挂 SOCKS5 出口：
+脚本内置候选：
 
-```
-SOCKS5 服务器地址: residential.example.com
-SOCKS5 端口: 1080
-用户名: user
-密码: ******
-```
+- `www.microsoft.com`
+- `www.apple.com`
+- `www.samsung.com`
+- `gateway.icloud.com`
+- `www.lovelive-anime.jp`
 
-挂上后该节点 **全部流量**（含 DNS）从 SOCKS5 出口落地，VPS 仅作前置中转。
+目标站建议满足：
 
-> ⚠️ 无故障回落：SOCKS5 出口挂掉时该节点直接不可用。
+- 支持 TLS 1.3 和 H2
+- SNI 稳定，证书 SAN 覆盖所填域名
+- 尽量选择与你 VPS 网络位置延迟较低的站点
+
+添加或修改节点时，脚本会尝试执行 `xray tls ping` 做目标站探测；探测失败不会强制中断，但建议换一个更稳定的目标站。
 
 ---
 
 ## 节点管理
 
-菜单 `5` 选择节点后：
+菜单 `3` 可执行：
 
+```text
+1) 修改端口
+2) 重置 UUID
+3) 轮换 Reality 密钥和 shortId
+4) 修改 Reality 目标站
+5) 启用/停用
+6) 删除节点
 ```
-1) 切换 SOCKS5 落地(改/加/删)
-2) 修改端口
-3) 重置 UUID / 密码
-4) 启用/停用
-5) 删除节点
-6) 修改 Reality 伪装站 (仅 Reality 节点)
-```
+
+轮换密钥或 shortId 后，旧客户端链接会失效，需要重新导入菜单 `4` 输出的新链接。
 
 ---
 
@@ -145,45 +117,52 @@ SOCKS5 端口: 1080
 
 | 路径 | 用途 |
 |------|------|
-| `/usr/local/bin/sing-box` | 内核二进制 |
-| `/etc/sing-box/nodes.json` | 节点元数据（唯一真相源） |
-| `/etc/sing-box/config.json` | sing-box 运行配置（由 nodes.json 自动生成） |
-| `/etc/sing-box/certs/` | 自签证书（Reality 不使用） |
-| `/etc/systemd/system/sing-box.service` | systemd 服务 |
+| `/usr/local/bin/xray` | Xray 核心二进制 |
+| `/usr/local/etc/xray/config.json` | Xray 运行配置，由脚本生成 |
+| `/usr/local/etc/xray/onevps-nodes.json` | 节点元数据 |
+| `/usr/local/share/xray/` | geoip/geosite 数据 |
+| `/etc/systemd/system/xray.service` | systemd 服务 |
+| `/var/log/xray/` | Xray 日志目录 |
 
 手动管理服务：
 
 ```bash
-systemctl status sing-box
-systemctl restart sing-box
-journalctl -u sing-box -f
+systemctl status xray
+systemctl restart xray
+journalctl -u xray -f
+```
+
+配置检查：
+
+```bash
+xray run -test -config /usr/local/etc/xray/config.json
 ```
 
 ---
 
 ## 环境要求
 
-- Linux + **systemd**
+- Linux + systemd
 - root 权限
 - 架构：amd64 / arm64 / armv7
-- 包管理器：apt / dnf / yum / apk
-- 依赖自动安装：`curl` `jq` `openssl` `tar`
+- 包管理器：apt / dnf / yum / zypper
+- 依赖自动安装：`curl` `jq` `openssl`
 
 ---
 
-## BBR 加速
+## BBR 与系统优化
 
-菜单 `8` 一键启用 Google BBR TCP 拥塞控制算法（需内核 ≥ 4.9）。
+菜单 `6` 可启用 BBR，写入 `/etc/sysctl.d/99-bbr.conf`。
 
-启用后写入 `/etc/sysctl.d/99-bbr.conf`，设置 `fq` 队列调度 + `bbr` 拥塞控制，重启不丢失。
-
-状态栏会显示当前 TCP 拥塞控制算法（如 `TCP:bbr`）。
+菜单 `7` 可应用 TCP/UDP buffer、TFO、backlog、swap、journald 限额等基础优化。
 
 ---
 
 ## 卸载
 
-菜单 `9`，删除二进制、配置、所有节点与证书。
+菜单 `8` 会删除 Xray 二进制、配置、节点元数据、geodata 与日志目录。
+
+BBR、系统优化配置和 swap 文件会保留。
 
 ---
 
