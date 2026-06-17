@@ -315,7 +315,14 @@ node_by_id() {
 validate_xray_config() {
   local conf="$1" err_file="$2"
   [[ -x "$XRAY_BIN" ]] || return 0
-  "$XRAY_BIN" run -test -config "$conf" >/dev/null 2>"$err_file"
+  "$XRAY_BIN" run -test -config "$conf" >"$err_file" 2>&1
+}
+
+mktemp_json() {
+  local t
+  t=$(mktemp)
+  rm -f "$t"
+  echo "${t}.json"
 }
 
 rebuild_config() {
@@ -342,7 +349,7 @@ rebuild_config() {
   [[ "$block_udp443" == "false" ]] || block_udp443=true
 
   local tmp_conf chk_err
-  tmp_conf=$(mktemp)
+  tmp_conf=$(mktemp_json)
   jq -n --argjson inbounds "$inbounds" --argjson block_udp443 "$block_udp443" '
     def private_ip_rule: {
       type: "field",
