@@ -154,7 +154,13 @@ xray run -test -config /usr/local/etc/xray/config.json
 
 菜单 `6` 可启用 BBR，写入 `/etc/sysctl.d/99-bbr.conf`。
 
-菜单 `7` 可应用 TCP/UDP buffer、TFO、backlog、swap、journald 限额等基础优化。
+菜单 `7` 应用偏保守的长期稳定型优化：
+
+- 提高 TCP buffer 上限，但不抬高每个 socket 的默认 buffer
+- 开启 TFO、MTU probing，并提高 backlog
+- 将临时端口范围设为 `10000-65535`
+- 可创建小 swap，限制 journald 磁盘占用
+- 可切换 Xray 出站 UDP/443 阻断；默认开启以减少 QUIC/HTTP3 带来的路由和稳定性问题
 
 ---
 

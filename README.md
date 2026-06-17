@@ -154,7 +154,13 @@ xray run -test -config /usr/local/etc/xray/config.json
 
 Menu `6` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`.
 
-Menu `7` applies basic TCP/UDP buffer, TFO, backlog, swap, and journald cap tuning.
+Menu `7` applies conservative long-running VPS tuning:
+
+- Raises TCP buffer ceilings without inflating each socket's default buffer
+- Enables TFO and MTU probing, and raises backlog limits
+- Sets ephemeral ports to `10000-65535`
+- Can create a small swap file and cap journald disk usage
+- Can toggle Xray outbound UDP/443 blocking; enabled by default to reduce QUIC/HTTP3 routing and stability issues
 
 ---
 

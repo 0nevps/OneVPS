@@ -321,7 +321,7 @@ validate_xray_config() {
 rebuild_config() {
   ensure_nodes_file
 
-  local inbounds n enabled type ib
+  local inbounds n enabled type ib block_udp443
   inbounds='[]'
   while IFS= read -r n; do
     enabled=$(jq -r '.enabled' <<<"$n")
@@ -333,10 +333,30 @@ rebuild_config() {
     esac
     inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds")
   done < <(jq -c '.nodes[]' "$XRAY_NODES")
+  block_udp443=$(jq -r '
+    if ((.settings | type) == "object" and (.settings | has("block_udp443"))) then
+      .settings.block_udp443
+    else
+      true
+    end' "$XRAY_NODES" 2>/dev/null || echo true)
+  [[ "$block_udp443" == "false" ]] || block_udp443=true
 
   local tmp_conf chk_err
   tmp_conf=$(mktemp)
-  jq -n --argjson inbounds "$inbounds" '
+  jq -n --argjson inbounds "$inbounds" --argjson block_udp443 "$block_udp443" '
+    def private_ip_rule: {
+      type: "field",
+      ip: [
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10",
+        "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+        "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
+        "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+        "::1/128", "fc00::/7", "fe80::/10"
+      ],
+      outboundTag: "block"
+    };
+    def bittorrent_rule: {type: "field", protocol: ["bittorrent"], outboundTag: "block"};
+    def udp443_rule: {type: "field", network: "udp", port: "443", outboundTag: "block"};
     {
       log: {loglevel: "warning"},
       inbounds: $inbounds,
@@ -346,21 +366,7 @@ rebuild_config() {
       ],
       routing: {
         domainStrategy: "AsIs",
-        rules: [
-          {
-            type: "field",
-            ip: [
-              "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10",
-              "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-              "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
-              "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
-              "::1/128", "fc00::/7", "fe80::/10"
-            ],
-            outboundTag: "block"
-          },
-          {type: "field", protocol: ["bittorrent"], outboundTag: "block"},
-          {type: "field", network: "udp", port: "443", outboundTag: "block"}
-        ]
+        rules: ([private_ip_rule, bittorrent_rule] + (if $block_udp443 then [udp443_rule] else [] end))
       },
       policy: {
         levels: {
@@ -734,6 +740,15 @@ bbr_status() {
   echo "congestion control: $cc  qdisc: $qdisc"
 }
 
+apply_sysctl_file() {
+  local file="$1"
+  command -v sysctl >/dev/null 2>&1 || { warn "sysctl not found, skipping $file"; return 0; }
+  if sysctl -e -p "$file" >/dev/null; then
+    return 0
+  fi
+  warn "some sysctl settings failed for $file; unsupported keys are safe to ignore on constrained VPS kernels"
+}
+
 enable_bbr() {
   echo; info "BBR acceleration"
   local cc qdisc kver kmin
@@ -766,7 +781,7 @@ enable_bbr() {
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-  sysctl --system >/dev/null 2>&1
+  apply_sysctl_file /etc/sysctl.d/99-bbr.conf
   apply_fq_qdisc
 
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -784,34 +799,67 @@ EOF
 write_tune_conf() {
   cat > "$TUNE_CONF" <<EOF
 # OneVPS system tuning
-# TCP buffers - high-BDP (long-distance) links
+# Raise buffer ceilings for high-BDP links without inflating every socket by default.
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
-# UDP buffers
-net.core.rmem_default = 26214400
-net.core.wmem_default = 26214400
+# Conservative TCP behavior for proxy workloads.
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
-# many concurrent connections
-net.ipv4.ip_local_port_range = 1024 65535
+# Many concurrent outbound connections, while avoiding common service ports.
+net.ipv4.ip_local_port_range = 10000 65535
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
-net.ipv4.tcp_tw_reuse = 1
-# cap unsent buffer per socket - lower latency for multiplexed proxy streams
+# Cap unsent buffer per socket - lower latency for multiplexed proxy streams.
 net.ipv4.tcp_notsent_lowat = 131072
-# drop dead connections faster
-net.ipv4.tcp_retries2 = 8
+# Drop closed connections sooner without being harsh on weak long-distance links.
 net.ipv4.tcp_fin_timeout = 30
 vm.swappiness = 10
 EOF
   if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
     echo "net.netfilter.nf_conntrack_max = 262144" >> "$TUNE_CONF"
   fi
-  sysctl --system >/dev/null 2>&1
+  apply_sysctl_file "$TUNE_CONF"
   ok "network tuning applied ($TUNE_CONF)"
+}
+
+xray_udp443_block_enabled() {
+  [[ -f "$XRAY_NODES" ]] || { echo true; return; }
+  local enabled
+  enabled=$(jq -r '
+    if ((.settings | type) == "object" and (.settings | has("block_udp443"))) then
+      .settings.block_udp443
+    else
+      true
+    end' "$XRAY_NODES" 2>/dev/null || echo true)
+  [[ "$enabled" == "false" ]] && echo false || echo true
+}
+
+set_xray_udp443_block() {
+  local enabled="$1"
+  ensure_nodes_file
+  jq_update_nodes --argjson enabled "$enabled" '.settings.block_udp443 = $enabled'
+  rebuild_config && ok "Xray UDP/443 blocking set to $enabled" || err "failed to apply Xray routing setting"
+}
+
+optimize_xray_routing() {
+  [[ -x "$XRAY_BIN" || -f "$XRAY_NODES" ]] || return 0
+
+  local enabled
+  enabled=$(xray_udp443_block_enabled)
+  if [[ "$enabled" == "true" ]]; then
+    ok "Xray blocks outbound UDP/443 (QUIC/HTTP3) for safer proxy routing"
+    if confirm "Disable UDP/443 blocking for better QUIC/HTTP3 app compatibility?" n; then
+      set_xray_udp443_block false
+    fi
+  else
+    warn "Xray UDP/443 blocking is disabled; some apps may prefer QUIC/HTTP3"
+    if confirm "Enable UDP/443 blocking for safer/stabler proxy routing?" y; then
+      set_xray_udp443_block true
+    fi
+  fi
 }
 
 create_swap() {
@@ -875,6 +923,8 @@ EOF
       ok "journald capped at 50MiB"
     fi
   fi
+
+  optimize_xray_routing
   pause
 }
 
