@@ -18,11 +18,11 @@ XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.s
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 
 REALITY_DESTS=(
+  "www.cloudflare.com"
+  "www.amazon.com"
+  "www.paypal.com"
+  "www.ebay.com"
   "www.microsoft.com"
-  "www.apple.com"
-  "www.samsung.com"
-  "gateway.icloud.com"
-  "www.lovelive-anime.jp"
 )
 
 PKG=""
@@ -427,7 +427,7 @@ build_reality_inbound() {
           show: false,
           target: $target,
           xver: 0,
-          serverNames: [$sni],
+          serverNames: [$sni, ""],
           privateKey: $pk,
           shortIds: [$sid]
         }

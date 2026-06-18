@@ -80,11 +80,11 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 
 脚本内置候选：
 
+- `www.cloudflare.com`
+- `www.amazon.com`
+- `www.paypal.com`
+- `www.ebay.com`
 - `www.microsoft.com`
-- `www.apple.com`
-- `www.samsung.com`
-- `gateway.icloud.com`
-- `www.lovelive-anime.jp`
 
 目标站建议满足：
 
