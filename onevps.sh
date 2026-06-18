@@ -16,6 +16,7 @@ XRAY_NODES=$XRAY_DIR/onevps-nodes.json
 XRAY_SERVICE=/etc/systemd/system/xray.service
 XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
+REALITY_PROBE_ROUNDS=3
 
 REALITY_DESTS=(
   "www.cloudflare.com"
@@ -23,6 +24,13 @@ REALITY_DESTS=(
   "www.paypal.com"
   "www.ebay.com"
   "www.microsoft.com"
+  "www.apple.com"
+  "www.samsung.com"
+  "gateway.icloud.com"
+  "www.lovelive-anime.jp"
+  "www.wikipedia.org"
+  "www.oracle.com"
+  "www.netflix.com"
 )
 
 PKG=""
@@ -456,17 +464,73 @@ probe_reality_target() {
   fi
 }
 
+probe_reality_once() {
+  local domain="$1"
+  timeout 10 "$XRAY_BIN" tls ping "$domain" >/dev/null 2>&1 \
+    || timeout 10 "$XRAY_BIN" tls ping "$domain:443" >/dev/null 2>&1
+}
+
+auto_pick_reality_target() {
+  [[ -x "$XRAY_BIN" ]] || { echo "${REALITY_DESTS[0]}"; return; }
+  if ! command -v timeout >/dev/null 2>&1; then
+    warn "timeout command not found; using ${REALITY_DESTS[0]}" >&2
+    echo "${REALITY_DESTS[0]}"
+    return
+  fi
+
+  local d i start end elapsed ok total avg
+  local best="" best_ok=-1 best_avg=999999999
+
+  info "auto-testing Reality targets (${REALITY_PROBE_ROUNDS} rounds each)..." >&2
+  for d in "${REALITY_DESTS[@]}"; do
+    ok=0
+    total=0
+    for ((i=1; i<=REALITY_PROBE_ROUNDS; i++)); do
+      start=$(date +%s%3N)
+      if probe_reality_once "$d"; then
+        end=$(date +%s%3N)
+        elapsed=$((end - start))
+        ok=$((ok + 1))
+        total=$((total + elapsed))
+      fi
+    done
+    avg=999999
+    (( ok > 0 )) && avg=$((total / ok))
+    if (( ok > best_ok || (ok == best_ok && avg < best_avg) )); then
+      best="$d"
+      best_ok="$ok"
+      best_avg="$avg"
+    fi
+    if (( ok > 0 )); then
+      printf '  %-24s %d/%d avg:%dms\n' "$d" "$ok" "$REALITY_PROBE_ROUNDS" "$avg" >&2
+    else
+      printf '  %-24s %d/%d failed\n' "$d" "$ok" "$REALITY_PROBE_ROUNDS" >&2
+    fi
+  done
+
+  if (( best_ok <= 0 )); then
+    warn "all target probes failed; using ${REALITY_DESTS[0]}" >&2
+    echo "${REALITY_DESTS[0]}"
+  else
+    ok "selected $best (${best_ok}/${REALITY_PROBE_ROUNDS}, avg ${best_avg}ms)" >&2
+    echo "$best"
+  fi
+}
+
 pick_reality_target() {
   echo >&2
   info "Reality handshake target (major TLS site; TLS 1.3 + H2 preferred):" >&2
   local i=0 d sel target
+  echo "  a) auto-test candidates (recommended)" >&2
   for d in "${REALITY_DESTS[@]}"; do
     i=$((i+1))
     echo "  $i) $d" >&2
   done
   echo "  0) custom" >&2
-  sel=$(ask "Select" "1")
-  if [[ "$sel" == "0" ]]; then
+  sel=$(ask "Select" "a")
+  if [[ "$sel" =~ ^[Aa]$ ]]; then
+    target=$(auto_pick_reality_target)
+  elif [[ "$sel" == "0" ]]; then
     target=$(normalize_domain "$(ask "Target domain")")
   elif [[ "$sel" =~ ^[0-9]+$ ]] && ((sel>=1 && sel<=${#REALITY_DESTS[@]})); then
     target="${REALITY_DESTS[$((sel-1))]}"

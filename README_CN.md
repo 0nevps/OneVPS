@@ -85,6 +85,13 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 - `www.paypal.com`
 - `www.ebay.com`
 - `www.microsoft.com`
+- `www.apple.com`
+- `www.samsung.com`
+- `gateway.icloud.com`
+- `www.lovelive-anime.jp`
+- `www.wikipedia.org`
+- `www.oracle.com`
+- `www.netflix.com`
 
 目标站建议满足：
 
@@ -92,7 +99,7 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 - SNI 稳定，证书 SAN 覆盖所填域名
 - 尽量选择与你 VPS 网络位置延迟较低的站点
 
-添加或修改节点时，脚本会尝试执行 `xray tls ping` 做目标站探测；探测失败不会强制中断，但建议换一个更稳定的目标站。
+添加或修改节点时，默认会对内置候选执行多轮 `xray tls ping`，按成功率和平均耗时自动选择目标站；也可以手动指定候选或自定义域名。探测全部失败时会回退到第一个候选，但建议换一个更稳定的目标站。
 
 ---
 

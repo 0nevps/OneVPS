@@ -80,11 +80,18 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 
 Built-in candidates:
 
+- `www.cloudflare.com`
+- `www.amazon.com`
+- `www.paypal.com`
+- `www.ebay.com`
 - `www.microsoft.com`
 - `www.apple.com`
 - `www.samsung.com`
 - `gateway.icloud.com`
 - `www.lovelive-anime.jp`
+- `www.wikipedia.org`
+- `www.oracle.com`
+- `www.netflix.com`
 
 Recommended target properties:
 
@@ -92,7 +99,7 @@ Recommended target properties:
 - Stable SNI, with the selected domain covered by certificate SAN
 - Low latency from your VPS network when possible
 
-When adding or editing a node, the script tries `xray tls ping` to probe the target. A failed probe does not force abort, but you should pick a more stable target when possible.
+When adding or editing a node, the script auto-tests built-in candidates with multiple `xray tls ping` rounds and selects by success rate, then average latency. You can still select a candidate manually or enter a custom domain. If every probe fails, the script falls back to the first candidate, but you should pick a more stable target when possible.
 
 ---
 
