@@ -1002,16 +1002,18 @@ manage_nodes() {
 
   Node actions:
    1) Reset password
-   2) Change WS path
-   3) Enable/disable
-   4) Delete node
+   2) Change domain
+   3) Change WS path
+   4) Enable/disable
+   5) Delete node
    0) Back
 EOF
       case "$(ask 'Select')" in
         1) reset_trojan_password "$id" ;;
-        2) edit_trojan_path "$id" ;;
-        3) toggle_enabled "$id" ;;
-        4) del_node "$id"; return ;;
+        2) edit_trojan_domain "$id" ;;
+        3) edit_trojan_path "$id" ;;
+        4) toggle_enabled "$id" ;;
+        5) del_node "$id"; return ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -1103,6 +1105,39 @@ reset_trojan_password() {
   jq_update_nodes --arg id "$id" --arg pw "$pw" \
     '(.nodes[]|select(.id==$id)).password = $pw'
   rebuild_config && ok "password reset" || err "apply failed"
+  pause
+}
+
+edit_trojan_domain() {
+  local id="$1" n cf port path olddom newdom
+  n=$(node_by_id "$id")
+  cf=$(jq -r '.caddy_file' <<<"$n")
+  port=$(jq -r '.port' <<<"$n")
+  path=$(jq -r '.ws_path' <<<"$n")
+  olddom=$(jq -r '.domain' <<<"$n")
+  newdom=$(normalize_domain "$(ask "New subdomain (DNS A/AAAA -> this server)" "$olddom")")
+  while ! is_valid_domain "$newdom"; do
+    warn "invalid domain"
+    newdom=$(normalize_domain "$(ask "New subdomain")")
+  done
+  if [[ "$newdom" == "$olddom" ]]; then warn "unchanged"; pause; return; fi
+
+  # Drop our old block first so the collision check ignores it.
+  caddy_remove_route "$id" "$cf"
+  if grep -qiF "$newdom" "$cf" 2>/dev/null; then
+    err "$newdom already appears in $cf; restoring old route"
+    caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
+    pause; return
+  fi
+  if ! caddy_add_route "$id" "$newdom" "$path" "$port" "$cf"; then
+    err "Caddy update failed; restoring old route"
+    caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
+    pause; return
+  fi
+  jq_update_nodes --arg id "$id" --arg d "$newdom" \
+    '(.nodes[]|select(.id==$id)).domain = $d'
+  rebuild_config && ok "domain changed to $newdom" || err "apply failed"
+  info "ensure DNS for $newdom points here so Caddy can issue its cert"
   pause
 }
 

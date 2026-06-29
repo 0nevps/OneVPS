@@ -153,9 +153,10 @@ Trojan node:
 
 ```text
 1) Reset password
-2) Change WS path
-3) Enable/disable
-4) Delete node
+2) Change domain
+3) Change WS path
+4) Enable/disable
+5) Delete node
 ```
 
 After rotating the Reality keypair/shortId or resetting a Trojan password/path, old client links stop working. Re-import the new link from menu `5`.
