@@ -2,9 +2,12 @@
 
 [中文版](README_CN.md)
 
-One-click Xray node deployment script for VPS. The mainline configuration is **VLESS + TCP + REALITY + XTLS Vision + uTLS**.
+One-click Xray node deployment script for VPS. Two protocols:
 
-This version replaces sing-box with [Xray-core](https://github.com/XTLS/Xray-core) and uses the common Reality + Vision setup: no domain, no certificate, and a uTLS client fingerprint.
+- **VLESS + TCP + REALITY + XTLS Vision + uTLS** (mainline) — no domain, no certificate.
+- **Trojan + WebSocket behind Caddy** — rides Caddy's `:443` + certificates, coexisting with other Caddy-proxied services.
+
+Built on [Xray-core](https://github.com/XTLS/Xray-core). The Reality path needs no domain/cert; the Trojan path requires Caddy (auto-installed when absent).
 
 ---
 
@@ -14,6 +17,7 @@ This version replaces sing-box with [Xray-core](https://github.com/XTLS/Xray-cor
 - **VLESS + TCP + REALITY**: direct VPS connection with REALITY target-site TLS camouflage
 - **XTLS Vision**: server users are generated with `flow: xtls-rprx-vision`
 - **uTLS**: share links use `fp=chrome` for mainstream client compatibility
+- **Trojan + WS behind Caddy**: loopback-only Xray inbound; Caddy terminates TLS on `:443` and reverse-proxies a secret WS path on a dedicated subdomain, coexisting with other Caddy sites. Caddy is auto-installed if missing.
 - **Secure defaults**: random UUID, X25519 keypair, 16-hex shortId, private IP blocking, BitTorrent blocking, UDP/443 blocking
 - **Hardened service**: systemd runs Xray as `nobody` with only low-port bind capability
 - **Operations**: node management, share links, BBR, basic system tuning
@@ -36,7 +40,7 @@ Or download and run locally:
 sudo bash onevps.sh
 ```
 
-First time: run `1` to install/update Xray-core, then run `2` to add a Reality node.
+First time: run `1` to install/update Xray-core, then run `2` for a Reality node or `3` for a Trojan + WS node.
 
 ---
 
@@ -45,12 +49,13 @@ First time: run `1` to install/update Xray-core, then run `2` to add a Reality n
 ```text
 1) Install / update Xray-core
 2) Add node - VLESS + Reality + Vision + uTLS
-3) Manage nodes
-4) Show all share links
-5) Restart service
-6) BBR acceleration
-7) System optimization
-8) Uninstall
+3) Add node - Trojan + WS (behind Caddy)
+4) Manage nodes
+5) Show all share links
+6) Restart service
+7) BBR acceleration
+8) System optimization
+9) Uninstall
 0) Exit
 ```
 
@@ -103,9 +108,37 @@ When adding or editing a node, the script auto-tests built-in candidates with mu
 
 ---
 
+## Trojan + WS (behind Caddy)
+
+Menu `3` adds a Trojan node that lives behind Caddy, so it shares `:443` with whatever else Caddy already serves.
+
+How it works:
+
+- Xray Trojan inbound binds **`127.0.0.1` only** with **no TLS** (`network: ws`).
+- Caddy terminates TLS on `:443`, auto-issues a certificate for a **dedicated subdomain**, and reverse-proxies a **secret WS path** to the local inbound. All other Caddy sites/paths are untouched.
+- The firewall is not modified for Trojan nodes — only Caddy faces the internet.
+
+Requirements:
+
+- A subdomain with a DNS `A`/`AAAA` record pointing at this server (so Caddy can issue the cert).
+- Ports `80` and `443` reachable for ACME and traffic.
+- Caddy installed — if absent, the script installs it (official apt/dnf/yum repo, or a static binary + systemd unit as fallback) and creates a default Caddyfile.
+
+The script appends a marked site block to the Caddyfile, validates, and reloads Caddy. Deleting the node removes that block and reloads again.
+
+Share link format:
+
+```text
+trojan://PASSWORD@SUBDOMAIN:443?security=tls&sni=SUBDOMAIN&type=ws&host=SUBDOMAIN&path=PATH#NAME
+```
+
+---
+
 ## Node Management
 
-Menu `3` supports:
+Menu `4` actions depend on node type.
+
+Reality node:
 
 ```text
 1) Change port
@@ -116,7 +149,16 @@ Menu `3` supports:
 6) Delete node
 ```
 
-After rotating the keypair or shortId, old client links stop working. Re-import the new link from menu `4`.
+Trojan node:
+
+```text
+1) Reset password
+2) Change WS path
+3) Enable/disable
+4) Delete node
+```
+
+After rotating the Reality keypair/shortId or resetting a Trojan password/path, old client links stop working. Re-import the new link from menu `5`.
 
 ---
 
@@ -154,14 +196,15 @@ xray run -test -config /usr/local/etc/xray/config.json
 - Architecture: amd64 / arm64 / armv7
 - Package manager: apt / dnf / yum / zypper
 - Dependencies auto-installed: `curl` `jq` `openssl`
+- Caddy auto-installed only when adding a Trojan node
 
 ---
 
 ## BBR and System Tuning
 
-Menu `6` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`.
+Menu `7` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`.
 
-Menu `7` applies conservative long-running VPS tuning:
+Menu `8` applies conservative long-running VPS tuning:
 
 - Raises TCP buffer ceilings without inflating each socket's default buffer
 - Enables TFO and MTU probing, and raises backlog limits
@@ -173,9 +216,9 @@ Menu `7` applies conservative long-running VPS tuning:
 
 ## Uninstall
 
-Menu `8` removes the Xray binary, config, node metadata, geodata, and log directory.
+Menu `9` removes the Xray binary, config, node metadata, geodata, and log directory.
 
-BBR, system tuning configs, and the swap file are kept.
+BBR, system tuning configs, the swap file, and Caddy (with its Caddyfile) are kept.
 
 ---
 
