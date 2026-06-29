@@ -504,8 +504,9 @@ HTML
 }
 
 # Append a marked site block routing a secret WS path to a local Xray inbound.
-# The WS path is gated on the Upgrade header; everything else (including plain
-# GETs to the WS path) is served as a static site, so probes see a real page.
+# The WS path is gated on the Upgrade header; every other request (any path,
+# including a plain GET to the WS path) returns HTTP 403 with the styled 403
+# page, so the whole subdomain looks like a locked-down site.
 # Reverts the append if Caddy reload fails. Returns non-zero on failure.
 caddy_add_route() {
   local id="$1" domain="$2" path="$3" port="$4" file="$5" root
@@ -523,7 +524,7 @@ caddy_add_route() {
     printf '\t}\n'
     printf '\treverse_proxy @ws_%s 127.0.0.1:%s\n' "$id" "$port"
     printf '\troot * %s\n' "$root"
-    printf '\tfile_server\n'
+    printf '\terror 403\n'
     printf '\thandle_errors {\n'
     printf '\t\trewrite * /index.html\n'
     printf '\t\tfile_server\n'

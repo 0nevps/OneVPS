@@ -116,7 +116,7 @@ How it works:
 
 - Xray Trojan inbound binds **`127.0.0.1` only** with **no TLS** (`network: ws`).
 - Caddy terminates TLS on `:443`, auto-issues a certificate for a **dedicated subdomain**, and reverse-proxies a **secret WS path** to the local inbound. All other Caddy sites/paths are untouched.
-- The WS path is **gated on the `Upgrade` header** — only real WebSocket handshakes reach Xray. Every other request (including a plain browser GET to the WS path) is served as a small **static site** from `/var/lib/onevps/sites/<domain>`, so probes see a normal page instead of a dead proxy. Replace that `index.html` with your own content anytime; the script never overwrites it.
+- The WS path is **gated on the `Upgrade` header** — only real WebSocket handshakes reach Xray. Every other request (any path, including a plain browser GET to the WS path) returns **HTTP 403 with a styled 403 page** from `/var/lib/onevps/sites/<domain>/index.html`, so the whole subdomain looks like a locked-down site rather than a dead proxy. Replace that `index.html` with your own content anytime; the script never overwrites it.
 - The firewall is not modified for Trojan nodes — only Caddy faces the internet.
 
 Requirements:
@@ -174,7 +174,7 @@ After rotating the Reality keypair/shortId or resetting a Trojan password/path, 
 | `/usr/local/share/xray/` | geoip/geosite data |
 | `/etc/systemd/system/xray.service` | systemd service |
 | `/var/log/xray/` | Xray log directory |
-| `/var/lib/onevps/sites/<domain>/` | Static camouflage site for a Trojan subdomain (editable) |
+| `/var/lib/onevps/sites/<domain>/` | 403 camouflage page for a Trojan subdomain (editable) |
 
 Manual service management:
 
