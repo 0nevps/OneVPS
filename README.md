@@ -156,9 +156,12 @@ Trojan node:
 1) Reset password
 2) Change domain
 3) Change WS path
-4) Enable/disable
-5) Delete node
+4) Rebuild Caddy route
+5) Enable/disable
+6) Delete node
 ```
+
+`Rebuild Caddy route` regenerates the node's Caddy block from its stored fields without changing the password/path/port — use it to roll an existing node onto the current Caddy template after updating the script.
 
 After rotating the Reality keypair/shortId or resetting a Trojan password/path, old client links stop working. Re-import the new link from menu `5`.
 

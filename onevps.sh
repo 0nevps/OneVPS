@@ -517,14 +517,18 @@ caddy_add_route() {
     printf '\n# OneVPS-trojan:%s BEGIN\n' "$id"
     printf '%s {\n' "$domain"
     printf '\tencode zstd gzip\n'
+    printf '\troot * %s\n' "$root"
     printf '\t@ws_%s {\n' "$id"
     printf '\t\tpath %s\n' "$path"
     printf '\t\theader Connection *Upgrade*\n'
     printf '\t\theader Upgrade websocket\n'
     printf '\t}\n'
-    printf '\treverse_proxy @ws_%s 127.0.0.1:%s\n' "$id" "$port"
-    printf '\troot * %s\n' "$root"
-    printf '\terror 403\n'
+    printf '\thandle @ws_%s {\n' "$id"
+    printf '\t\treverse_proxy 127.0.0.1:%s\n' "$port"
+    printf '\t}\n'
+    printf '\thandle {\n'
+    printf '\t\terror 403\n'
+    printf '\t}\n'
     printf '\thandle_errors {\n'
     printf '\t\trewrite * /index.html\n'
     printf '\t\tfile_server\n'
@@ -1078,16 +1082,18 @@ manage_nodes() {
    1) Reset password
    2) Change domain
    3) Change WS path
-   4) Enable/disable
-   5) Delete node
+   4) Rebuild Caddy route
+   5) Enable/disable
+   6) Delete node
    0) Back
 EOF
       case "$(ask 'Select')" in
         1) reset_trojan_password "$id" ;;
         2) edit_trojan_domain "$id" ;;
         3) edit_trojan_path "$id" ;;
-        4) toggle_enabled "$id" ;;
-        5) del_node "$id"; return ;;
+        4) rebuild_trojan_route "$id" ;;
+        5) toggle_enabled "$id" ;;
+        6) del_node "$id"; return ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -1230,6 +1236,29 @@ edit_trojan_path() {
   jq_update_nodes --arg id "$id" --arg p "$newpath" \
     '(.nodes[]|select(.id==$id)).ws_path = $p'
   rebuild_config && ok "WS path changed to $newpath" || err "apply failed"
+  pause
+}
+
+# Regenerate the Caddy block for an existing node from its stored fields,
+# without changing the password/path/port (share link stays valid). Use after
+# updating the script to roll an old node onto the current Caddy template.
+rebuild_trojan_route() {
+  local id="$1" n cf domain path port
+  n=$(node_by_id "$id")
+  cf=$(jq -r '.caddy_file' <<<"$n")
+  domain=$(jq -r '.domain' <<<"$n")
+  path=$(jq -r '.ws_path' <<<"$n")
+  port=$(jq -r '.port' <<<"$n")
+  if [[ ! -f "$cf" ]]; then
+    cf=$(find_caddyfile)
+    [[ -n "$cf" ]] || { err "Caddyfile not found"; pause; return; }
+  fi
+  caddy_remove_route "$id" "$cf"
+  if caddy_add_route "$id" "$domain" "$path" "$port" "$cf"; then
+    ok "Caddy route rebuilt for $domain"
+  else
+    err "rebuild failed"
+  fi
   pause
 }
 
