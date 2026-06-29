@@ -343,19 +343,42 @@ caddy_install_repo() {
 }
 
 # Fallback: drop the official static binary + systemd unit + caddy user.
+# Prefers the GitHub release tarball (a fast static asset); falls back to the
+# on-demand caddyserver.com build API. All downloads are time-limited so a slow
+# or blocked mirror fails fast instead of hanging.
 caddy_install_binary() {
-  local carch="amd64" url tmp
+  local gh_arch td ver url
   case "$ARCH" in
-    amd64) carch="amd64" ;;
-    arm64) carch="arm64" ;;
-    armv7) carch="arm&arm=7" ;;
+    amd64) gh_arch="amd64" ;;
+    arm64) gh_arch="arm64" ;;
+    armv7) gh_arch="armv7" ;;
   esac
-  url="https://caddyserver.com/api/download?os=linux&arch=${carch}"
-  tmp=$(mktemp)
-  info "downloading Caddy static binary..."
-  curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 0755 "$tmp" /usr/local/bin/caddy || { rm -f "$tmp"; return 1; }
-  rm -f "$tmp"
+  td=$(mktemp -d)
+
+  ver=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+          https://api.github.com/repos/caddyserver/caddy/releases/latest 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+
+  if [[ -n "$ver" ]] && command -v tar >/dev/null 2>&1; then
+    url="https://github.com/caddyserver/caddy/releases/download/v${ver}/caddy_${ver}_linux_${gh_arch}.tar.gz"
+    info "downloading Caddy ${ver} (${gh_arch}) from GitHub..."
+    if curl -fL --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$td/caddy.tar.gz" \
+       && tar -xzf "$td/caddy.tar.gz" -C "$td" caddy 2>/dev/null; then
+      install -m 0755 "$td/caddy" /usr/local/bin/caddy || true
+    fi
+  fi
+
+  if ! caddy_present; then
+    local carch="$gh_arch"; [[ "$gh_arch" == armv7 ]] && carch="arm&arm=7"
+    info "trying caddyserver.com download API..."
+    if curl -fL --connect-timeout 15 --max-time 180 \
+        "https://caddyserver.com/api/download?os=linux&arch=${carch}" -o "$td/caddy"; then
+      install -m 0755 "$td/caddy" /usr/local/bin/caddy || true
+    fi
+  fi
+
+  rm -rf "$td"
+  caddy_present || { err "Caddy binary download failed"; return 1; }
 
   id caddy >/dev/null 2>&1 || \
     useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
