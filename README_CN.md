@@ -116,7 +116,7 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 
 - Xray Trojan 入站**仅监听 `127.0.0.1`**，**不做 TLS**（`network: ws`）。
 - Caddy 在 `:443` 终结 TLS，为**独立子域**自动签发证书，并把**隐藏 WS 路径**反代到本地入站。其它 Caddy 站点/路径不受影响。
-- WS 路径按 **`Upgrade` 头**判定——只有真正的 WebSocket 握手才会进入 Xray。其余所有请求（任意路径，包括浏览器直接 GET 该 WS 路径）一律返回 **HTTP 403 + 403 页面**（`/var/lib/onevps/sites/<域名>/index.html`），整个子域看起来像一个受限站点，而非死代理。可随时把该 `index.html` 换成自己的内容，脚本不会覆盖。
+- 只有**密 WS 路径**会反代到 Xray（由 Caddy `reverse_proxy` 完成 WebSocket 升级）。其余所有路径一律返回 **HTTP 403 + 403 页面**（`/var/lib/onevps/sites/<域名>/index.html`），子域其余部分看起来像受限站点，而非死代理。随机路径本身即是秘密。可随时把该 `index.html` 换成自己的内容，脚本不会覆盖。
 - Trojan 节点不修改防火墙——仅 Caddy 对外。
 
 要求：

@@ -116,7 +116,7 @@ How it works:
 
 - Xray Trojan inbound binds **`127.0.0.1` only** with **no TLS** (`network: ws`).
 - Caddy terminates TLS on `:443`, auto-issues a certificate for a **dedicated subdomain**, and reverse-proxies a **secret WS path** to the local inbound. All other Caddy sites/paths are untouched.
-- The WS path is **gated on the `Upgrade` header** — only real WebSocket handshakes reach Xray. Every other request (any path, including a plain browser GET to the WS path) returns **HTTP 403 with a styled 403 page** from `/var/lib/onevps/sites/<domain>/index.html`, so the whole subdomain looks like a locked-down site rather than a dead proxy. Replace that `index.html` with your own content anytime; the script never overwrites it.
+- Only the **secret WS path** is proxied to Xray (Caddy's `reverse_proxy` performs the WebSocket upgrade). Every other path returns **HTTP 403 with a styled 403 page** from `/var/lib/onevps/sites/<domain>/index.html`, so the rest of the subdomain looks like a locked-down site rather than a dead proxy. The random path is the secret. Replace that `index.html` with your own content anytime; the script never overwrites it.
 - The firewall is not modified for Trojan nodes — only Caddy faces the internet.
 
 Requirements:

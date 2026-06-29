@@ -504,9 +504,9 @@ HTML
 }
 
 # Append a marked site block routing a secret WS path to a local Xray inbound.
-# The WS path is gated on the Upgrade header; every other request (any path,
-# including a plain GET to the WS path) returns HTTP 403 with the styled 403
-# page, so the whole subdomain looks like a locked-down site.
+# Requests to the secret path are proxied to Xray (reverse_proxy handles the
+# WebSocket upgrade); every other path returns HTTP 403 with the styled 403
+# page, so the rest of the subdomain looks like a locked-down site.
 # Reverts the append if Caddy reload fails. Returns non-zero on failure.
 caddy_add_route() {
   local id="$1" domain="$2" path="$3" port="$4" file="$5" root
@@ -518,12 +518,7 @@ caddy_add_route() {
     printf '%s {\n' "$domain"
     printf '\tencode zstd gzip\n'
     printf '\troot * %s\n' "$root"
-    printf '\t@ws_%s {\n' "$id"
-    printf '\t\tpath %s\n' "$path"
-    printf '\t\theader Connection *Upgrade*\n'
-    printf '\t\theader Upgrade websocket\n'
-    printf '\t}\n'
-    printf '\thandle @ws_%s {\n' "$id"
+    printf '\thandle %s {\n' "$path"
     printf '\t\treverse_proxy 127.0.0.1:%s\n' "$port"
     printf '\t}\n'
     printf '\thandle {\n'
