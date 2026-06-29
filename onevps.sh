@@ -312,12 +312,21 @@ caddy_install_repo() {
     apt)
       pkg_install debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
       mkdir -p /usr/share/keyrings
+      # umask 077 (set script-wide) would make these root-only; apt reads the
+      # keyring and sources list as the unprivileged _apt user, so force 0644.
       curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || return 1
+        | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || return 1
+      chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg
       curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
         > /etc/apt/sources.list.d/caddy-stable.list || return 1
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq \
-        && apt-get install -y -qq caddy
+      chmod 0644 /etc/apt/sources.list.d/caddy-stable.list
+      if DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+         && apt-get install -y -qq caddy; then
+        return 0
+      fi
+      # Don't leave a broken/unsigned repo poisoning future apt runs.
+      rm -f /etc/apt/sources.list.d/caddy-stable.list
+      return 1
       ;;
     dnf)
       dnf install -y -q 'dnf-command(copr)' || return 1
