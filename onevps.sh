@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# OneVPS - Xray Reality node setup script
-# Protocol: VLESS + TCP + REALITY + XTLS Vision + uTLS
+# OneVPS - Xray node setup script
+# Protocols:
+#   - VLESS + TCP + REALITY + XTLS Vision + uTLS (standalone)
+#   - Trojan + WebSocket behind Caddy (coexists with Caddy-proxied sites)
 #
 set -euo pipefail
 umask 077
@@ -36,6 +38,7 @@ REALITY_DESTS=(
 PKG=""
 ARCH=""
 PUBIP=""
+CADDYFILE=""
 
 # ----------------------------------------------------------------------------
 # Output
@@ -94,6 +97,8 @@ ask_uuid() {
 }
 
 rand_short_id() { openssl rand -hex 8; }
+
+rand_password() { openssl rand -hex 16; }
 
 rand_port() {
   local p
@@ -296,6 +301,181 @@ port_taken_by_node() {
 }
 
 # ----------------------------------------------------------------------------
+# Caddy integration (for Trojan + WS nodes; shares Caddy's :443 + certs)
+# ----------------------------------------------------------------------------
+caddy_present() { command -v caddy >/dev/null 2>&1; }
+
+# Install Caddy from its official package repo (apt/dnf/yum). Non-zero if the
+# distro has no supported repo path.
+caddy_install_repo() {
+  case "$PKG" in
+    apt)
+      pkg_install debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
+      mkdir -p /usr/share/keyrings
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || return 1
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        > /etc/apt/sources.list.d/caddy-stable.list || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+        && apt-get install -y -qq caddy
+      ;;
+    dnf)
+      dnf install -y -q 'dnf-command(copr)' || return 1
+      dnf copr enable -y @caddy/caddy || return 1
+      dnf install -y -q caddy
+      ;;
+    yum)
+      yum install -y -q yum-plugin-copr || return 1
+      yum copr enable -y @caddy/caddy || return 1
+      yum install -y -q caddy
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Fallback: drop the official static binary + systemd unit + caddy user.
+caddy_install_binary() {
+  local carch="amd64" url tmp
+  case "$ARCH" in
+    amd64) carch="amd64" ;;
+    arm64) carch="arm64" ;;
+    armv7) carch="arm&arm=7" ;;
+  esac
+  url="https://caddyserver.com/api/download?os=linux&arch=${carch}"
+  tmp=$(mktemp)
+  info "downloading Caddy static binary..."
+  curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 0755 "$tmp" /usr/local/bin/caddy || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+
+  id caddy >/dev/null 2>&1 || \
+    useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
+  mkdir -p /etc/caddy /var/lib/caddy /var/log/caddy
+
+  cat > /etc/systemd/system/caddy.service <<'EOF'
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# Guarantee Caddy is installed, has a Caddyfile, and is enabled. Non-zero on
+# failure. Sets CADDYFILE on success.
+ensure_caddy() {
+  if ! caddy_present; then
+    warn "Caddy not found; installing (required for Trojan nodes)"
+    if ! caddy_install_repo; then
+      warn "repo install unavailable; falling back to static binary"
+      caddy_install_binary || { err "Caddy install failed"; return 1; }
+    fi
+    caddy_present || { err "Caddy install failed"; return 1; }
+    ok "Caddy installed"
+  fi
+
+  local cf
+  cf=$(find_caddyfile)
+  if [[ -z "$cf" ]]; then
+    cf=/etc/caddy/Caddyfile
+    mkdir -p /etc/caddy
+    cat > "$cf" <<'EOF'
+# Managed alongside OneVPS. Caddy reverse-proxies real services here;
+# OneVPS appends marked Trojan-WS site blocks below.
+:80 {
+	respond "OK" 200
+}
+EOF
+    CADDYFILE="$cf"
+  fi
+
+  systemctl enable caddy >/dev/null 2>&1 || true
+  if ! systemctl is-active caddy >/dev/null 2>&1; then
+    systemctl start caddy >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+find_caddyfile() {
+  [[ -n "$CADDYFILE" && -f "$CADDYFILE" ]] && { echo "$CADDYFILE"; return; }
+  local c
+  c=$(systemctl cat caddy 2>/dev/null \
+      | sed -n 's/.*--config[ =]\([^ ]*\).*/\1/p' | head -n1)
+  if [[ -n "$c" && -f "$c" ]]; then CADDYFILE="$c"; echo "$c"; return; fi
+  for c in /etc/caddy/Caddyfile /etc/Caddyfile /usr/local/etc/caddy/Caddyfile; do
+    [[ -f "$c" ]] && { CADDYFILE="$c"; echo "$c"; return; }
+  done
+  echo ""
+}
+
+# Reload Caddy after validating. Returns non-zero on validation/reload failure.
+caddy_reload() {
+  local file="$1"
+  if caddy_present; then
+    if ! caddy validate --adapter caddyfile --config "$file" >/dev/null 2>&1; then
+      err "Caddyfile validation failed ($file)"
+      return 1
+    fi
+  fi
+  if systemctl is-active caddy >/dev/null 2>&1; then
+    systemctl reload caddy >/dev/null 2>&1 && return 0
+  fi
+  if caddy_present; then
+    caddy reload --adapter caddyfile --config "$file" >/dev/null 2>&1 && return 0
+  fi
+  err "failed to reload Caddy"
+  return 1
+}
+
+# Append a marked site block routing a secret WS path to a local Xray inbound.
+# Reverts the append if Caddy reload fails. Returns non-zero on failure.
+caddy_add_route() {
+  local id="$1" domain="$2" path="$3" port="$4" file="$5"
+  cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
+  {
+    printf '\n# OneVPS-trojan:%s BEGIN\n' "$id"
+    printf '%s {\n' "$domain"
+    printf '\thandle %s {\n' "$path"
+    printf '\t\treverse_proxy 127.0.0.1:%s\n' "$port"
+    printf '\t}\n'
+    printf '\thandle {\n\t\trespond "Not Found" 404\n\t}\n'
+    printf '}\n'
+    printf '# OneVPS-trojan:%s END\n' "$id"
+  } >> "$file"
+  if ! caddy_reload "$file"; then
+    err "reverting Caddyfile change"
+    caddy_remove_route "$id" "$file"
+    caddy_reload "$file" || true
+    return 1
+  fi
+  return 0
+}
+
+# Remove the marked block for a node id (does not reload; caller reloads).
+caddy_remove_route() {
+  local id="$1" file="$2"
+  [[ -f "$file" ]] || return 0
+  cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
+  sed -i "/# OneVPS-trojan:$id BEGIN/,/# OneVPS-trojan:$id END/d" "$file"
+}
+
+# ----------------------------------------------------------------------------
 # [3] Node storage + config generation
 # ----------------------------------------------------------------------------
 ensure_nodes_file() {
@@ -344,6 +524,7 @@ rebuild_config() {
     type=$(jq -r '.type' <<<"$n")
     case "$type" in
       vless-reality) ib=$(build_reality_inbound "$n") ;;
+      trojan-ws)     ib=$(build_trojan_inbound "$n") ;;
       *) continue ;;
     esac
     inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds")
@@ -439,6 +620,37 @@ build_reality_inbound() {
           privateKey: $pk,
           shortIds: [$sid]
         }
+      },
+      sniffing: {
+        enabled: true,
+        destOverride: ["http", "tls"],
+        routeOnly: true
+      }
+    }'
+}
+
+# Trojan inbound: listens on loopback only; Caddy terminates TLS on :443 and
+# reverse-proxies the WS path here. No TLS at the Xray layer.
+build_trojan_inbound() {
+  local n="$1"
+  jq -n \
+    --arg tag "$(jq -r '.tag' <<<"$n")" \
+    --argjson port "$(jq -r '.port' <<<"$n")" \
+    --arg pw "$(jq -r '.password' <<<"$n")" \
+    --arg email "$(jq -r '.tag' <<<"$n")@onevps" \
+    --arg path "$(jq -r '.ws_path' <<<"$n")" '
+    {
+      tag: $tag,
+      listen: "127.0.0.1",
+      port: $port,
+      protocol: "trojan",
+      settings: {
+        clients: [ {password: $pw, email: $email} ]
+      },
+      streamSettings: {
+        network: "ws",
+        security: "none",
+        wsSettings: { path: $path }
       },
       sniffing: {
         enabled: true,
@@ -619,10 +831,86 @@ add_reality_node() {
 }
 
 # ----------------------------------------------------------------------------
+# [4b] Add Trojan + WS node (behind Caddy)
+# ----------------------------------------------------------------------------
+add_trojan_node() {
+  require_xray
+  ensure_nodes_file
+  echo; info "Add node - Trojan + WebSocket (behind Caddy)"
+
+  if ! ensure_caddy; then
+    err "Caddy required for Trojan nodes but could not be installed"
+    pause; return
+  fi
+  local cfile
+  cfile=$(find_caddyfile)
+  if [[ -z "$cfile" ]]; then
+    err "Caddyfile still not found after install"
+    pause; return
+  fi
+  info "using Caddyfile: $cfile"
+
+  local name domain password path id port node
+  name=$(ask "Node name" "trojan-$(openssl rand -hex 2)")
+
+  domain=$(normalize_domain "$(ask "Trojan subdomain (DNS A/AAAA -> this server)")")
+  while ! is_valid_domain "$domain"; do
+    warn "invalid domain"
+    domain=$(normalize_domain "$(ask "Trojan subdomain")")
+  done
+  if grep -qiF "$domain" "$cfile" 2>/dev/null; then
+    err "$domain already appears in $cfile; pick another subdomain or remove the existing block first"
+    pause; return
+  fi
+
+  password=$(ask "Password (Enter for random)" "$(rand_password)")
+  path="/$(openssl rand -hex 8)"
+  id=$(openssl rand -hex 4)
+  port=$(rand_port)   # loopback-only inbound; firewall untouched
+
+  node=$(jq -n \
+    --arg id "$id" --arg name "$name" --arg tag "trojan-$id" \
+    --argjson port "$port" --arg pw "$password" \
+    --arg domain "$domain" --arg path "$path" --arg cfile "$cfile" '
+    {
+      id: $id,
+      type: "trojan-ws",
+      name: $name,
+      tag: $tag,
+      port: $port,
+      password: $pw,
+      domain: $domain,
+      ws_path: $path,
+      caddy_file: $cfile,
+      enabled: true
+    }')
+
+  jq_update_nodes --argjson node "$node" '.nodes += [$node]'
+
+  if ! caddy_add_route "$id" "$domain" "$path" "$port" "$cfile"; then
+    err "Caddy update failed, rolled back"
+    jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
+    pause; return
+  fi
+
+  if rebuild_config; then
+    ok "Trojan node added"
+    info "ensure DNS A/AAAA for $domain points here so Caddy can issue its cert"
+    node_link "$(node_by_id "$id")"
+  else
+    err "Xray config generation failed, rolled back"
+    caddy_remove_route "$id" "$cfile"; caddy_reload "$cfile" || true
+    jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
+    rebuild_config || true
+  fi
+  pause
+}
+
+# ----------------------------------------------------------------------------
 # Share links
 # ----------------------------------------------------------------------------
 node_link() {
-  local n="$1" type name port link addr uuid sni pubk sid spx fp
+  local n="$1" type name port link addr uuid sni pubk sid spx fp pw domain path
   type=$(jq -r '.type' <<<"$n")
   name=$(jq -r '.name' <<<"$n")
   port=$(jq -r '.port' <<<"$n")
@@ -637,14 +925,24 @@ node_link() {
     fp=$(jq -r '.fingerprint // "chrome"' <<<"$n")
     spx=$(jq -r '.spider_x // "/"' <<<"$n")
     link="vless://${uuid}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pubk}&sid=${sid}&spx=$(urlenc "$spx")&type=tcp#$(urlenc "$name")"
-  fi
+    echo
+    printf '%s-- %s (VLESS Reality + Vision + uTLS) --%s\n' "$c_grn" "$name" "$c_rst"
+    echo "$link"
+    printf '%sTarget: %s:%s  uTLS: %s  shortId: %s%s\n' "$c_ylw" \
+      "$(jq -r '.reality_target' <<<"$n")" "$(jq -r '.reality_target_port // 443' <<<"$n")" \
+      "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
 
-  echo
-  printf '%s-- %s (VLESS Reality + Vision + uTLS) --%s\n' "$c_grn" "$name" "$c_rst"
-  echo "$link"
-  printf '%sTarget: %s:%s  uTLS: %s  shortId: %s%s\n' "$c_ylw" \
-    "$(jq -r '.reality_target' <<<"$n")" "$(jq -r '.reality_target_port // 443' <<<"$n")" \
-    "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
+  elif [[ "$type" == "trojan-ws" ]]; then
+    pw=$(jq -r '.password' <<<"$n")
+    domain=$(jq -r '.domain' <<<"$n")
+    path=$(jq -r '.ws_path' <<<"$n")
+    link="trojan://$(urlenc "$pw")@${domain}:443?security=tls&sni=${domain}&type=ws&host=${domain}&path=$(urlenc "$path")#$(urlenc "$name")"
+    echo
+    printf '%s-- %s (Trojan + WS behind Caddy) --%s\n' "$c_grn" "$name" "$c_rst"
+    echo "$link"
+    printf '%sDomain: %s  path: %s  upstream: 127.0.0.1:%s%s\n' "$c_ylw" \
+      "$domain" "$path" "$port" "$c_rst"
+  fi
 }
 
 show_links() {
@@ -660,13 +958,17 @@ show_links() {
 # Node management
 # ----------------------------------------------------------------------------
 list_nodes() {
-  local i=0 n en st
+  local i=0 n en st kind dest
   while IFS= read -r n; do
     i=$((i+1))
     en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
-    printf '  %d) %-18s port:%-6s target:%-24s %s\n' \
-      "$i" "$(jq -r '.name' <<<"$n")" "$(jq -r '.port' <<<"$n")" \
-      "$(jq -r '.reality_target' <<<"$n")" \
+    case "$(jq -r '.type' <<<"$n")" in
+      trojan-ws) kind="trojan"; dest=$(jq -r '.domain' <<<"$n") ;;
+      *)         kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
+    esac
+    printf '  %d) %-18s %-8s port:%-6s %-26s %s\n' \
+      "$i" "$(jq -r '.name' <<<"$n")" "$kind" "$(jq -r '.port' <<<"$n")" \
+      "$dest" \
       "$([[ "$en" == true ]] && echo "$st" || echo "${c_ylw}$st${c_rst}")"
   done < <(jq -c '.nodes[]' "$XRAY_NODES")
 }
@@ -686,15 +988,35 @@ manage_nodes() {
   require_xray
   ensure_nodes_file
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes, add one first"; pause; return; }
-  local id n
+  local id n type
   id=$(pick_node)
   [[ -n "$id" ]] || return
   n=$(node_by_id "$id")
+  type=$(jq -r '.type' <<<"$n")
 
   while :; do
     clear
     node_link "$n"
-    cat <<EOF
+    if [[ "$type" == "trojan-ws" ]]; then
+      cat <<EOF
+
+  Node actions:
+   1) Reset password
+   2) Change WS path
+   3) Enable/disable
+   4) Delete node
+   0) Back
+EOF
+      case "$(ask 'Select')" in
+        1) reset_trojan_password "$id" ;;
+        2) edit_trojan_path "$id" ;;
+        3) toggle_enabled "$id" ;;
+        4) del_node "$id"; return ;;
+        0|"") return ;;
+        *) continue ;;
+      esac
+    else
+      cat <<EOF
 
   Node actions:
    1) Change port
@@ -705,16 +1027,17 @@ manage_nodes() {
    6) Delete node
    0) Back
 EOF
-    case "$(ask 'Select')" in
-      1) edit_port "$id" ;;
-      2) reset_uuid "$id" ;;
-      3) rotate_reality_secret "$id" ;;
-      4) edit_reality_target "$id" ;;
-      5) toggle_enabled "$id" ;;
-      6) del_node "$id"; return ;;
-      0|"") return ;;
-      *) continue ;;
-    esac
+      case "$(ask 'Select')" in
+        1) edit_port "$id" ;;
+        2) reset_uuid "$id" ;;
+        3) rotate_reality_secret "$id" ;;
+        4) edit_reality_target "$id" ;;
+        5) toggle_enabled "$id" ;;
+        6) del_node "$id"; return ;;
+        0|"") return ;;
+        *) continue ;;
+      esac
+    fi
     n=$(node_by_id "$id") || return
     [[ -n "$n" ]] || return
   done
@@ -774,6 +1097,33 @@ edit_reality_target() {
   pause
 }
 
+reset_trojan_password() {
+  local id="$1" pw
+  pw=$(ask "New password (Enter for random)" "$(rand_password)")
+  jq_update_nodes --arg id "$id" --arg pw "$pw" \
+    '(.nodes[]|select(.id==$id)).password = $pw'
+  rebuild_config && ok "password reset" || err "apply failed"
+  pause
+}
+
+edit_trojan_path() {
+  local id="$1" n cf port domain newpath
+  n=$(node_by_id "$id")
+  cf=$(jq -r '.caddy_file' <<<"$n")
+  port=$(jq -r '.port' <<<"$n")
+  domain=$(jq -r '.domain' <<<"$n")
+  newpath=$(ask "New WS path" "$(jq -r '.ws_path' <<<"$n")")
+  [[ "$newpath" == /* ]] || newpath="/$newpath"
+  caddy_remove_route "$id" "$cf"
+  if ! caddy_add_route "$id" "$domain" "$newpath" "$port" "$cf"; then
+    err "Caddy update failed"; pause; return
+  fi
+  jq_update_nodes --arg id "$id" --arg p "$newpath" \
+    '(.nodes[]|select(.id==$id)).ws_path = $p'
+  rebuild_config && ok "WS path changed to $newpath" || err "apply failed"
+  pause
+}
+
 toggle_enabled() {
   local id="$1"
   jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)'
@@ -782,12 +1132,18 @@ toggle_enabled() {
 }
 
 del_node() {
-  local id="$1" n port
+  local id="$1" n port type cf
   confirm "Delete this node?" n || return
   n=$(node_by_id "$id")
   port=$(jq -r '.port' <<<"$n")
+  type=$(jq -r '.type' <<<"$n")
   jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
-  close_port "$port" tcp
+  if [[ "$type" == "trojan-ws" ]]; then
+    cf=$(jq -r '.caddy_file' <<<"$n")
+    caddy_remove_route "$id" "$cf"; caddy_reload "$cf" || true
+  else
+    close_port "$port" tcp
+  fi
   rebuild_config && ok "deleted" || err "apply failed"
   pause
 }
@@ -1054,23 +1410,25 @@ EOF
 
   1) Install / update Xray-core
   2) Add node - VLESS + Reality + Vision + uTLS
-  3) Manage nodes
-  4) Show all share links
-  5) Restart service
-  6) BBR acceleration
-  7) System optimization
-  8) Uninstall
+  3) Add node - Trojan + WS (behind Caddy)
+  4) Manage nodes
+  5) Show all share links
+  6) Restart service
+  7) BBR acceleration
+  8) System optimization
+  9) Uninstall
   0) Exit
 EOF
     case "$(ask 'Select')" in
       1) install_xray; pause ;;
       2) add_reality_node ;;
-      3) manage_nodes ;;
-      4) show_links ;;
-      5) restart_service ;;
-      6) enable_bbr ;;
-      7) optimize_system ;;
-      8) uninstall ;;
+      3) add_trojan_node ;;
+      4) manage_nodes ;;
+      5) show_links ;;
+      6) restart_service ;;
+      7) enable_bbr ;;
+      8) optimize_system ;;
+      9) uninstall ;;
       0|"") exit 0 ;;
       *) ;;
     esac
