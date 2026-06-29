@@ -454,37 +454,48 @@ ensure_site_content() {
   mkdir -p "$root"
   if [[ ! -f "$root/index.html" ]]; then
     cat > "$root/index.html" <<'HTML'
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Notes</title>
+<title>403 Forbidden</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-body{max-width:42rem;margin:4rem auto;padding:0 1.2rem;font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#222}
-h1{font-size:1.6rem;margin:0 0 .2rem}h2{font-size:1.15rem;margin:0 0 .2rem}
-.muted{color:#888;font-size:.9rem}article{margin:2.4rem 0}
-a{color:#0366d6;text-decoration:none}footer{margin-top:4rem;color:#aaa;font-size:.85rem}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+@keyframes floatA{0%,100%{transform:translateY(0)}50%{transform:translateY(-18px)}}
+@keyframes floatB{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-12px) rotate(3deg)}}
+@keyframes blob{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(30px,-20px) scale(1.12)}}
+@keyframes pop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
+@keyframes blink{0%,90%,100%{transform:scaleY(1)}95%{transform:scaleY(.1)}}
+@keyframes shake{0%,100%{transform:rotate(0)}25%{transform:rotate(-12deg)}75%{transform:rotate(12deg)}}
 </style>
 </head>
 <body>
-<header>
-<h1>Notes</h1>
-<p class="muted">Occasional writing on software and infrastructure.</p>
-</header>
-<main>
-<article>
-<h2>Keeping things simple</h2>
-<p class="muted">2024-11-02</p>
-<p>A short note on why small, boring setups tend to outlast the clever ones, and the maintenance cost you pay either way.</p>
-</article>
-<article>
-<h2>Notes on caching</h2>
-<p class="muted">2024-09-18</p>
-<p>Some thoughts after a weekend spent tuning cache headers and watching the hit ratio climb.</p>
-</article>
-</main>
-<footer>&copy; 2024</footer>
+<div style="position:relative;min-height:100vh;width:100%;overflow:hidden;background:radial-gradient(1200px 800px at 75% 15%, #241d33 0%, #181520 55%, #131019 100%);font-family:'Outfit','Noto Sans SC',system-ui,sans-serif;color:#ece8f2;display:flex;align-items:center;justify-content:center;padding:48px 32px">
+  <div style="position:relative;z-index:2;display:flex;align-items:center;justify-content:center;max-width:760px;width:100%">
+    <div style="display:flex;flex-direction:column;gap:28px">
+      <div style="display:inline-flex;align-items:center;gap:10px;align-self:flex-start;padding:7px 14px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);font-size:13px;letter-spacing:.04em;color:#b9b2c9;font-weight:500">
+        <span style="width:8px;height:8px;border-radius:50%;background:#ff4d42;box-shadow:0 0 12px #ff4d42"></span>
+        HTTP 403 · FORBIDDEN
+      </div>
+      <div style="display:flex;align-items:baseline;gap:6px;font-weight:800;line-height:.85;font-size:clamp(96px,16vw,196px);letter-spacing:-.04em">
+        <span>4</span>
+        <span>0</span>
+        <span>3</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <h1 style="font-size:clamp(26px,3.4vw,40px);font-weight:700;letter-spacing:-.01em;line-height:1.15">Access Forbidden</h1>
+      </div>
+      <p style="font-size:16px;line-height:1.7;color:#b9b2c9;max-width:52ch">
+        You don't have permission to view this page. Try signing in again, or reach out if you think this is a mistake.
+      </p>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 HTML
@@ -513,6 +524,10 @@ caddy_add_route() {
     printf '\treverse_proxy @ws_%s 127.0.0.1:%s\n' "$id" "$port"
     printf '\troot * %s\n' "$root"
     printf '\tfile_server\n'
+    printf '\thandle_errors {\n'
+    printf '\t\trewrite * /index.html\n'
+    printf '\t\tfile_server\n'
+    printf '\t}\n'
     printf '}\n'
     printf '# OneVPS-trojan:%s END\n' "$id"
   } >> "$file"
