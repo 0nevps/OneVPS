@@ -443,18 +443,76 @@ caddy_reload() {
   return 1
 }
 
+# Web root served for non-WS traffic on a Trojan subdomain.
+caddy_site_root() { echo "/var/lib/onevps/sites/$1"; }
+
+# Drop a small static landing page so casual probes see a site, not a 404.
+# Never overwrites an existing index.html (user may customize it).
+ensure_site_content() {
+  local domain="$1" root
+  root=$(caddy_site_root "$domain")
+  mkdir -p "$root"
+  if [[ ! -f "$root/index.html" ]]; then
+    cat > "$root/index.html" <<'HTML'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes</title>
+<style>
+body{max-width:42rem;margin:4rem auto;padding:0 1.2rem;font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#222}
+h1{font-size:1.6rem;margin:0 0 .2rem}h2{font-size:1.15rem;margin:0 0 .2rem}
+.muted{color:#888;font-size:.9rem}article{margin:2.4rem 0}
+a{color:#0366d6;text-decoration:none}footer{margin-top:4rem;color:#aaa;font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+<h1>Notes</h1>
+<p class="muted">Occasional writing on software and infrastructure.</p>
+</header>
+<main>
+<article>
+<h2>Keeping things simple</h2>
+<p class="muted">2024-11-02</p>
+<p>A short note on why small, boring setups tend to outlast the clever ones, and the maintenance cost you pay either way.</p>
+</article>
+<article>
+<h2>Notes on caching</h2>
+<p class="muted">2024-09-18</p>
+<p>Some thoughts after a weekend spent tuning cache headers and watching the hit ratio climb.</p>
+</article>
+</main>
+<footer>&copy; 2024</footer>
+</body>
+</html>
+HTML
+  fi
+  chmod -R a+rX /var/lib/onevps 2>/dev/null || true
+}
+
 # Append a marked site block routing a secret WS path to a local Xray inbound.
+# The WS path is gated on the Upgrade header; everything else (including plain
+# GETs to the WS path) is served as a static site, so probes see a real page.
 # Reverts the append if Caddy reload fails. Returns non-zero on failure.
 caddy_add_route() {
-  local id="$1" domain="$2" path="$3" port="$4" file="$5"
+  local id="$1" domain="$2" path="$3" port="$4" file="$5" root
+  root=$(caddy_site_root "$domain")
+  ensure_site_content "$domain"
   cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
   {
     printf '\n# OneVPS-trojan:%s BEGIN\n' "$id"
     printf '%s {\n' "$domain"
-    printf '\thandle %s {\n' "$path"
-    printf '\t\treverse_proxy 127.0.0.1:%s\n' "$port"
+    printf '\tencode zstd gzip\n'
+    printf '\t@ws_%s {\n' "$id"
+    printf '\t\tpath %s\n' "$path"
+    printf '\t\theader Connection *Upgrade*\n'
+    printf '\t\theader Upgrade websocket\n'
     printf '\t}\n'
-    printf '\thandle {\n\t\trespond "Not Found" 404\n\t}\n'
+    printf '\treverse_proxy @ws_%s 127.0.0.1:%s\n' "$id" "$port"
+    printf '\troot * %s\n' "$root"
+    printf '\tfile_server\n'
     printf '}\n'
     printf '# OneVPS-trojan:%s END\n' "$id"
   } >> "$file"
