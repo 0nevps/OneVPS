@@ -1,0 +1,52 @@
+{
+  "nodes": [
+    {
+      "id": "a1b2c3d4",
+      "type": "vless-reality",
+      "name": "Reality Test / HK",
+      "tag": "reality-a1b2c3d4",
+      "port": 443,
+      "uuid": "123e4567-e89b-12d3-a456-426614174000",
+      "flow": "xtls-rprx-vision",
+      "fingerprint": "chrome",
+      "reality_sni": "www.example.com",
+      "reality_target": "www.example.com",
+      "reality_target_port": 443,
+      "reality_private_key": "PRIVATE_KEY_FIXTURE",
+      "reality_public_key": "PUBLIC_KEY_FIXTURE",
+      "reality_short_id": "0123456789abcdef",
+      "spider_x": "/",
+      "enabled": true
+    },
+    {
+      "id": "b2c3d4e5",
+      "type": "trojan-ws",
+      "name": "Trojan Test",
+      "tag": "trojan-b2c3d4e5",
+      "port": 20001,
+      "password": "test+pass@example",
+      "domain": "node.example.com",
+      "ws_path": "/secret path",
+      "caddy_file": "/etc/caddy/Caddyfile",
+      "enabled": true
+    },
+    {
+      "id": "deadbeef",
+      "type": "vless-reality",
+      "name": "Disabled Test",
+      "tag": "reality-deadbeef",
+      "port": 24443,
+      "uuid": "123e4567-e89b-12d3-a456-426614174001",
+      "flow": "xtls-rprx-vision",
+      "fingerprint": "chrome",
+      "reality_sni": "disabled.example.com",
+      "reality_target": "disabled.example.com",
+      "reality_target_port": 443,
+      "reality_private_key": "DISABLED_PRIVATE_KEY",
+      "reality_public_key": "DISABLED_PUBLIC_KEY",
+      "reality_short_id": "fedcba9876543210",
+      "spider_x": "/",
+      "enabled": false
+    }
+  ]
+}

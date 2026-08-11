@@ -132,7 +132,7 @@ normalize_domain() {
   local d="$1"
   d="${d#https://}"; d="${d#http://}"
   d="${d%%/*}"; d="${d%%:*}"
-  echo "${d,,}"
+  printf '%s\n' "$d" | tr '[:upper:]' '[:lower:]'
 }
 
 is_valid_domain() {
@@ -1604,4 +1604,7 @@ main() {
   check_env
   main_menu
 }
-main "$@"
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

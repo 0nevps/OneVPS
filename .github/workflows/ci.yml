@@ -23,15 +23,18 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh
+        run: bash -n onevps.sh tests/test_onevps.sh
 
-      - name: Install ShellCheck
+      - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes shellcheck
+          sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh
+        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+
+      - name: Test configuration generation
+        run: bash tests/test_onevps.sh
 
       - name: Lint Markdown
         run: npx --yes markdownlint-cli2@0.23.2 "**/*.md"
