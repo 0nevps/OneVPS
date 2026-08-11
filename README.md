@@ -1,6 +1,7 @@
 # OneVPS
 
 [![CI](https://github.com/0nevps/OneVPS/actions/workflows/ci.yml/badge.svg)](https://github.com/0nevps/OneVPS/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/0nevps/OneVPS)](https://github.com/0nevps/OneVPS/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [简体中文](README_CN.md)
@@ -61,10 +62,12 @@ the same workflow on another supported host, and contribute fixes in one place.
 The script runs as root and changes system services, firewall rules, and optional kernel settings. Review the
 script before running it, especially on an existing server.
 
-Recommended installation:
+Recommended release installation with checksum verification:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh -o onevps.sh
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/SHA256SUMS
+sha256sum --check SHA256SUMS
 less onevps.sh
 sudo bash onevps.sh
 ```
@@ -72,7 +75,7 @@ sudo bash onevps.sh
 Convenience command for an already trusted environment:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
+bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh)
 ```
 
 The convenience command must be run from a root shell. On first use, select `1` to install or update Xray-core,
@@ -276,12 +279,29 @@ maintenance priorities are:
 
 - Keep generated Xray and Caddy configuration compatible with supported upstream releases
 - Improve failure handling and make host changes easier to audit or roll back
-- Expand automated checks beyond Bash syntax and static analysis
-- Add reproducible tests for pure configuration-generation logic
+- Expand automated coverage for configuration migrations, Caddy routes, and failure paths
+- Add disposable cross-distribution integration tests for host-level operations
 - Document compatibility results from different distributions and architectures
 - Review runtime downloads and release-integrity controls
 
-The CI workflow runs Bash syntax validation, ShellCheck, and Markdownlint for each push and pull request.
+The CI workflow runs Bash syntax validation, ShellCheck, configuration-generation tests, and Markdownlint for
+each push and pull request.
+
+## Testing
+
+The dependency-light test suite sources `onevps.sh`, uses fixture node metadata, and writes only to a temporary
+directory. It does not modify systemd, firewall rules, or production configuration.
+
+```bash
+bash -n onevps.sh tests/test_onevps.sh
+shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+bash tests/test_onevps.sh
+```
+
+## Releases
+
+Versioned releases include `onevps.sh` and a `SHA256SUMS` file. See [CHANGELOG.md](CHANGELOG.md) for release notes
+and compatibility-impacting changes.
 
 ## Contributing
 

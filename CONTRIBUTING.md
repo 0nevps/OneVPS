@@ -18,6 +18,7 @@ safe to review.
 The repository intentionally has a small toolchain. For local checks, install:
 
 - Bash
+- `jq` and OpenSSL
 - [ShellCheck](https://www.shellcheck.net/)
 - Node.js and npm for Markdownlint
 - [actionlint](https://github.com/rhysd/actionlint) when changing GitHub Actions workflows
@@ -46,8 +47,9 @@ git switch -c fix/short-description
 Run the same baseline checks as CI:
 
 ```bash
-bash -n onevps.sh
-shellcheck --severity=warning onevps.sh
+bash -n onevps.sh tests/test_onevps.sh
+shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+bash tests/test_onevps.sh
 npx --yes markdownlint-cli2@0.23.2 "**/*.md"
 ```
 
@@ -92,6 +94,6 @@ firewall rules, Caddy routing, generated credentials, or systemd hardening.
 
 - 提交前先检索现有 issue；安全漏洞请按 [SECURITY.md](SECURITY.md) 私密报告。
 - 公开内容中不得包含节点链接、UUID、密码、私钥、WebSocket 路径或未脱敏日志。
-- 功能变更需同步更新中英文 README，并执行 Bash 语法、ShellCheck 和 Markdownlint。
+- 功能变更需同步更新中英文 README，并执行 Bash 语法、ShellCheck、自动测试和 Markdownlint。
 - 涉及安装、升级或系统配置的手工测试只能在有权管理的临时 VPS 或虚拟机中进行。
 - Pull request 应说明问题、实现理由、验证结果、兼容性影响和回滚方式。

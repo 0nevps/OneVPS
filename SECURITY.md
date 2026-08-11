@@ -4,13 +4,14 @@
 
 ## Supported Versions
 
-OneVPS does not currently publish versioned releases. Security fixes target the latest commit on the `main`
-branch. Historical commits and locally modified copies are not maintained as separate supported versions.
+Security fixes target the latest release and the current `main` branch. Historical releases, historical commits,
+and locally modified copies are not maintained as separate supported versions.
 
 | Version | Supported |
 | --- | --- |
-| Latest `main` | Yes |
-| Historical commits | No |
+| Latest release | Yes |
+| Current `main` | Development |
+| Historical releases and commits | No |
 | Third-party forks | No |
 
 ## Reporting a Vulnerability
@@ -75,4 +76,4 @@ Usually out of scope unless OneVPS causes or worsens the issue:
 - 仓库管理员需要在 GitHub Security 设置中保持 Private Vulnerability Reporting 开启。
 - 报告应包含影响、受影响 commit、复现步骤、环境版本和已知缓解方式。
 - 必须删除节点链接、UUID、密码、私钥、WebSocket 路径、令牌及不必要的公网 IP。
-- 当前仅维护 `main` 分支最新版本；历史提交、本地修改版本和第三方 fork 不单独提供安全支持。
+- 当前维护最新正式版本与 `main` 分支；历史版本、本地修改版本和第三方 fork 不单独提供安全支持。

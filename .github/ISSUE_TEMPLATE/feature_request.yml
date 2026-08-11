@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a focused improvement to OneVPS
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        OneVPS is intentionally focused on Xray deployment and operations.
+        Explain the operational problem before describing a preferred solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Operational problem
+      description: What workflow is difficult, unreliable, or unsupported today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed improvement
+      description: Describe the expected behavior without including live credentials.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or simpler approaches you evaluated.
+
+  - type: input
+    id: environments
+    attributes:
+      label: Relevant environments
+      description: List distributions, architectures, Xray versions, or Caddy versions.
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Compatibility and security considerations
+      description: Note host changes, migration needs, credentials, ports, or rollback concerns.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and the project roadmap.
+          required: true
+        - label: This request fits OneVPS's Xray-focused scope.
+          required: true

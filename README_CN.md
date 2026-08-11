@@ -1,6 +1,7 @@
 # OneVPS
 
 [![CI](https://github.com/0nevps/OneVPS/actions/workflows/ci.yml/badge.svg)](https://github.com/0nevps/OneVPS/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/0nevps/OneVPS)](https://github.com/0nevps/OneVPS/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [English](README.md)
@@ -54,10 +55,12 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 
 脚本以 root 权限运行，并会修改系统服务、防火墙规则和可选内核参数。在现有服务器上执行前，请先审阅脚本。
 
-推荐安装方式：
+推荐使用带校验文件的正式版本：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh -o onevps.sh
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/SHA256SUMS
+sha256sum --check SHA256SUMS
 less onevps.sh
 sudo bash onevps.sh
 ```
@@ -65,7 +68,7 @@ sudo bash onevps.sh
 已确认环境可信时，也可使用便捷命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
+bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh)
 ```
 
 便捷命令需要在 root Shell 中运行。首次使用时先选择 `1` 安装或更新 Xray-core，再选择 `2` 添加 Reality 节点，
@@ -258,12 +261,27 @@ BBR 设置、系统优化文件、swap、Caddy、Caddyfile 和自定义站点内
 
 - 保持生成的 Xray 与 Caddy 配置兼容受支持的上游版本
 - 改善失败处理，使主机变更更容易审计和回滚
-- 在 Bash 语法与静态分析之外扩展自动化检查
-- 为纯配置生成逻辑增加可重复测试
+- 扩展配置迁移、Caddy 路由和失败路径的自动测试
+- 为主机级操作增加一次性跨发行版集成测试
 - 记录不同发行版与架构的兼容性结果
 - 审查运行时下载和发布完整性控制
 
-CI 会在每次 push 和 pull request 时执行 Bash 语法校验、ShellCheck 和 Markdownlint。
+CI 会在每次 push 和 pull request 时执行 Bash 语法校验、ShellCheck、配置生成测试和 Markdownlint。
+
+## 测试
+
+轻量测试套件会加载 `onevps.sh`，使用固定节点数据，并且只写入临时目录；不会修改 systemd、防火墙或生产配置。
+
+```bash
+bash -n onevps.sh tests/test_onevps.sh
+shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+bash tests/test_onevps.sh
+```
+
+## 版本发布
+
+正式版本包含 `onevps.sh` 和 `SHA256SUMS`。发布说明及兼容性相关变更记录在
+[CHANGELOG.md](CHANGELOG.md) 中。
 
 ## 参与贡献
 
