@@ -1,48 +1,82 @@
 # OneVPS
 
-[中文版](README_CN.md)
+[![CI](https://github.com/0nevps/OneVPS/actions/workflows/ci.yml/badge.svg)](https://github.com/0nevps/OneVPS/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-One-click Xray node deployment script for VPS. Two protocols:
+[简体中文](README_CN.md)
 
-- **VLESS + TCP + REALITY + XTLS Vision + uTLS** (mainline) — no domain, no certificate.
-- **Trojan + WebSocket behind Caddy** — rides Caddy's `:443` + certificates, coexisting with other Caddy-proxied services.
+OneVPS is an open-source automation tool for deploying and operating Xray nodes on Linux VPS hosts.
+It turns the installation, configuration, service management, and routine maintenance steps into one
+auditable Bash workflow.
 
-Built on [Xray-core](https://github.com/XTLS/Xray-core). The Reality path needs no domain/cert; the Trojan path requires Caddy (auto-installed when absent).
+Two deployment modes are supported:
 
----
+- **VLESS + TCP + REALITY + XTLS Vision + uTLS** — a standalone deployment that does not require a domain
+  or certificate.
+- **Trojan + WebSocket behind Caddy** — a deployment that shares Caddy's `:443` listener and certificates
+  with other Caddy-managed services.
+
+OneVPS deliberately focuses on Xray-based deployments. It is not a general-purpose VPS control panel or a
+replacement for infrastructure-as-code, firewall management, monitoring, or backups.
+
+## Why OneVPS?
+
+Operating an Xray service by hand involves more than installing a binary. Maintainers must generate secrets,
+produce valid configuration, create a least-privilege systemd service, coordinate ports and firewall rules,
+integrate with a TLS endpoint, and keep the resulting deployment maintainable.
+
+OneVPS keeps those steps in a readable shell script so operators can inspect what changes will be made, repeat
+the same workflow on another supported host, and contribute fixes in one place.
 
 ## Features
 
-- **Official Xray installer**: installs/updates core and geodata through [XTLS/Xray-install](https://github.com/XTLS/Xray-install)
+- **Repeatable deployment**: installs dependencies and generates Xray configuration from stored node metadata
+- **Official Xray installer**: installs or updates core and geodata through
+  [XTLS/Xray-install](https://github.com/XTLS/Xray-install)
 - **VLESS + TCP + REALITY**: direct VPS connection with REALITY target-site TLS camouflage
-- **XTLS Vision**: server users are generated with `flow: xtls-rprx-vision`
-- **uTLS**: share links use `fp=chrome` for mainstream client compatibility
-- **Trojan + WS behind Caddy**: loopback-only Xray inbound; Caddy terminates TLS on `:443` and reverse-proxies a secret WS path on a dedicated subdomain, coexisting with other Caddy sites. Caddy is auto-installed if missing.
-- **Secure defaults**: random UUID, X25519 keypair, 16-hex shortId, private IP blocking, BitTorrent blocking, UDP/443 blocking
-- **Hardened service**: systemd runs Xray as `nobody` with only low-port bind capability
-- **Operations**: node management, share links, BBR, basic system tuning
+- **XTLS Vision and uTLS**: generates `xtls-rprx-vision` users and share links with `fp=chrome`
+- **Trojan + WS behind Caddy**: exposes only Caddy while the Xray inbound remains bound to loopback
+- **Configuration validation**: validates generated Xray configuration before replacing the active file
+- **Secure defaults**: random UUIDs, X25519 keys, short IDs, passwords, and WebSocket paths
+- **Restricted routing**: blocks private address ranges, BitTorrent traffic, and—by default—outbound UDP/443
+- **Least-privilege service**: runs Xray as `nobody` with only the low-port bind capability
+- **Operations**: manages nodes and share links, restarts the service, enables BBR, and applies optional system tuning
 
-> Old sing-box nodes are not migrated automatically. This script now manages Xray under `/usr/local/etc/xray/`.
+> Legacy sing-box nodes are not migrated automatically. OneVPS manages Xray under `/usr/local/etc/xray/`.
 
----
+## Supported Technologies
+
+| Area | Supported options |
+| --- | --- |
+| Core | [Xray-core](https://github.com/XTLS/Xray-core) |
+| Protocols | VLESS, Trojan |
+| Transports | TCP, WebSocket |
+| Security | REALITY, XTLS Vision, TLS terminated by Caddy |
+| Service manager | systemd |
+| Architectures | amd64, arm64, armv7 |
+| Package managers | apt, dnf, yum, zypper |
 
 ## Quick Start
 
-One-liner:
+The script runs as root and changes system services, firewall rules, and optional kernel settings. Review the
+script before running it, especially on an existing server.
+
+Recommended installation:
+
+```bash
+curl -fL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh -o onevps.sh
+less onevps.sh
+sudo bash onevps.sh
+```
+
+Convenience command for an already trusted environment:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
 ```
 
-Or download and run locally:
-
-```bash
-sudo bash onevps.sh
-```
-
-First time: run `1` to install/update Xray-core, then run `2` for a Reality node or `3` for a Trojan + WS node.
-
----
+The convenience command must be run from a root shell. On first use, select `1` to install or update Xray-core,
+then select `2` for a Reality node or `3` for a Trojan + WS node.
 
 ## Menu
 
@@ -59,19 +93,19 @@ First time: run `1` to install/update Xray-core, then run `2` for a Reality node
 0) Exit
 ```
 
----
+## VLESS + REALITY
 
-## Node Configuration
+### Default configuration
 
 | Item | Default |
-|------|---------|
+| --- | --- |
 | Protocol | VLESS |
 | Transport | TCP |
 | Transport security | REALITY |
 | Flow | `xtls-rprx-vision` |
 | uTLS fingerprint | `chrome` |
 | Encryption | `none` |
-| Default port | `443`, random if occupied |
+| Port | `443`, or a random high port if occupied |
 
 Share link format:
 
@@ -79,9 +113,7 @@ Share link format:
 vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=TARGET&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&spx=%2F&type=tcp#NAME
 ```
 
----
-
-## Reality Target
+### REALITY target selection
 
 Built-in candidates:
 
@@ -98,34 +130,34 @@ Built-in candidates:
 - `www.oracle.com`
 - `www.netflix.com`
 
-Recommended target properties:
+A suitable target should support TLS 1.3 and HTTP/2, have a stable SNI covered by the certificate SAN, and have
+acceptable latency from the VPS network.
 
-- Supports TLS 1.3 and H2
-- Stable SNI, with the selected domain covered by certificate SAN
-- Low latency from your VPS network when possible
+When a Reality node is added or edited, OneVPS runs multiple `xray tls ping` rounds against the built-in
+candidates and ranks them by success rate and average latency. Operators can still select a candidate manually
+or enter a custom domain. If every probe fails, the script falls back to the first candidate and displays a
+warning.
 
-When adding or editing a node, the script auto-tests built-in candidates with multiple `xray tls ping` rounds and selects by success rate, then average latency. You can still select a candidate manually or enter a custom domain. If every probe fails, the script falls back to the first candidate, but you should pick a more stable target when possible.
+## Trojan + WebSocket Behind Caddy
 
----
-
-## Trojan + WS (behind Caddy)
-
-Menu `3` adds a Trojan node that lives behind Caddy, so it shares `:443` with whatever else Caddy already serves.
+Menu option `3` creates a Trojan node that shares port `443` with services already managed by Caddy.
 
 How it works:
 
-- Xray Trojan inbound binds **`127.0.0.1` only** with **no TLS** (`network: ws`).
-- Caddy terminates TLS on `:443`, auto-issues a certificate for a **dedicated subdomain**, and reverse-proxies a **secret WS path** to the local inbound. All other Caddy sites/paths are untouched.
-- Only the **secret WS path** is proxied to Xray (Caddy's `reverse_proxy` performs the WebSocket upgrade). Every other path returns **HTTP 403 with a styled 403 page** from `/var/lib/onevps/sites/<domain>/index.html`, so the rest of the subdomain looks like a locked-down site rather than a dead proxy. The random path is the secret. Replace that `index.html` with your own content anytime; the script never overwrites it.
-- The firewall is not modified for Trojan nodes — only Caddy faces the internet.
+- The Xray Trojan inbound listens on **`127.0.0.1` only**, uses WebSocket transport, and does not terminate TLS.
+- Caddy terminates TLS for a dedicated subdomain and reverse-proxies a secret WebSocket path to the local inbound.
+- Other Caddy sites remain untouched.
+- Requests outside the secret path receive an HTTP 403 response backed by an editable page in
+  `/var/lib/onevps/sites/<domain>/index.html`.
+- The script appends a marked site block to the Caddyfile, validates the configuration, and reloads Caddy. A failed
+  reload rolls the appended block back.
+- Trojan nodes do not change firewall rules; Caddy remains the public endpoint.
 
 Requirements:
 
-- A subdomain with a DNS `A`/`AAAA` record pointing at this server (so Caddy can issue the cert).
-- Ports `80` and `443` reachable for ACME and traffic.
-- Caddy installed — if absent, the script installs it (official apt/dnf/yum repo, or a static binary + systemd unit as fallback) and creates a default Caddyfile.
-
-The script appends a marked site block to the Caddyfile, validates, and reloads Caddy. Deleting the node removes that block and reloads again.
+- A dedicated subdomain with `A` or `AAAA` records pointing at the server
+- Reachable ports `80` and `443` for ACME and client traffic
+- Caddy, which OneVPS installs when absent using a supported package repository or a static binary fallback
 
 Share link format:
 
@@ -133,13 +165,9 @@ Share link format:
 trojan://PASSWORD@SUBDOMAIN:443?security=tls&sni=SUBDOMAIN&type=ws&host=SUBDOMAIN&path=PATH#NAME
 ```
 
----
-
 ## Node Management
 
-Menu `4` actions depend on node type.
-
-Reality node:
+Reality node actions:
 
 ```text
 1) Change port
@@ -150,7 +178,7 @@ Reality node:
 6) Delete node
 ```
 
-Trojan node:
+Trojan node actions:
 
 ```text
 1) Reset password
@@ -161,23 +189,37 @@ Trojan node:
 6) Delete node
 ```
 
-`Rebuild Caddy route` regenerates the node's Caddy block from its stored fields without changing the password/path/port — use it to roll an existing node onto the current Caddy template after updating the script.
+`Rebuild Caddy route` regenerates the managed Caddy block without changing the node password, path, or port.
+Rotating Reality secrets or resetting Trojan credentials invalidates old client links; import the updated link
+from menu option `5`.
 
-After rotating the Reality keypair/shortId or resetting a Trojan password/path, old client links stop working. Re-import the new link from menu `5`.
+## Security Model
 
----
+OneVPS applies several defensive defaults, but running any root-level deployment script still requires operator
+review and normal server hardening.
+
+- Node credentials and private keys are stored in `/usr/local/etc/xray/onevps-nodes.json` with restricted access.
+- Generated runtime configuration is validated before activation.
+- Xray runs without root privileges after installation.
+- Trojan inbounds are loopback-only; Caddy is the only public TLS endpoint for that mode.
+- Share links contain live credentials and must be handled as secrets.
+- The installation workflow downloads upstream installers or binaries at runtime. Operators should evaluate their
+  network and upstream trust requirements before execution.
+- OneVPS does not configure SSH policy, unattended upgrades, intrusion detection, backups, or a complete firewall.
+
+Report suspected vulnerabilities privately according to the [security policy](SECURITY.md).
 
 ## File Locations
 
 | Path | Purpose |
-|------|---------|
+| --- | --- |
 | `/usr/local/bin/xray` | Xray core binary |
-| `/usr/local/etc/xray/config.json` | Generated Xray runtime config |
-| `/usr/local/etc/xray/onevps-nodes.json` | Node metadata |
-| `/usr/local/share/xray/` | geoip/geosite data |
-| `/etc/systemd/system/xray.service` | systemd service |
+| `/usr/local/etc/xray/config.json` | Generated Xray runtime configuration |
+| `/usr/local/etc/xray/onevps-nodes.json` | Node metadata and credentials |
+| `/usr/local/share/xray/` | geoip and geosite data |
+| `/etc/systemd/system/xray.service` | systemd service unit |
 | `/var/log/xray/` | Xray log directory |
-| `/var/lib/onevps/sites/<domain>/` | 403 camouflage page for a Trojan subdomain (editable) |
+| `/var/lib/onevps/sites/<domain>/` | Editable 403 page for a Trojan subdomain |
 
 Manual service management:
 
@@ -187,47 +229,74 @@ systemctl restart xray
 journalctl -u xray -f
 ```
 
-Config validation:
+Configuration validation:
 
 ```bash
 xray run -test -config /usr/local/etc/xray/config.json
 ```
 
----
-
 ## Requirements
 
-- Linux + systemd
+- Linux with systemd
 - Root access
-- Architecture: amd64 / arm64 / armv7
-- Package manager: apt / dnf / yum / zypper
-- Dependencies auto-installed: `curl` `jq` `openssl`
-- Caddy auto-installed only when adding a Trojan node
+- amd64, arm64, or armv7 architecture
+- apt, dnf, yum, or zypper
+- `curl`, `jq`, `openssl`, and CA certificates; missing dependencies are installed automatically
+- Caddy only for Trojan + WS nodes; it is installed automatically when required
 
----
+Support is best-effort because distribution releases, package repositories, Xray, and Caddy change independently.
+When reporting a compatibility problem, include the distribution, version, architecture, package manager, and
+sanitized command output.
 
 ## BBR and System Tuning
 
-Menu `7` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`.
+Menu option `7` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`.
 
-Menu `8` applies conservative long-running VPS tuning:
+Menu option `8` applies optional, conservative tuning for long-running VPS workloads:
 
-- Raises TCP buffer ceilings without inflating each socket's default buffer
-- Enables TFO and MTU probing, and raises backlog limits
-- Sets ephemeral ports to `10000-65535`
+- Raises TCP buffer ceilings without increasing every socket's default allocation
+- Enables TCP Fast Open and MTU probing and raises backlog limits
+- Sets the ephemeral port range to `10000-65535`
 - Can create a small swap file and cap journald disk usage
-- Can toggle Xray outbound UDP/443 blocking; enabled by default to reduce QUIC/HTTP3 routing and stability issues
+- Can toggle Xray outbound UDP/443 blocking, which is enabled by default
 
----
+Review these settings against the server's other workloads before applying them.
 
 ## Uninstall
 
-Menu `9` removes the Xray binary, config, node metadata, geodata, and log directory.
+Menu option `9` removes the Xray binary, configuration, node metadata, geodata, and log directory.
 
-BBR, system tuning configs, the swap file, and Caddy (with its Caddyfile) are kept.
+BBR settings, system-tuning files, the swap file, Caddy, its Caddyfile, and customized site content are retained so
+the script does not remove host-wide state that may be shared with other services.
 
----
+## Maintenance and Roadmap
+
+Infrastructure automation must track changes across Linux distributions and upstream components. Current
+maintenance priorities are:
+
+- Keep generated Xray and Caddy configuration compatible with supported upstream releases
+- Improve failure handling and make host changes easier to audit or roll back
+- Expand automated checks beyond Bash syntax and static analysis
+- Add reproducible tests for pure configuration-generation logic
+- Document compatibility results from different distributions and architectures
+- Review runtime downloads and release-integrity controls
+
+The CI workflow runs Bash syntax validation, ShellCheck, and Markdownlint for each push and pull request.
+
+## Contributing
+
+Bug reports, compatibility results, documentation improvements, and focused pull requests are welcome. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a contribution. Do not include node URLs, UUIDs, passwords,
+private keys, or unredacted server logs in public issues.
+
+Security-sensitive reports must follow [SECURITY.md](SECURITY.md) instead of the public issue tracker.
+
+## License
+
+OneVPS is available under the [MIT License](LICENSE).
 
 ## Disclaimer
 
-For educational and legitimate network debugging purposes only. Please comply with local laws and your VPS provider's terms of service.
+Use OneVPS only for lawful administration of systems and networks you are authorized to manage. You are
+responsible for reviewing the script, complying with local law and provider terms, and protecting generated
+credentials.
