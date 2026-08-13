@@ -632,8 +632,14 @@ plain_view() {
 
       span = sprintf("%s / %d 次采样", dur(last_e - first_e + interval), n)
       if (p == 0) {
+        # Name what was actually checked; a bare "services ok" says nothing
+        # about which ones were watched.
+        svc = ""
+        for (name in seen) svc = svc (svc == "" ? "" : "、") name
         printf "\n🟢 服务端正常 · %s\n", span
-        printf "  服务 🟢  连接 🟢  → 客户端或线路问题\n"
+        if (svc != "") printf "  %s 全程在线 · 无连接被拒绝或丢弃\n", svc
+        else           printf "  无连接被拒绝或丢弃\n"
+        printf "  → 客户端或线路问题\n"
       } else {
         printf "\n🔴 %d 个问题 · %s\n\n", p, span
         printf "%s", out
