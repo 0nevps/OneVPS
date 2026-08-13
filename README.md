@@ -332,7 +332,7 @@ it meant for users, and the command to run next:
   IP 封禁 🟢
   监听端口 🟢
 
-  2 项异常 → 优先排查上面的红项
+  2 项异常 · 优先排查上面的红项
 ```
 
 When nothing is found, that is itself the answer: the server was healthy throughout the window, so the fault lay

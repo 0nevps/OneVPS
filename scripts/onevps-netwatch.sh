@@ -669,8 +669,11 @@ plain_view() {
         if (rc[i] != "") printf "     %s→ %s%s\n", blu, rc[i], rst
       }
       printf "\n"
-      if (p == 0) printf "  全部正常 → 客户端或线路问题\n"
-      else        printf "  %d 项异常 → 优先排查上面的红项\n", p
+      # The healthy line is a conclusion by elimination, and only means
+      # something against a complaint; say so, or it reads as a claim that
+      # the client is broken right now.
+      if (p == 0) printf "  全部正常 · 若有人这段时间连不上，原因不在本机\n"
+      else        printf "  %d 项异常 · 优先排查上面的红项\n", p
       if (hint != "") printf "\n  %s详细：%s%s\n", blu, hint, rst
       printf "\n"
     }
