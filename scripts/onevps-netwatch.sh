@@ -618,20 +618,20 @@ plain_view() {
       }
 
       if (queue_lost > 0) {
-        row("连接接纳", 1, "队列溢出丢弃 " queue_lost " 个（" queue_hm " 起） · 涌入超过处理能力", "")
+        row("接受新连接", 1, "排队溢出丢弃 " queue_lost " 个（" queue_hm " 起） · 涌入超过处理能力", "")
       } else {
-        row("连接接纳", 0, "", "")
+        row("接受新连接", 0, "", "")
       }
 
       if (ctfull > 0) {
-        row("连接跟踪表", 1, "占满" times(ctfull, ctfull_hm) " · 内核直接拒绝新连接",
+        row("防火墙连接表", 1, "占满" times(ctfull, ctfull_hm) " · 新连接一律被拒，老连接不受影响",
             "sysctl net.netfilter.nf_conntrack_max")
       } else if (ct_peak >= 80) {
-        row("连接跟踪表", 1, "峰值 " ct_peak "%（" ct_hm "） · 接近上限，再涨会丢连接", "")
+        row("防火墙连接表", 1, "峰值 " ct_peak "%（" ct_hm "） · 接近上限，满了会开始拒连", "")
       } else if (ct_limit == 0) {
-        row("连接跟踪表", 0, "未启用 · 本机没有用到连接跟踪的防火墙规则", "")
+        row("防火墙连接表", 0, "未启用 · 本机没有跟踪连接的防火墙规则", "")
       } else {
-        row("连接跟踪表", 0, "", "")
+        row("防火墙连接表", 0, "", "")
       }
 
       if (oom > 0) {
