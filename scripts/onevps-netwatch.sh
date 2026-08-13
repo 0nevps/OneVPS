@@ -7,12 +7,16 @@
 # `netwatch at 14:30` shows exactly what the box looked like at that moment,
 # which separates a server-side fault from a link/client-side one.
 #
+# status, at and report answer that question in plain language, so an operator
+# who does not read TCP counters still gets a verdict and a next step; --detail
+# exposes the underlying numbers.
+#
 # Subcommands:
 #   collect            take one sample and append it to the log (timer entry)
-#   status             show the most recent sample as a table
-#   tail               follow the log live
-#   at <time>          show samples around a point in time
-#   report [--since D] summarize anomalies over a window
+#   status             verdict for the last 24 hours
+#   at <time>          verdict around a point in time
+#   report [--since D] verdict over a window
+#   tail               follow the raw log live
 #   install            install and start the systemd timer
 #   uninstall          remove the timer (add --purge to drop logs and config)
 #
@@ -488,22 +492,197 @@ render_sample() {
   '
 }
 
+# Plain-language verdict over a window, for operators who should not have to
+# read TCP counters. Findings are aggregated per kind rather than per sample,
+# and ordered by how likely they are to explain a failed connection.
+# plain_view <from> <to> <lead> <hint> <live>
+# live=1 means the window runs up to now, so an unresolved fault can be
+# described in the present tense; on a historical window it cannot.
+plain_view() {
+  local from="$1" to="$2" lead="$3" hint="$4" live="${5:-0}"
+  awk -v from="$from" -v to="$to" -v lead="$lead" -v hint="$hint" -v live="$live" \
+      -v interval="$INTERVAL" \
+      -v grn="$c_grn" -v ylw="$c_ylw" -v red="$c_red" -v blu="$c_blu" -v rst="$c_rst" '
+    function hm(ts) { return substr(ts, 12, 5) }
+    function dur(sec,   h, m) {
+      h = int(sec / 3600); m = int((sec % 3600) / 60)
+      if (h > 0) return h "小时" (m > 0 ? m "分钟" : "")
+      if (m > 0) return m "分钟"
+      return sec "秒"
+    }
+    function add(title, why, how) {
+      p++
+      out = out sprintf("\n  %s●%s %s\n", red, rst, title)
+      out = out sprintf("    %s\n", why)
+      if (how != "") out = out sprintf("    %s细查：%s%s\n", blu, how, rst)
+    }
+    {
+      delete v
+      for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+      e = v["epoch"] + 0
+      if (e < from || e > to) next
+
+      n++
+      if (!first_e) { first_e = e }
+      last_e = e
+      t = hm(v["ts"])
+
+      for (k in v) {
+        if (substr(k, 1, 4) == "svc.") {
+          name = substr(k, 5); seen[name] = 1
+          if (v[k] == "down") {
+            if (!(name in down_from)) { down_from[name] = e; down_hm[name] = t }
+            down_last[name] = e
+          } else if (name in down_from) {
+            downlen[name] += down_last[name] - down_from[name] + interval
+            if (!(name in down_start_hm)) down_start_hm[name] = down_hm[name]
+            down_end_hm[name] = t
+            delete down_from[name]
+          }
+        }
+        if (substr(k, 1, 4) == "pid.") {
+          name = substr(k, 5)
+          if (name in lastpid && lastpid[name] != 0 && v[k] != 0 && lastpid[name] != v[k]) {
+            restarts[name]++
+            if (!(name in restart_hm)) restart_hm[name] = t
+          }
+          lastpid[name] = v[k]
+        }
+      }
+
+      if (v["drops"] + 0 > 0 || v["ovfl"] + 0 > 0) {
+        queue_lost += v["drops"] + v["ovfl"]
+        if (queue_hm == "") queue_hm = t
+      }
+      if (v["ctfull"] + 0 > 0) { ctfull += v["ctfull"]; if (ctfull_hm == "") ctfull_hm = t }
+      if (v["oom"] + 0 > 0)    { oom += v["oom"];       if (oom_hm == "")    oom_hm = t }
+      if (v["ct_pct"] + 0 > ct_peak)  { ct_peak = v["ct_pct"] + 0; ct_hm = t }
+      if (v["disk"] + 0 > disk_peak)  { disk_peak = v["disk"] + 0; disk_hm = t }
+
+      if (n == 1) { banned_first = banned_max = v["banned"] + 0; listen_min = listen_max = v["listen_n"] + 0 }
+      if (v["banned"] + 0 > banned_max) banned_max = v["banned"] + 0
+      if (v["listen_n"] + 0 < listen_min) listen_min = v["listen_n"] + 0
+      if (v["listen_n"] + 0 > listen_max) listen_max = v["listen_n"] + 0
+    }
+    END {
+      if (n == 0) {
+        printf "\n  %s这段时间没有采样记录。%s\n", ylw, rst
+        printf "  记录可能尚未启动，或该时间早于安装时间。\n\n"
+        exit
+      }
+
+      # Ordered by how directly each finding explains a failed connection.
+      for (name in down_from) {
+        if (live == 1) {
+          add(name " 服务当前处于停止状态，已持续 " dur(last_e - down_from[name] + interval),
+              "现在所有到该服务的连接都会失败，需要立即处理。",
+              "systemctl status " name)
+        } else {
+          add(name " 服务在 " down_hm[name] " 停止，直到这段记录结束仍未恢复",
+              "这段时间内所有到该服务的连接都会失败。",
+              "journalctl -u " name " --since \"" down_hm[name] "\"")
+        }
+      }
+      for (name in downlen) {
+        add(name " 服务曾停止 " dur(downlen[name]) \
+            "（" down_start_hm[name] " - " down_end_hm[name] "）",
+            "这段时间内所有到该服务的连接都会失败。",
+            "journalctl -u " name " --since \"" down_start_hm[name] "\"")
+      }
+      if (ctfull > 0) {
+        add("连接跟踪表被占满 " ctfull " 次（最早 " ctfull_hm "）",
+            "内核直接拒绝了新连接。这是偶发连不上最常见的服务端原因。",
+            "sysctl net.netfilter.nf_conntrack_max")
+      }
+      if (queue_lost > 0) {
+        add("连接队列溢出，共丢弃 " queue_lost " 个连接（最早 " queue_hm "）",
+            "短时间涌入的连接超过了服务处理能力，一部分被直接拒绝。", "")
+      }
+      if (oom > 0) {
+        add("内存耗尽，内核杀掉进程 " oom " 次（最早 " oom_hm "）",
+            "被杀掉的可能就是代理服务，期间会完全无法连接。",
+            "journalctl -k | grep -i \"out of memory\"")
+      }
+      for (name in restarts) {
+        add(name " 服务重启过 " restarts[name] " 次（最早 " restart_hm[name] "）",
+            "重启瞬间已建立的连接会断开，用户需要重新连接。",
+            "journalctl -u " name " --since \"" restart_hm[name] "\"")
+      }
+      # Only worth reporting as a warning when the table never actually filled;
+      # otherwise the "table full" finding above already says it, and harder.
+      if (ct_peak >= 80 && ctfull == 0) {
+        add("连接跟踪表最高占用 " ct_peak "%（" ct_hm "）",
+            "还没到拒绝连接的程度，但已接近上限，继续增长就会开始丢连接。", "")
+      }
+      if (banned_max > banned_first) {
+        add("fail2ban 新封禁了 " (banned_max - banned_first) " 个 IP",
+            "如果用户的 IP 被误封，他们会完全连不上，而其他人一切正常。",
+            "fail2ban-client status")
+      }
+      if (disk_peak >= 90) {
+        add("磁盘占用最高 " disk_peak "%（" disk_hm "）",
+            "磁盘写满会导致服务写日志失败甚至崩溃。", "")
+      }
+      if (listen_max != listen_min) {
+        add("监听端口数量变化过（" listen_min " - " listen_max "）",
+            "期间有服务启动或停止过，可能与连接失败有关。", "")
+      }
+
+      if (p == 0) {
+        printf "\n%s[+] 服务端正常%s\n\n", grn, rst
+        printf "  %s：共 %d 次采样，实际覆盖 %s。\n", lead, n, dur(last_e - first_e + interval)
+        svc = ""
+        for (name in seen) svc = svc (svc == "" ? "" : "、") name
+        if (svc != "") printf "  %s 全程在线。\n", svc
+        printf "  这台服务器没有拒绝或丢弃过任何连接。\n\n"
+        printf "  如果这段时间有人连不上，问题出在他们自己的网络或到本机的线路，\n"
+        printf "  不在这台服务器。\n"
+      } else {
+        printf "\n%s[!] 发现 %d 个问题%s\n", ylw, p, rst
+        printf "  %s：共 %d 次采样，实际覆盖 %s。\n", lead, n, dur(last_e - first_e + interval)
+        printf "%s", out
+      }
+      if (hint != "") printf "\n  %s完整指标：%s%s\n", blu, hint, rst
+      printf "\n"
+    }
+  ' "$LOG"
+}
+
 cmd_status() {
+  local detail=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --detail) detail=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
   require_log
+
   local last epoch age now stale
   last=$(tail -n 1 "$LOG")
   now=$(date +%s)
   epoch=$(printf '%s\n' "$last" | grep -o 'epoch=[0-9]*' | head -n 1 | cut -d= -f2)
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "malformed last log line in $LOG"
   age=$(( now - epoch ))
-
-  info "latest sample (${age}s ago)"
-  printf '%s\n' "$last" | render_sample
-
   stale=$(( INTERVAL * 3 ))
-  if (( age > stale )); then
-    warn "sample is stale (> ${stale}s) - check: systemctl status $NAME.timer"
+
+  if [[ "$detail" -eq 1 ]]; then
+    info "latest sample (${age}s ago)"
+    printf '%s\n' "$last" | render_sample
+    if (( age > stale )); then
+      warn "sample is stale (> ${stale}s) - check: systemctl status $NAME.timer"
+    fi
+    return 0
   fi
+
+  if (( age > stale )); then
+    printf '\n%s[!] 采样已中断%s\n\n' "$c_red" "$c_rst"
+    printf '  最后一次采样在 %s 分钟前，记录并不完整。\n' "$(( age / 60 ))"
+    printf '  %s细查：systemctl status %s.timer%s\n\n' "$c_blu" "$NAME" "$c_rst"
+    return 0
+  fi
+
+  plain_view "$(( now - 86400 ))" "$now" "最近 24 小时" "$NAME status --detail" 1
 }
 
 cmd_tail() {
@@ -511,10 +690,18 @@ cmd_tail() {
   tail -n "${1:-20}" -f "$LOG"
 }
 
-# Shows every sample within +/- window minutes of a point in time.
+# Answers "what did this box look like when the user could not connect?"
 cmd_at() {
-  local when="${1:-}" window="${2:-10}" target from to
-  [[ -n "$when" ]] || die "usage: $0 at \"<time>\" [window_minutes]"
+  local detail=0 args=() when window="10" target from to
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --detail) detail=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  when="${args[0]:-}"
+  [[ -n "$when" ]] || die "usage: $0 at \"<time>\" [window_minutes] [--detail]"
+  [[ ${#args[@]} -lt 2 ]] || window="${args[1]}"
   [[ "$window" =~ ^[0-9]+$ ]] || die "window must be a number of minutes: $window"
   require_log
 
@@ -522,6 +709,15 @@ cmd_at() {
     || die "cannot parse time: $when (try \"14:30\" or \"2026-08-13 14:30\")"
   from=$(( target - window * 60 ))
   to=$(( target + window * 60 ))
+
+  if [[ "$detail" -eq 0 ]]; then
+    local live=0
+    [[ "$to" -ge "$(( $(date +%s) - INTERVAL * 2 ))" ]] && live=1
+    plain_view "$from" "$to" \
+      "$(date -d "@$from" +%H:%M) - $(date -d "@$to" +%H:%M)" \
+      "$NAME at \"$when\" $window --detail" "$live"
+    return 0
+  fi
 
   info "samples within +/-${window}min of $(date -d "@$target" -Iseconds)"
   local matched=0 line
@@ -554,17 +750,24 @@ parse_since() {
 # Summarizes only the anomalies in a window - the point is to answer
 # "was anything wrong on the server side at that time?" in one screen.
 cmd_report() {
-  local since=24h from secs
+  local since=24h from secs detail=0 now
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --since) since="${2:-}"; shift 2 ;;
+      --detail) detail=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
   require_log
   # parse_since dies in a subshell, so its failure has to be checked here.
   secs=$(parse_since "$since") || exit 1
-  from=$(( $(date +%s) - secs ))
+  now=$(date +%s)
+  from=$(( now - secs ))
+
+  if [[ "$detail" -eq 0 ]]; then
+    plain_view "$from" "$now" "最近 $since" "$NAME report --since $since --detail" 1
+    return 0
+  fi
 
   info "anomaly report over the last $since"
   awk -v from="$from" -v red="$c_red" -v ylw="$c_ylw" -v rst="$c_rst" '
@@ -765,18 +968,21 @@ Usage: $0 <command> [args]
   uninstall [--purge]     remove the timer (--purge also drops logs and config)
   collect                 take one sample (invoked by the timer)
 
-  status                  show the most recent sample
-  tail [lines]            follow the log live
-  at "<time>" [minutes]   show samples around a time, default +/-10 minutes
-  report [--since 24h]    summarize anomalies over a window
+  status                  verdict for the last 24 hours
+  at "<time>" [minutes]   verdict around a time, default +/-10 minutes
+  report [--since 24h]    verdict over a window
+  tail [lines]            follow the raw log live
+
+status, at and report explain in plain language whether this server was at
+fault. Add --detail to any of them for the underlying counters instead.
 
 Log:    $LOG
 Config: $CONF
 
 Typical use: a user reports trouble at 14:30, then
-  $0 at "14:30"        - machine state at that moment
-  $0 report --since 6h - anomalies around it
-No anomalies means the fault was on the link or the client side.
+  $0 at "14:30"        - was this server at fault at that moment?
+  $0 report --since 6h - anything wrong in the hours around it?
+No findings means the fault was on the link or the client side.
 EOF
 }
 

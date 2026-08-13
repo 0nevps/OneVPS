@@ -298,15 +298,44 @@ is used when present and skipped otherwise.
 
 | Command | Purpose |
 | --- | --- |
-| `onevps-netwatch status` | Most recent sample as a table, with a warning when sampling has stalled |
-| `onevps-netwatch at "14:30"` | Samples around a point in time; append a number to widen the default 10-minute window |
-| `onevps-netwatch report --since 24h` | Anomalies only, over a window given in `s`, `m`, `h`, or `d` |
-| `onevps-netwatch tail` | Follow samples live |
+| `onevps-netwatch status` | Verdict for the last 24 hours, or a warning when sampling has stalled |
+| `onevps-netwatch at "14:30"` | Verdict around a point in time; append a number to widen the default 10-minute window |
+| `onevps-netwatch report --since 24h` | Verdict over a window given in `s`, `m`, `h`, or `d` |
+| `onevps-netwatch tail` | Follow the raw log live |
 | `onevps-netwatch uninstall` | Remove the timer; `--purge` also removes logs and configuration |
+
+`status`, `at`, and `report` answer one question in plain language: was this server at fault? Each finding says
+what happened, what it meant for users, and which command to run next. Add `--detail` to any of them to see the
+underlying counters instead.
+
+### Investigating a report
+
+```bash
+onevps-netwatch at "14:30"          # was this server at fault at that moment?
+onevps-netwatch report --since 6h   # anything wrong in the hours around it?
+```
+
+Findings are aggregated per kind and ordered by how directly each one explains a failed connection, so a service
+that went down is reported before a queue that merely came close to its limit:
+
+```text
+[!] 发现 2 个问题
+  14:20 - 14:40：共 41 次采样，实际覆盖 20分钟。
+
+  ● xray 服务曾停止 3分钟（14:31 - 14:34）
+    这段时间内所有到该服务的连接都会失败。
+    细查：journalctl -u xray --since "14:31"
+
+  ● 连接队列溢出，共丢弃 37 个连接（最早 14:33）
+    短时间涌入的连接超过了服务处理能力，一部分被直接拒绝。
+```
+
+When nothing is found, that is itself the answer: the server was healthy throughout the window, so the fault lay
+in the link or on the client. That conclusion is the one that is hardest to reach without a recording.
 
 ### Recorded values
 
-Each sample is one `key=value` line, so the log stays greppable without extra tooling:
+Behind the verdict, each sample is one `key=value` line, so the log stays greppable without extra tooling:
 
 - conntrack usage against its limit, and kernel `table full` events
 - TCP accept-queue drops and overflows, SYN retransmits, retransmission rate
@@ -318,18 +347,6 @@ Each sample is one `key=value` line, so the log stays greppable without extra to
 
 Services are autodetected from `xray`, `caddy`, `nginx`, `sshd`, `ssh`, `fail2ban`, and `docker`. Set
 `MONITOR_UNITS` in the configuration file to watch a different set.
-
-### Investigating a report
-
-```bash
-onevps-netwatch at "14:30"          # machine state at the reported time
-onevps-netwatch report --since 6h   # anomalies around it
-```
-
-`report` lists only anomalies: conntrack pressure, accept-queue drops, services down or restarted, changes in the
-number of listening sockets, and new fail2ban bans. When it finds none, the server was healthy throughout the
-window and the fault lies in the link or on the client, which is the conclusion that is hardest to reach without
-a recording.
 
 ### Alerts
 

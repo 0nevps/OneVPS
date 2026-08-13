@@ -279,15 +279,41 @@ sudo bash onevps-netwatch.sh install
 
 | 命令 | 用途 |
 | --- | --- |
-| `onevps-netwatch status` | 以表格显示最近一次采样，采样中断时给出提示 |
-| `onevps-netwatch at "14:30"` | 显示该时刻前后的采样，默认 ±10 分钟，可追加数字调整窗口 |
-| `onevps-netwatch report --since 24h` | 只列出窗口内的异常，时长支持 `s`、`m`、`h`、`d` |
-| `onevps-netwatch tail` | 实时跟随采样 |
+| `onevps-netwatch status` | 最近 24 小时的结论，采样中断时给出提示 |
+| `onevps-netwatch at "14:30"` | 该时刻前后的结论，默认 ±10 分钟，可追加数字调整窗口 |
+| `onevps-netwatch report --since 24h` | 指定窗口的结论，时长支持 `s`、`m`、`h`、`d` |
+| `onevps-netwatch tail` | 实时跟随原始日志 |
 | `onevps-netwatch uninstall` | 移除 timer；加 `--purge` 同时删除日志与配置 |
+
+`status`、`at`、`report` 用大白话回答一个问题：这台服务器有没有责任。每条结论都说明发生了什么、对用户意味着
+什么、下一步该执行什么命令。三个命令都可以加 `--detail` 改看原始指标。
+
+### 排查一次报障
+
+```bash
+onevps-netwatch at "14:30"          # 那个时刻这台服务器有没有问题
+onevps-netwatch report --since 6h   # 前后几小时有没有异常
+```
+
+结论按类型聚合，并按「多大程度能解释一次连接失败」排序——服务停止会排在仅仅接近上限的队列压力之前：
+
+```text
+[!] 发现 2 个问题
+  14:20 - 14:40：共 41 次采样，实际覆盖 20分钟。
+
+  ● xray 服务曾停止 3分钟（14:31 - 14:34）
+    这段时间内所有到该服务的连接都会失败。
+    细查：journalctl -u xray --since "14:31"
+
+  ● 连接队列溢出，共丢弃 37 个连接（最早 14:33）
+    短时间涌入的连接超过了服务处理能力，一部分被直接拒绝。
+```
+
+什么都没查到本身就是答案：整个窗口内服务端正常，故障出在链路或客户端——这正是没有记录时最难得出的结论。
 
 ### 记录的指标
 
-每次采样写一行 `key=value`，无需额外工具即可 grep 和统计：
+结论之下，每次采样写一行 `key=value`，无需额外工具即可 grep 和统计：
 
 - conntrack 使用量与上限，以及内核 `table full` 事件
 - TCP accept 队列丢弃与溢出、SYN 重传、重传率
@@ -299,16 +325,6 @@ sudo bash onevps-netwatch.sh install
 
 服务从 `xray`、`caddy`、`nginx`、`sshd`、`ssh`、`fail2ban`、`docker` 中自动探测。需要监控其他单元时，在配置文件中
 设置 `MONITOR_UNITS`。
-
-### 排查一次报障
-
-```bash
-onevps-netwatch at "14:30"          # 该时刻的机器状态
-onevps-netwatch report --since 6h   # 前后的异常汇总
-```
-
-`report` 只列异常：conntrack 压力、accept 队列丢包、服务下线或重启、监听套接字数变化、新增 fail2ban 封禁。
-如果没有异常，说明整个窗口内服务端正常，故障出在链路或客户端——这正是没有记录时最难得出的结论。
 
 ### 告警
 
