@@ -125,11 +125,17 @@ default_iface() {
 }
 
 # Units that exist on this box, so the log only carries meaningful services.
+# Aliases such as ssh.service and sshd.service share one unit file; keeping
+# both would record the same service twice on every sample.
 detect_units() {
   if [[ -n "$MONITOR_UNITS" ]]; then printf '%s' "$MONITOR_UNITS"; return; fi
-  local unit out=""
+  local unit out="" path paths=""
   for unit in $AUTODETECT_UNITS; do
-    if systemctl cat "$unit.service" >/dev/null 2>&1; then out+="$unit "; fi
+    systemctl cat "$unit.service" >/dev/null 2>&1 || continue
+    path=$(systemctl show -p FragmentPath --value "$unit.service" 2>/dev/null || true)
+    if [[ -n "$path" && " $paths " == *" $path "* ]]; then continue; fi
+    paths+=" $path"
+    out+="$unit "
   done
   printf '%s' "${out% }"
 }
@@ -495,12 +501,12 @@ render_sample() {
 # Plain-language verdict over a window, for operators who should not have to
 # read TCP counters. Findings are aggregated per kind rather than per sample,
 # and ordered by how likely they are to explain a failed connection.
-# plain_view <from> <to> <lead> <hint> <live>
+# plain_view <from> <to> <hint> <live>
 # live=1 means the window runs up to now, so an unresolved fault can be
 # described in the present tense; on a historical window it cannot.
 plain_view() {
-  local from="$1" to="$2" lead="$3" hint="$4" live="${5:-0}"
-  awk -v from="$from" -v to="$to" -v lead="$lead" -v hint="$hint" -v live="$live" \
+  local from="$1" to="$2" hint="$3" live="${4:-0}"
+  awk -v from="$from" -v to="$to" -v hint="$hint" -v live="$live" \
       -v interval="$INTERVAL" \
       -v grn="$c_grn" -v ylw="$c_ylw" -v red="$c_red" -v blu="$c_blu" -v rst="$c_rst" '
     function hm(ts) { return substr(ts, 12, 5) }
@@ -628,21 +634,15 @@ plain_view() {
             "期间有服务启动或停止过，可能与连接失败有关。", "")
       }
 
+      span = sprintf("%s / %d 次采样", dur(last_e - first_e + interval), n)
       if (p == 0) {
-        printf "\n%s[+] 服务端正常%s\n\n", grn, rst
-        printf "  %s：共 %d 次采样，实际覆盖 %s。\n", lead, n, dur(last_e - first_e + interval)
-        svc = ""
-        for (name in seen) svc = svc (svc == "" ? "" : "、") name
-        if (svc != "") printf "  %s 全程在线。\n", svc
-        printf "  这台服务器没有拒绝或丢弃过任何连接。\n\n"
-        printf "  如果这段时间有人连不上，问题出在他们自己的网络或到本机的线路，\n"
-        printf "  不在这台服务器。\n"
+        printf "\n%s[+] 服务端正常%s · %s\n", grn, rst, span
+        printf "  服务全程在线，没有拒绝或丢弃过连接。连不上是客户端或线路问题。\n"
       } else {
-        printf "\n%s[!] 发现 %d 个问题%s\n", ylw, p, rst
-        printf "  %s：共 %d 次采样，实际覆盖 %s。\n", lead, n, dur(last_e - first_e + interval)
+        printf "\n%s[!] 发现 %d 个问题%s · %s\n", ylw, p, rst, span
         printf "%s", out
       }
-      if (hint != "") printf "\n  %s完整指标：%s%s\n", blu, hint, rst
+      if (hint != "") printf "\n  %s详细：%s%s\n", blu, hint, rst
       printf "\n"
     }
   ' "$LOG"
@@ -682,7 +682,7 @@ cmd_status() {
     return 0
   fi
 
-  plain_view "$(( now - 86400 ))" "$now" "最近 24 小时" "$NAME status --detail" 1
+  plain_view "$(( now - 86400 ))" "$now" "$NAME status --detail" 1
 }
 
 cmd_tail() {
@@ -713,9 +713,7 @@ cmd_at() {
   if [[ "$detail" -eq 0 ]]; then
     local live=0
     [[ "$to" -ge "$(( $(date +%s) - INTERVAL * 2 ))" ]] && live=1
-    plain_view "$from" "$to" \
-      "$(date -d "@$from" +%H:%M) - $(date -d "@$to" +%H:%M)" \
-      "$NAME at \"$when\" $window --detail" "$live"
+    plain_view "$from" "$to" "$NAME at \"$when\" $window --detail" "$live"
     return 0
   fi
 
@@ -765,7 +763,7 @@ cmd_report() {
   from=$(( now - secs ))
 
   if [[ "$detail" -eq 0 ]]; then
-    plain_view "$from" "$now" "最近 $since" "$NAME report --since $since --detail" 1
+    plain_view "$from" "$now" "$NAME report --since $since --detail" 1
     return 0
   fi
 

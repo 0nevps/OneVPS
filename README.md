@@ -319,8 +319,7 @@ Findings are aggregated per kind and ordered by how directly each one explains a
 that went down is reported before a queue that merely came close to its limit:
 
 ```text
-[!] 发现 2 个问题
-  14:20 - 14:40：共 41 次采样，实际覆盖 20分钟。
+[!] 发现 2 个问题 · 20分钟 / 41 次采样
 
   ● xray 服务曾停止 3分钟（14:31 - 14:34）
     这段时间内所有到该服务的连接都会失败。
