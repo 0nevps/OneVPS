@@ -508,7 +508,7 @@ plain_view() {
   local from="$1" to="$2" hint="$3" live="${4:-0}"
   awk -v from="$from" -v to="$to" -v hint="$hint" -v live="$live" \
       -v interval="$INTERVAL" \
-      -v grn="$c_grn" -v ylw="$c_ylw" -v red="$c_red" -v blu="$c_blu" -v rst="$c_rst" '
+      -v ylw="$c_ylw" -v blu="$c_blu" -v rst="$c_rst" '
     function hm(ts) { return substr(ts, 12, 5) }
     function dur(sec,   h, m) {
       h = int(sec / 3600); m = int((sec % 3600) / 60)
@@ -524,7 +524,7 @@ plain_view() {
     # only when there is a command worth running next.
     function add(title, why, how) {
       p++
-      out = out sprintf("  %s●%s %s · %s\n", red, rst, title, why)
+      out = out sprintf("  🔴 %s · %s\n", title, why)
       if (how != "") out = out sprintf("    %s→ %s%s\n", blu, how, rst)
     }
     {
@@ -632,10 +632,10 @@ plain_view() {
 
       span = sprintf("%s / %d 次采样", dur(last_e - first_e + interval), n)
       if (p == 0) {
-        printf "\n%s●%s 服务端正常 · %s\n", grn, rst, span
-        printf "  服务 %s●%s  连接 %s●%s  → 客户端或线路问题\n", grn, rst, grn, rst
+        printf "\n🟢 服务端正常 · %s\n", span
+        printf "  服务 🟢  连接 🟢  → 客户端或线路问题\n"
       } else {
-        printf "\n%s●%s %d 个问题 · %s\n\n", red, rst, p, span
+        printf "\n🔴 %d 个问题 · %s\n\n", p, span
         printf "%s", out
       }
       if (hint != "") printf "\n  %s详细：%s%s\n", blu, hint, rst
