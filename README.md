@@ -42,6 +42,8 @@ the same workflow on another supported host, and contribute fixes in one place.
 - **Restricted routing**: blocks private address ranges, BitTorrent traffic, and—by default—outbound UDP/443
 - **Least-privilege service**: runs Xray as `nobody` with only the low-port bind capability
 - **Operations**: manages nodes and share links, restarts the service, enables BBR, and applies optional system tuning
+- **Network diagnostics**: an optional recorder that samples network and service counters so intermittent
+  "cannot connect" reports can be traced to the server or ruled out
 
 > Legacy sing-box nodes are not migrated automatically. OneVPS manages Xray under `/usr/local/etc/xray/`.
 
@@ -223,6 +225,10 @@ Report suspected vulnerabilities privately according to the [security policy](SE
 | `/etc/systemd/system/xray.service` | systemd service unit |
 | `/var/log/xray/` | Xray log directory |
 | `/var/lib/onevps/sites/<domain>/` | Editable 403 page for a Trojan subdomain |
+| `/usr/local/sbin/onevps-netwatch` | Installed copy of the diagnostics recorder |
+| `/etc/onevps-netwatch.conf` | Recorder configuration, including notification tokens |
+| `/var/log/onevps-netwatch.log` | Recorded samples, rotated in place |
+| `/var/lib/onevps-netwatch/` | Recorder counter baselines and alert cooldowns |
 
 Manual service management:
 
@@ -265,12 +271,82 @@ Menu option `8` applies optional, conservative tuning for long-running VPS workl
 
 Review these settings against the server's other workloads before applying them.
 
+## Network Diagnostics
+
+`scripts/onevps-netwatch.sh` answers a question that connection reports alone cannot: when a user says the node
+was unreachable at 14:30, was the server at fault, or was it the link or the client? Intermittent faults leave no
+evidence unless something was already recording, so the script samples counters on a systemd timer and keeps a
+timeline you can query after the fact.
+
+It is optional and independent of node management. Nothing in `onevps.sh` requires it.
+
+### Install
+
+```bash
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/onevps-netwatch.sh
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/SHA256SUMS
+sha256sum --check SHA256SUMS
+less onevps-netwatch.sh
+sudo bash onevps-netwatch.sh install
+```
+
+Installation copies the script to `/usr/local/sbin/onevps-netwatch`, writes a mode-600 configuration file, and
+starts a timer that samples every 30 seconds. It needs systemd, root, and `ss` from iproute2; `fail2ban-client`
+is used when present and skipped otherwise.
+
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `onevps-netwatch status` | Most recent sample as a table, with a warning when sampling has stalled |
+| `onevps-netwatch at "14:30"` | Samples around a point in time; append a number to widen the default 10-minute window |
+| `onevps-netwatch report --since 24h` | Anomalies only, over a window given in `s`, `m`, `h`, or `d` |
+| `onevps-netwatch tail` | Follow samples live |
+| `onevps-netwatch uninstall` | Remove the timer; `--purge` also removes logs and configuration |
+
+### Recorded values
+
+Each sample is one `key=value` line, so the log stays greppable without extra tooling:
+
+- conntrack usage against its limit, and kernel `table full` events
+- TCP accept-queue drops and overflows, SYN retransmits, retransmission rate
+- Established, TIME_WAIT, and SYN_RECV socket counts, and the number of listening sockets
+- CPU, memory, and root filesystem usage
+- Interface throughput and NIC drop counters
+- Kernel OOM events and the fail2ban banned-address total
+- Liveness and main PID of detected services, which makes silent restarts visible
+
+Services are autodetected from `xray`, `caddy`, `nginx`, `sshd`, `ssh`, `fail2ban`, and `docker`. Set
+`MONITOR_UNITS` in the configuration file to watch a different set.
+
+### Investigating a report
+
+```bash
+onevps-netwatch at "14:30"          # machine state at the reported time
+onevps-netwatch report --since 6h   # anomalies around it
+```
+
+`report` lists only anomalies: conntrack pressure, accept-queue drops, services down or restarted, changes in the
+number of listening sockets, and new fail2ban bans. When it finds none, the server was healthy throughout the
+window and the fault lies in the link or on the client, which is the conclusion that is hardest to reach without
+a recording.
+
+### Alerts
+
+Set `TELEGRAM_TOKEN` with `TELEGRAM_CHAT_ID`, or `WEBHOOK_URL`, in `/etc/onevps-netwatch.conf` to be notified when
+conntrack passes 80 percent, the accept queue drops connections, a watched service goes down or restarts, the
+kernel reports an OOM kill, or the disk passes 90 percent. Alerts are throttled per kind, by default to one push
+every 30 minutes; every alert is written to the log regardless. Because the file holds notification tokens, it is
+created with mode 600 and should stay that way.
+
 ## Uninstall
 
 Menu option `9` removes the Xray binary, configuration, node metadata, geodata, and log directory.
 
 BBR settings, system-tuning files, the swap file, Caddy, its Caddyfile, and customized site content are retained so
 the script does not remove host-wide state that may be shared with other services.
+
+The diagnostics recorder is installed separately and is removed with `onevps-netwatch uninstall`.
 
 ## Maintenance and Roadmap
 
@@ -293,15 +369,15 @@ The dependency-light test suite sources `onevps.sh`, uses fixture node metadata,
 directory. It does not modify systemd, firewall rules, or production configuration.
 
 ```bash
-bash -n onevps.sh tests/test_onevps.sh
-shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+bash -n onevps.sh scripts/onevps-netwatch.sh tests/test_onevps.sh
+shellcheck --severity=warning onevps.sh scripts/onevps-netwatch.sh tests/test_onevps.sh
 bash tests/test_onevps.sh
 ```
 
 ## Releases
 
-Versioned releases include `onevps.sh` and a `SHA256SUMS` file. See [CHANGELOG.md](CHANGELOG.md) for release notes
-and compatibility-impacting changes.
+Versioned releases include `onevps.sh`, `scripts/onevps-netwatch.sh`, and a `SHA256SUMS` file covering both. See
+[CHANGELOG.md](CHANGELOG.md) for release notes and compatibility-impacting changes.
 
 ## Contributing
 

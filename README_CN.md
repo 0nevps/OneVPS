@@ -36,6 +36,7 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 - **受限路由**：阻断私网地址、BitTorrent 流量，并默认阻断出站 UDP/443
 - **最小权限服务**：Xray 使用 `nobody` 运行，仅保留绑定低端口的能力
 - **运维能力**：节点与分享链接管理、服务重启、BBR 和可选系统优化
+- **网络诊断记录**：可选的采样脚本，持续记录网络与服务指标，使偶发的「连不上」能被定位到服务端或排除服务端
 
 > 旧版 sing-box 节点不会自动迁移。OneVPS 使用 `/usr/local/etc/xray/` 管理 Xray。
 
@@ -208,6 +209,10 @@ OneVPS 提供多项防御性默认设置，但执行任何 root 级部署脚本�
 | `/etc/systemd/system/xray.service` | systemd 服务单元 |
 | `/var/log/xray/` | Xray 日志目录 |
 | `/var/lib/onevps/sites/<域名>/` | Trojan 子域的可编辑 403 页面 |
+| `/usr/local/sbin/onevps-netwatch` | 诊断记录脚本的安装副本 |
+| `/etc/onevps-netwatch.conf` | 记录脚本配置，含通知令牌 |
+| `/var/log/onevps-netwatch.log` | 采样记录，自动轮转 |
+| `/var/lib/onevps-netwatch/` | 计数器基线与告警冷却状态 |
 
 手动管理服务：
 
@@ -249,11 +254,76 @@ xray run -test -config /usr/local/etc/xray/config.json
 
 应用前请确认这些设置适合服务器上的其他工作负载。
 
+## 网络诊断记录
+
+用户报告「14:30 连不上」时，连接报告本身无法回答一个问题：故障在服务端，还是在链路或客户端？偶发问题只有在
+故障发生时已有记录才留得下证据，因此 `scripts/onevps-netwatch.sh` 通过 systemd timer 持续采样，生成一条可以
+事后查询的时间线。
+
+该脚本是可选的，与节点管理相互独立，`onevps.sh` 不依赖它。
+
+### 安装
+
+```bash
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/onevps-netwatch.sh
+curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/SHA256SUMS
+sha256sum --check SHA256SUMS
+less onevps-netwatch.sh
+sudo bash onevps-netwatch.sh install
+```
+
+安装会把脚本复制到 `/usr/local/sbin/onevps-netwatch`，写入权限 600 的配置文件，并启动每 30 秒采样一次的 timer。
+依赖 systemd、root 权限和 iproute2 的 `ss`；`fail2ban-client` 存在时使用，不存在则跳过。
+
+### 命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `onevps-netwatch status` | 以表格显示最近一次采样，采样中断时给出提示 |
+| `onevps-netwatch at "14:30"` | 显示该时刻前后的采样，默认 ±10 分钟，可追加数字调整窗口 |
+| `onevps-netwatch report --since 24h` | 只列出窗口内的异常，时长支持 `s`、`m`、`h`、`d` |
+| `onevps-netwatch tail` | 实时跟随采样 |
+| `onevps-netwatch uninstall` | 移除 timer；加 `--purge` 同时删除日志与配置 |
+
+### 记录的指标
+
+每次采样写一行 `key=value`，无需额外工具即可 grep 和统计：
+
+- conntrack 使用量与上限，以及内核 `table full` 事件
+- TCP accept 队列丢弃与溢出、SYN 重传、重传率
+- ESTABLISHED、TIME_WAIT、SYN_RECV 套接字数量与监听套接字数
+- CPU、内存与根文件系统使用率
+- 网卡吞吐与丢包计数
+- 内核 OOM 事件与 fail2ban 封禁总数
+- 已探测服务的存活状态与主 PID，可暴露无声重启
+
+服务从 `xray`、`caddy`、`nginx`、`sshd`、`ssh`、`fail2ban`、`docker` 中自动探测。需要监控其他单元时，在配置文件中
+设置 `MONITOR_UNITS`。
+
+### 排查一次报障
+
+```bash
+onevps-netwatch at "14:30"          # 该时刻的机器状态
+onevps-netwatch report --since 6h   # 前后的异常汇总
+```
+
+`report` 只列异常：conntrack 压力、accept 队列丢包、服务下线或重启、监听套接字数变化、新增 fail2ban 封禁。
+如果没有异常，说明整个窗口内服务端正常，故障出在链路或客户端——这正是没有记录时最难得出的结论。
+
+### 告警
+
+在 `/etc/onevps-netwatch.conf` 中设置 `TELEGRAM_TOKEN` 与 `TELEGRAM_CHAT_ID`，或设置 `WEBHOOK_URL`，即可在
+conntrack 超过 80%、accept 队列开始丢连接、被监控服务下线或重启、内核发生 OOM、磁盘超过 90% 时收到通知。
+告警按类型限流，默认每 30 分钟推送一次；无论是否推送，所有告警都会写入日志。该文件保存通知令牌，创建时权限为
+600，请保持不变。
+
 ## 卸载
 
 菜单 `9` 删除 Xray 二进制、配置、节点元数据、geodata 和日志目录。
 
 BBR 设置、系统优化文件、swap、Caddy、Caddyfile 和自定义站点内容会被保留，避免删除可能由其他服务共享的主机状态。
+
+诊断记录脚本独立安装，使用 `onevps-netwatch uninstall` 移除。
 
 ## 维护与路线图
 
@@ -273,15 +343,15 @@ CI 会在每次 push 和 pull request 时执行 Bash 语法校验、ShellCheck�
 轻量测试套件会加载 `onevps.sh`，使用固定节点数据，并且只写入临时目录；不会修改 systemd、防火墙或生产配置。
 
 ```bash
-bash -n onevps.sh tests/test_onevps.sh
-shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+bash -n onevps.sh scripts/onevps-netwatch.sh tests/test_onevps.sh
+shellcheck --severity=warning onevps.sh scripts/onevps-netwatch.sh tests/test_onevps.sh
 bash tests/test_onevps.sh
 ```
 
 ## 版本发布
 
-正式版本包含 `onevps.sh` 和 `SHA256SUMS`。发布说明及兼容性相关变更记录在
-[CHANGELOG.md](CHANGELOG.md) 中。
+正式版本包含 `onevps.sh`、`scripts/onevps-netwatch.sh`，以及覆盖两者的 `SHA256SUMS`。发布说明及兼容性相关变更
+记录在 [CHANGELOG.md](CHANGELOG.md) 中。
 
 ## 参与贡献
 

@@ -5,6 +5,15 @@ All notable changes to OneVPS are documented in this file. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Optional network diagnostics recorder `scripts/onevps-netwatch.sh`, sampling conntrack, TCP queue, socket,
+  resource, interface, and service counters on a systemd timer so intermittent connectivity reports can be traced
+  to the server or ruled out.
+- Recorder query commands for the latest sample, a point in time, an anomaly report over a window, and live
+  following, plus throttled Telegram or webhook alerts for conntrack pressure, accept-queue drops, service
+  restarts, kernel OOM events, and disk usage.
+
 ## [0.1.0] - 2026-08-11
 
 ### Added

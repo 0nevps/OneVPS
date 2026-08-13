@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh tests/test_onevps.sh
+        run: bash -n onevps.sh scripts/onevps-netwatch.sh tests/test_onevps.sh
 
       - name: Install test dependencies
         run: |
@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+        run: shellcheck --severity=warning onevps.sh scripts/onevps-netwatch.sh tests/test_onevps.sh
 
       - name: Test configuration generation
         run: bash tests/test_onevps.sh
