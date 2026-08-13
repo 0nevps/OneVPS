@@ -516,11 +516,16 @@ plain_view() {
       if (m > 0) return m "分钟"
       return sec "秒"
     }
+    # "（14:28）" for a lone event, "×4（14:29 起）" for a run of them.
+    function times(cnt, at) {
+      return cnt == 1 ? "（" at "）" : " ×" cnt "（" at " 起）"
+    }
+    # One finding, one line: what happened and what it meant. A second line
+    # only when there is a command worth running next.
     function add(title, why, how) {
       p++
-      out = out sprintf("\n  %s●%s %s\n", red, rst, title)
-      out = out sprintf("    %s\n", why)
-      if (how != "") out = out sprintf("    %s细查：%s%s\n", blu, how, rst)
+      out = out sprintf("  %s✗%s %s · %s\n", red, rst, title, why)
+      if (how != "") out = out sprintf("    %s→ %s%s\n", blu, how, rst)
     }
     {
       delete v
@@ -572,74 +577,65 @@ plain_view() {
     }
     END {
       if (n == 0) {
-        printf "\n  %s这段时间没有采样记录。%s\n", ylw, rst
-        printf "  记录可能尚未启动，或该时间早于安装时间。\n\n"
+        printf "\n  %s无记录%s · 该时段早于安装时间，或记录未运行\n\n", ylw, rst
         exit
       }
 
       # Ordered by how directly each finding explains a failed connection.
       for (name in down_from) {
         if (live == 1) {
-          add(name " 服务当前处于停止状态，已持续 " dur(last_e - down_from[name] + interval),
-              "现在所有到该服务的连接都会失败，需要立即处理。",
-              "systemctl status " name)
+          add(name " 当前停止 " dur(last_e - down_from[name] + interval),
+              "连接全部失败，需立即处理", "systemctl status " name)
         } else {
-          add(name " 服务在 " down_hm[name] " 停止，直到这段记录结束仍未恢复",
-              "这段时间内所有到该服务的连接都会失败。",
-              "journalctl -u " name " --since \"" down_hm[name] "\"")
+          add(name " " down_hm[name] " 起停止，至记录结束未恢复",
+              "期间连接全部失败", "journalctl -u " name " --since \"" down_hm[name] "\"")
         }
       }
       for (name in downlen) {
-        add(name " 服务曾停止 " dur(downlen[name]) \
-            "（" down_start_hm[name] " - " down_end_hm[name] "）",
-            "这段时间内所有到该服务的连接都会失败。",
-            "journalctl -u " name " --since \"" down_start_hm[name] "\"")
+        add(name " 停止 " dur(downlen[name]) \
+            "（" down_start_hm[name] "-" down_end_hm[name] "）",
+            "期间连接全部失败", "journalctl -u " name " --since \"" down_start_hm[name] "\"")
       }
       if (ctfull > 0) {
-        add("连接跟踪表被占满 " ctfull " 次（最早 " ctfull_hm "）",
-            "内核直接拒绝了新连接。这是偶发连不上最常见的服务端原因。",
-            "sysctl net.netfilter.nf_conntrack_max")
+        add("连接跟踪表满" times(ctfull, ctfull_hm),
+            "内核直接拒绝新连接", "sysctl net.netfilter.nf_conntrack_max")
       }
       if (queue_lost > 0) {
-        add("连接队列溢出，共丢弃 " queue_lost " 个连接（最早 " queue_hm "）",
-            "短时间涌入的连接超过了服务处理能力，一部分被直接拒绝。", "")
+        add("连接队列溢出，丢弃 " queue_lost " 个（" queue_hm " 起）",
+            "涌入超过处理能力", "")
       }
       if (oom > 0) {
-        add("内存耗尽，内核杀掉进程 " oom " 次（最早 " oom_hm "）",
-            "被杀掉的可能就是代理服务，期间会完全无法连接。",
-            "journalctl -k | grep -i \"out of memory\"")
+        add("内存耗尽杀进程" times(oom, oom_hm),
+            "被杀的可能就是代理服务", "journalctl -k | grep -i \"out of memory\"")
       }
       for (name in restarts) {
-        add(name " 服务重启过 " restarts[name] " 次（最早 " restart_hm[name] "）",
-            "重启瞬间已建立的连接会断开，用户需要重新连接。",
-            "journalctl -u " name " --since \"" restart_hm[name] "\"")
+        add(name " 重启" times(restarts[name], restart_hm[name]),
+            "重启瞬间连接断开", "journalctl -u " name " --since \"" restart_hm[name] "\"")
       }
       # Only worth reporting as a warning when the table never actually filled;
       # otherwise the "table full" finding above already says it, and harder.
       if (ct_peak >= 80 && ctfull == 0) {
-        add("连接跟踪表最高占用 " ct_peak "%（" ct_hm "）",
-            "还没到拒绝连接的程度，但已接近上限，继续增长就会开始丢连接。", "")
+        add("连接跟踪表峰值 " ct_peak "%（" ct_hm "）",
+            "接近上限，再涨会丢连接", "")
       }
       if (banned_max > banned_first) {
-        add("fail2ban 新封禁了 " (banned_max - banned_first) " 个 IP",
-            "如果用户的 IP 被误封，他们会完全连不上，而其他人一切正常。",
-            "fail2ban-client status")
+        add("fail2ban 新封 " (banned_max - banned_first) " 个 IP",
+            "被误封的用户完全连不上", "fail2ban-client status")
       }
       if (disk_peak >= 90) {
-        add("磁盘占用最高 " disk_peak "%（" disk_hm "）",
-            "磁盘写满会导致服务写日志失败甚至崩溃。", "")
+        add("磁盘峰值 " disk_peak "%（" disk_hm "）",
+            "写满会导致服务异常", "")
       }
       if (listen_max != listen_min) {
-        add("监听端口数量变化过（" listen_min " - " listen_max "）",
-            "期间有服务启动或停止过，可能与连接失败有关。", "")
+        add("监听端口数 " listen_min "-" listen_max " 变动", "有服务启停", "")
       }
 
       span = sprintf("%s / %d 次采样", dur(last_e - first_e + interval), n)
       if (p == 0) {
-        printf "\n%s[+] 服务端正常%s · %s\n", grn, rst, span
-        printf "  服务全程在线，没有拒绝或丢弃过连接。连不上是客户端或线路问题。\n"
+        printf "\n%s✓ 服务端正常%s · %s\n", grn, rst, span
+        printf "  服务 %s✓%s  连接 %s✓%s  → 客户端或线路问题\n", grn, rst, grn, rst
       } else {
-        printf "\n%s[!] 发现 %d 个问题%s · %s\n", ylw, p, rst, span
+        printf "\n%s✗ %d 个问题%s · %s\n\n", ylw, p, rst, span
         printf "%s", out
       }
       if (hint != "") printf "\n  %s详细：%s%s\n", blu, hint, rst

@@ -319,14 +319,11 @@ Findings are aggregated per kind and ordered by how directly each one explains a
 that went down is reported before a queue that merely came close to its limit:
 
 ```text
-[!] 发现 2 个问题 · 20分钟 / 41 次采样
+✗ 2 个问题 · 20分钟 / 41 次采样
 
-  ● xray 服务曾停止 3分钟（14:31 - 14:34）
-    这段时间内所有到该服务的连接都会失败。
-    细查：journalctl -u xray --since "14:31"
-
-  ● 连接队列溢出，共丢弃 37 个连接（最早 14:33）
-    短时间涌入的连接超过了服务处理能力，一部分被直接拒绝。
+  ✗ xray 停止 3分钟（14:31-14:34） · 期间连接全部失败
+    → journalctl -u xray --since "14:31"
+  ✗ 连接队列溢出，丢弃 37 个（14:33 起） · 涌入超过处理能力
 ```
 
 When nothing is found, that is itself the answer: the server was healthy throughout the window, so the fault lay
