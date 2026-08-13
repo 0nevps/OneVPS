@@ -524,7 +524,7 @@ plain_view() {
     # only when there is a command worth running next.
     function add(title, why, how) {
       p++
-      out = out sprintf("  %s✗%s %s · %s\n", red, rst, title, why)
+      out = out sprintf("  %s●%s %s · %s\n", red, rst, title, why)
       if (how != "") out = out sprintf("    %s→ %s%s\n", blu, how, rst)
     }
     {
@@ -632,10 +632,10 @@ plain_view() {
 
       span = sprintf("%s / %d 次采样", dur(last_e - first_e + interval), n)
       if (p == 0) {
-        printf "\n%s✓ 服务端正常%s · %s\n", grn, rst, span
-        printf "  服务 %s✓%s  连接 %s✓%s  → 客户端或线路问题\n", grn, rst, grn, rst
+        printf "\n%s●%s 服务端正常 · %s\n", grn, rst, span
+        printf "  服务 %s●%s  连接 %s●%s  → 客户端或线路问题\n", grn, rst, grn, rst
       } else {
-        printf "\n%s✗ %d 个问题%s · %s\n\n", ylw, p, rst, span
+        printf "\n%s●%s %d 个问题 · %s\n\n", red, rst, p, span
         printf "%s", out
       }
       if (hint != "") printf "\n  %s详细：%s%s\n", blu, hint, rst
