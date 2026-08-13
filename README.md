@@ -304,8 +304,8 @@ is used when present and skipped otherwise.
 | `onevps-netwatch tail` | Follow the raw log live |
 | `onevps-netwatch uninstall` | Remove the timer; `--purge` also removes logs and configuration |
 
-`status`, `at`, and `report` answer one question in plain language: was this server at fault? Each finding says
-what happened, what it meant for users, and which command to run next. Add `--detail` to any of them to see the
+`status`, `at`, and `report` answer one question in plain language: was this server at fault? Each prints the
+same checklist of watched services and system checks over its window. Add `--detail` to any of them to see the
 underlying counters instead.
 
 ### Investigating a report
@@ -315,15 +315,24 @@ onevps-netwatch at "14:30"          # was this server at fault at that moment?
 onevps-netwatch report --since 6h   # anything wrong in the hours around it?
 ```
 
-Findings are aggregated per kind and ordered by how directly each one explains a failed connection, so a service
-that went down is reported before a queue that merely came close to its limit:
+Every check is listed, green or red, so nothing is implied by omission. A failing row states what happened, what
+it meant for users, and the command to run next:
 
 ```text
-🔴 2 个问题 · 20分钟 / 41 次采样
+服务端状态 · 20分钟 / 41 次采样
 
-  🔴 xray 停止 3分钟（14:31-14:34） · 期间连接全部失败
-    → journalctl -u xray --since "14:31"
-  🔴 连接队列溢出，丢弃 37 个（14:33 起） · 涌入超过处理能力
+  caddy 🟢
+  sshd 🟢
+  xray 🔴 停止 3分钟（14:31-14:34） · 期间连接全部失败
+     → journalctl -u xray --since "14:31"
+  连接接纳 🔴 队列溢出丢弃 37 个（14:33 起） · 涌入超过处理能力
+  连接跟踪表 🟢
+  内存 🟢
+  磁盘 🟢
+  IP 封禁 🟢
+  监听端口 🟢
+
+  2 项异常 → 优先排查上面的红项
 ```
 
 When nothing is found, that is itself the answer: the server was healthy throughout the window, so the fault lay

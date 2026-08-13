@@ -13,9 +13,9 @@ All notable changes to OneVPS are documented in this file. The project follows
 - Recorder query commands for the last 24 hours, a point in time, an arbitrary window, and live following, plus
   throttled Telegram or webhook alerts for conntrack pressure, accept-queue drops, service restarts, kernel OOM
   events, and disk usage.
-- Plain-language verdicts from `status`, `at`, and `report`, aggregated per finding kind and ordered by how
-  directly each one explains a failed connection, so operators who do not read TCP counters still get a
-  conclusion and a next step. `--detail` shows the underlying counters.
+- Plain-language verdicts from `status`, `at`, and `report`, printed as a checklist of every watched service and
+  system check, so operators who do not read TCP counters still get a conclusion and a next step. A failing row
+  states what happened, what it meant, and the command to run next. `--detail` shows the underlying counters.
 
 ## [0.1.0] - 2026-08-11
 

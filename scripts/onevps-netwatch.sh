@@ -520,12 +520,24 @@ plain_view() {
     function times(cnt, at) {
       return cnt == 1 ? "（" at "）" : " ×" cnt "（" at " 起）"
     }
-    # One finding, one line: what happened and what it meant. A second line
-    # only when there is a command worth running next.
-    function add(title, why, how) {
-      p++
-      out = out sprintf("  🔴 %s · %s\n", title, why)
-      if (how != "") out = out sprintf("    %s→ %s%s\n", blu, how, rst)
+    # One checked item per row, green ones included, so the reader sees the
+    # whole checklist instead of only what failed. A command line follows a
+    # failing row only when there is something worth running.
+    function row(label, bad, detail, cmd) {
+      r++
+      rl[r] = label; rb[r] = bad; rd[r] = detail; rc[r] = cmd
+      if (bad) p++
+    }
+    # Deterministic row order; awk iterates arrays arbitrarily.
+    function sortnames(arr, out_,   name, i, j, tmp, cnt) {
+      cnt = 0
+      for (name in arr) out_[++cnt] = name
+      for (i = 2; i <= cnt; i++) {
+        tmp = out_[i]
+        for (j = i - 1; j >= 1 && out_[j] > tmp; j--) out_[j + 1] = out_[j]
+        out_[j + 1] = tmp
+      }
+      return cnt
     }
     {
       delete v
@@ -568,6 +580,7 @@ plain_view() {
       if (v["ctfull"] + 0 > 0) { ctfull += v["ctfull"]; if (ctfull_hm == "") ctfull_hm = t }
       if (v["oom"] + 0 > 0)    { oom += v["oom"];       if (oom_hm == "")    oom_hm = t }
       if (v["ct_pct"] + 0 > ct_peak)  { ct_peak = v["ct_pct"] + 0; ct_hm = t }
+      if (v["ct_max"] + 0 > ct_limit) ct_limit = v["ct_max"] + 0
       if (v["disk"] + 0 > disk_peak)  { disk_peak = v["disk"] + 0; disk_hm = t }
 
       if (n == 1) { banned_first = banned_max = v["banned"] + 0; listen_min = listen_max = v["listen_n"] + 0 }
@@ -581,69 +594,83 @@ plain_view() {
         exit
       }
 
-      # Ordered by how directly each finding explains a failed connection.
-      for (name in down_from) {
-        if (live == 1) {
-          add(name " 当前停止 " dur(last_e - down_from[name] + interval),
-              "连接全部失败，需立即处理", "systemctl status " name)
-        } else {
-          add(name " " down_hm[name] " 起停止，至记录结束未恢复",
-              "期间连接全部失败", "journalctl -u " name " --since \"" down_hm[name] "\"")
+      # Services first, then the shared checks, each either green or red.
+      cnt = sortnames(seen, names)
+      for (i = 1; i <= cnt; i++) {
+        name = names[i]; detail = ""; cmd = ""
+        if (name in down_from) {
+          detail = (live == 1) \
+            ? "当前停止 " dur(last_e - down_from[name] + interval) " · 连接全部失败，需立即处理" \
+            : down_hm[name] " 起停止，至记录结束未恢复 · 期间连接全部失败"
+          cmd = (live == 1) ? "systemctl status " name \
+                            : "journalctl -u " name " --since \"" down_hm[name] "\""
+        } else if (name in downlen) {
+          detail = "停止 " dur(downlen[name]) "（" down_start_hm[name] "-" down_end_hm[name] \
+                   "） · 期间连接全部失败"
+          cmd = "journalctl -u " name " --since \"" down_start_hm[name] "\""
         }
-      }
-      for (name in downlen) {
-        add(name " 停止 " dur(downlen[name]) \
-            "（" down_start_hm[name] "-" down_end_hm[name] "）",
-            "期间连接全部失败", "journalctl -u " name " --since \"" down_start_hm[name] "\"")
-      }
-      if (ctfull > 0) {
-        add("连接跟踪表满" times(ctfull, ctfull_hm),
-            "内核直接拒绝新连接", "sysctl net.netfilter.nf_conntrack_max")
-      }
-      if (queue_lost > 0) {
-        add("连接队列溢出，丢弃 " queue_lost " 个（" queue_hm " 起）",
-            "涌入超过处理能力", "")
-      }
-      if (oom > 0) {
-        add("内存耗尽杀进程" times(oom, oom_hm),
-            "被杀的可能就是代理服务", "journalctl -k | grep -i \"out of memory\"")
-      }
-      for (name in restarts) {
-        add(name " 重启" times(restarts[name], restart_hm[name]),
-            "重启瞬间连接断开", "journalctl -u " name " --since \"" restart_hm[name] "\"")
-      }
-      # Only worth reporting as a warning when the table never actually filled;
-      # otherwise the "table full" finding above already says it, and harder.
-      if (ct_peak >= 80 && ctfull == 0) {
-        add("连接跟踪表峰值 " ct_peak "%（" ct_hm "）",
-            "接近上限，再涨会丢连接", "")
-      }
-      if (banned_max > banned_first) {
-        add("fail2ban 新封 " (banned_max - banned_first) " 个 IP",
-            "被误封的用户完全连不上", "fail2ban-client status")
-      }
-      if (disk_peak >= 90) {
-        add("磁盘峰值 " disk_peak "%（" disk_hm "）",
-            "写满会导致服务异常", "")
-      }
-      if (listen_max != listen_min) {
-        add("监听端口数 " listen_min "-" listen_max " 变动", "有服务启停", "")
+        # A service that came back necessarily restarted; reporting both
+        # would say the same outage twice.
+        if (detail == "" && (name in restarts)) {
+          detail = "重启" times(restarts[name], restart_hm[name]) " · 重启瞬间连接断开"
+          cmd = "journalctl -u " name " --since \"" restart_hm[name] "\""
+        }
+        row(name, detail != "", detail, cmd)
       }
 
-      span = sprintf("%s / %d 次采样", dur(last_e - first_e + interval), n)
-      if (p == 0) {
-        # Name what was actually checked; a bare "services ok" says nothing
-        # about which ones were watched.
-        svc = ""
-        for (name in seen) svc = svc (svc == "" ? "" : "、") name
-        printf "\n🟢 服务端正常 · %s\n", span
-        if (svc != "") printf "  %s 全程在线 · 无连接被拒绝或丢弃\n", svc
-        else           printf "  无连接被拒绝或丢弃\n"
-        printf "  → 客户端或线路问题\n"
+      if (queue_lost > 0) {
+        row("连接接纳", 1, "队列溢出丢弃 " queue_lost " 个（" queue_hm " 起） · 涌入超过处理能力", "")
       } else {
-        printf "\n🔴 %d 个问题 · %s\n\n", p, span
-        printf "%s", out
+        row("连接接纳", 0, "", "")
       }
+
+      if (ctfull > 0) {
+        row("连接跟踪表", 1, "占满" times(ctfull, ctfull_hm) " · 内核直接拒绝新连接",
+            "sysctl net.netfilter.nf_conntrack_max")
+      } else if (ct_peak >= 80) {
+        row("连接跟踪表", 1, "峰值 " ct_peak "%（" ct_hm "） · 接近上限，再涨会丢连接", "")
+      } else if (ct_limit == 0) {
+        row("连接跟踪表", 0, "未启用 · 本机没有用到连接跟踪的防火墙规则", "")
+      } else {
+        row("连接跟踪表", 0, "", "")
+      }
+
+      if (oom > 0) {
+        row("内存", 1, "耗尽杀进程" times(oom, oom_hm) " · 被杀的可能就是代理服务",
+            "journalctl -k | grep -i \"out of memory\"")
+      } else {
+        row("内存", 0, "", "")
+      }
+
+      if (disk_peak >= 90) {
+        row("磁盘", 1, "峰值 " disk_peak "%（" disk_hm "） · 写满会导致服务异常", "")
+      } else {
+        row("磁盘", 0, "", "")
+      }
+
+      if (banned_max > banned_first) {
+        row("IP 封禁", 1, "新封 " (banned_max - banned_first) " 个 · 被误封的用户完全连不上",
+            "fail2ban-client status")
+      } else {
+        row("IP 封禁", 0, "", "")
+      }
+
+      if (listen_max != listen_min) {
+        row("监听端口", 1, "数量 " listen_min "-" listen_max " 变动 · 有服务启停", "")
+      } else {
+        row("监听端口", 0, "", "")
+      }
+
+      printf "\n服务端状态 · %s / %d 次采样\n\n", dur(last_e - first_e + interval), n
+      for (i = 1; i <= r; i++) {
+        printf "  %s %s", rl[i], (rb[i] ? "🔴" : "🟢")
+        if (rd[i] != "") printf " %s", rd[i]
+        printf "\n"
+        if (rc[i] != "") printf "     %s→ %s%s\n", blu, rc[i], rst
+      }
+      printf "\n"
+      if (p == 0) printf "  全部正常 → 客户端或线路问题\n"
+      else        printf "  %d 项异常 → 优先排查上面的红项\n", p
       if (hint != "") printf "\n  %s详细：%s%s\n", blu, hint, rst
       printf "\n"
     }
