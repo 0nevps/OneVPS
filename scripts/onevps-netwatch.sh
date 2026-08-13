@@ -992,7 +992,7 @@ main() {
   shift || true
   case "$cmd" in
     collect)         collect ;;
-    status)          cmd_status ;;
+    status)          cmd_status "$@" ;;
     tail)            cmd_tail "$@" ;;
     at)              cmd_at "$@" ;;
     report)          cmd_report "$@" ;;
