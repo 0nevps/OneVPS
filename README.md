@@ -93,8 +93,42 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 7) BBR acceleration
 8) System optimization
 9) Uninstall
+10) Realm relay
 0) Exit
 ```
+
+## Realm port relay
+
+Choose menu `10`, then `1` to install realm and add a relay without installing Xray.
+Enter a local port, destination IP or hostname, destination port, and `tcp` (default) or `both` (TCP+UDP).
+For example, forward local port `10443` to `203.0.113.20:443` using TCP.
+Destinations support IPv4, hostnames, and IPv6 literals without brackets; listeners bind to `0.0.0.0` (IPv4).
+
+**Security:** realm forwards traffic without adding authentication or encryption. Only expose intended ports,
+restrict source addresses in your firewall where appropriate, and retain the destination protocol's security.
+Manually allow the listening port in the host firewall and cloud security group. OneVPS does not change these rules.
+Existing Xray share links are not rewritten; preserve destination TLS/Reality server names when configuring clients.
+
+The submenu lists rules and service status, deletes rules, restarts the service, and uninstalls realm independently.
+Deleting the last rule stops and disables the service. Failed rule activation restores the previous configuration
+and attempts to restore the previous service state. A successful local listener check does not prove destination
+reachability: test from a client and inspect `journalctl -u onevps-realm` if forwarding fails.
+
+Installation uses the official [realm v2.9.6 release](https://github.com/zhboner/realm/releases/tag/v2.9.6),
+verifies the archive against the GitHub release asset's SHA-256 digest, and supports amd64, arm64, and armv7.
+The pinned release is reused on subsequent additions, not automatically upgraded.
+Requires systemd with `DynamicUser` support (232+), `tar`, and `ss` from `iproute2` (Debian/Ubuntu) or
+`iproute` (RHEL-family). The service runs with a dynamic unprivileged user and permission to bind low ports.
+
+| Resource | Location |
+| --- | --- |
+| Binary | `/usr/local/bin/onevps-realm` |
+| Configuration | `/usr/local/etc/onevps-realm/config.json` |
+| Ownership marker | `/usr/local/etc/onevps-realm/.onevps-managed` |
+| Service | `/etc/systemd/system/onevps-realm.service` |
+
+Existing unmanaged files at these paths are not overwritten. Other realm installations are left alone, but may
+conflict on listening ports. Menu `9` only uninstalls Xray; remove realm using menu `10` → `5`.
 
 ## VLESS + REALITY
 

@@ -5,6 +5,13 @@ All notable changes to OneVPS are documented in this file. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Independent realm port relay menu with verified v2.9.6 downloads for amd64, arm64, and armv7.
+- TCP and TCP+UDP rules, IPv4/IPv6 destinations, service status, deletion, restart, and independent uninstall.
+- Restricted systemd service, input and listening-port checks, unmanaged-file protection, and configuration rollback.
+- Relay configuration and mocked service lifecycle tests, plus English and Chinese operator instructions.
+
 ## [0.1.0] - 2026-08-11
 
 ### Added

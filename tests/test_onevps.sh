@@ -170,4 +170,113 @@ rebuild_config
 assert_file_jq "honors the UDP/443 opt-out" "$XRAY_CONF" \
   'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
 
+assert_true "realm accepts maximum port" realm_valid_port 65535
+for port in 0 65536 080 -1 '22;id' ''; do
+  assert_false "realm rejects invalid port '$port'" realm_valid_port "$port"
+done
+for host in 192.0.2.1 relay.example.com localhost ::1 2001:db8::1 1:2:3:4:5:6:7:8; do
+  assert_true "realm accepts host $host" realm_valid_host "$host"
+done
+for host in 999.1.1.1 01.2.3.4 1.2.3 'bad host' '-bad.example' 'bad..example' \
+  'example.com/path' ':::' '1::2::3' '1:2:3' '::1:' ':1::' '[::1]' '::fffff'; do
+  assert_false "realm rejects host $host" realm_valid_host "$host"
+done
+endpoint=$(realm_endpoint 12345 2001:db8::1 443 both)
+assert_jq "realm brackets IPv6 and enables UDP per endpoint" "$endpoint" \
+  '.listen == "0.0.0.0:12345" and .remote == "[2001:db8::1]:443"
+   and .network.use_udp and (.network.no_tcp | not)'
+assert_jq "realm TCP-only endpoint" "$(realm_endpoint 12346 example.com 8443 tcp)" \
+  '.remote == "example.com:8443" and (.network.use_udp | not)'
+assert_false "realm rejects unsupported protocol" realm_endpoint 12345 example.com 443 udp
+
+REALM_DIR="$TEST_TMP/realm"
+# Consumed by realm installation and service generation in the sourced script.
+# shellcheck disable=SC2034
+REALM_BIN="$TEST_TMP/realm-bin"
+REALM_SERVICE="$TEST_TMP/realm.service"
+mkdir -p "$REALM_DIR"
+assert_false "realm refuses unmanaged paths" realm_install
+printf 'original\n' > "$REALM_SERVICE"
+assert_false "realm does not own unrelated service" realm_owned
+assert_eq "unmanaged service remains unchanged" original "$(cat "$REALM_SERVICE")"
+touch "$REALM_DIR/.onevps-managed"
+realm_write_service > "$REALM_SERVICE"
+assert_true "realm recognizes managed service" realm_owned
+assert_contains "realm runs as dynamic unprivileged user" "$(cat "$REALM_SERVICE")" 'DynamicUser=true'
+assert_contains "realm service uses separate config" "$(cat "$REALM_SERVICE")" "$REALM_DIR/config.json"
+printf '{"endpoints":[]}\n' > "$REALM_DIR/config.json"
+
+# Exercise actual readiness checks before replacing the restart helper.
+MOCK_UDP_BOUND=true
+systemctl() {
+  case "$1" in
+    restart|is-active) return 0 ;;
+    show) printf '1234\n' ;;
+    *) return 1 ;;
+  esac
+}
+sleep() { :; }
+ss() {
+  if [[ "$2" == -lnup ]] && ! $MOCK_UDP_BOUND; then return 0; fi
+  printf 'LISTEN 0 128 0.0.0.0:12345 0.0.0.0:* users:(("realm",pid=1234,fd=5))\n'
+}
+jq -n --argjson endpoint "$endpoint" '{endpoints:[$endpoint]}' > "$REALM_DIR/config.json"
+assert_true "realm verifies owned TCP and UDP listeners" realm_restart
+MOCK_UDP_BOUND=false
+assert_false "realm detects partial listener failure despite active service" realm_restart
+printf '{"endpoints":[]}\n' > "$REALM_DIR/config.json"
+
+# Mock all runtime effects; rollback must restore both data and service state.
+MOCK_ACTIVE=false
+MOCK_ENABLED=false
+MOCK_RESTART_FAIL=false
+MOCK_ENABLE_FAIL=false
+MOCK_RESTARTS=0
+systemctl() {
+  case "$1" in
+    is-active) "$MOCK_ACTIVE" ;;
+    is-enabled) "$MOCK_ENABLED" ;;
+    enable) if $MOCK_ENABLE_FAIL; then return 1; fi; MOCK_ENABLED=true ;;
+    disable) MOCK_ENABLED=false ;;
+    stop) MOCK_ACTIVE=false ;;
+    *) return 1 ;;
+  esac
+}
+realm_restart() {
+  MOCK_RESTARTS=$((MOCK_RESTARTS + 1))
+  if $MOCK_RESTART_FAIL; then MOCK_RESTART_FAIL=false; return 1; fi
+  MOCK_ACTIVE=true
+}
+candidate="$REALM_DIR/candidate"
+jq -n --argjson endpoint "$endpoint" '{endpoints:[$endpoint]}' > "$candidate"
+assert_true "realm activates first rule" realm_apply "$candidate"
+assert_eq "realm starts service" true "$MOCK_ACTIVE"
+assert_eq "realm enables service" true "$MOCK_ENABLED"
+before=$(cat "$REALM_DIR/config.json")
+second=$(realm_endpoint 12346 example.com 443 tcp)
+jq --argjson endpoint "$second" '.endpoints += [$endpoint]' "$REALM_DIR/config.json" > "$candidate"
+MOCK_RESTART_FAIL=true
+assert_false "realm rejects failed restart" realm_apply "$candidate"
+assert_eq "realm rollback preserves previous config" "$before" "$(cat "$REALM_DIR/config.json")"
+assert_eq "realm rollback restarts old active service" true "$MOCK_ACTIVE"
+assert_eq "realm attempted recovery restart" 3 "$MOCK_RESTARTS"
+
+jq --argjson endpoint "$second" '.endpoints += [$endpoint]' "$REALM_DIR/config.json" > "$candidate"
+assert_true "realm adds a second rule" realm_apply "$candidate"
+assert_file_jq "realm retains both protocols" "$REALM_DIR/config.json" \
+  '(.endpoints | length == 2) and .endpoints[0].network.use_udp and (.endpoints[1].network.use_udp | not)'
+printf '{"endpoints":[]}\n' > "$candidate"
+assert_true "realm removes last rules" realm_apply "$candidate"
+assert_eq "realm stops empty service" false "$MOCK_ACTIVE"
+assert_eq "realm disables empty service" false "$MOCK_ENABLED"
+before=$(cat "$REALM_DIR/config.json")
+jq -n --argjson endpoint "$endpoint" '{endpoints:[$endpoint]}' > "$candidate"
+MOCK_ENABLE_FAIL=true
+assert_false "realm rolls back enable failure" realm_apply "$candidate"
+assert_eq "realm restores previously stopped service" false "$MOCK_ACTIVE"
+assert_eq "realm enable failure restores config" "$before" "$(cat "$REALM_DIR/config.json")"
+printf 'invalid json\n' > "$candidate"
+assert_false "realm rejects malformed candidate" realm_apply "$candidate"
+assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
+
 printf '# %d tests passed\n' "$TEST_COUNT"

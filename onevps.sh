@@ -19,6 +19,10 @@ XRAY_SERVICE=/etc/systemd/system/xray.service
 XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 REALITY_PROBE_ROUNDS=3
+REALM_DIR=/usr/local/etc/onevps-realm
+REALM_BIN=/usr/local/bin/onevps-realm
+REALM_SERVICE=/etc/systemd/system/onevps-realm.service
+REALM_VERSION=v2.9.6
 
 REALITY_DESTS=(
   "www.cloudflare.com"
@@ -1547,6 +1551,279 @@ uninstall() {
 }
 
 # ----------------------------------------------------------------------------
+# Realm relay (independent of Xray)
+# ----------------------------------------------------------------------------
+realm_valid_port() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 ))
+}
+
+realm_valid_host() {
+  local host="$1" part rest count=0
+  if [[ "$host" == *:* ]]; then
+    [[ "$host" =~ ^[0-9a-fA-F:]+$ && "$host" != *:::* ]] || return 1
+    [[ "$host" != :* || "$host" == ::* ]] || return 1
+    [[ "$host" != *: || "$host" == *:: ]] || return 1
+    rest=${host/::/X}
+    [[ "$rest" != *::* ]] || return 1
+    if [[ "$host" != *::* ]]; then
+      [[ "$host" != :* && "$host" != *: ]] || return 1
+    fi
+    rest="$host"
+    while [[ -n "$rest" ]]; do
+      part=${rest%%:*}
+      [[ -z "$part" || ${#part} -le 4 ]] || return 1
+      [[ -z "$part" ]] || count=$((count + 1))
+      [[ "$rest" == *:* ]] || break
+      rest=${rest#*:}
+    done
+    if [[ "$host" == *::* ]]; then (( count < 8 )); else (( count == 8 )); fi
+  elif [[ "$host" =~ ^[0-9.]+$ ]]; then
+    [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    rest="$host"
+    while :; do
+      part=${rest%%.*}
+      [[ "$part" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( 10#$part <= 255 )) || return 1
+      [[ "$rest" == *.* ]] || break
+      rest=${rest#*.}
+    done
+  else
+    [[ ${#host} -le 253 && "$host" != *. ]] || return 1
+    rest="$host"
+    while :; do
+      part=${rest%%.*}
+      [[ ${#part} -le 63 && "$part" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+      [[ "$rest" == *.* ]] || break
+      rest=${rest#*.}
+    done
+  fi
+}
+
+realm_endpoint() {
+  local port="$1" host="$2" remote_port="$3" mode="$4"
+  realm_valid_port "$port" && realm_valid_port "$remote_port" && realm_valid_host "$host" || return 1
+  [[ "$mode" == tcp || "$mode" == both ]] || return 1
+  [[ "$host" != *:* ]] || host="[$host]"
+  jq -n --arg listen "0.0.0.0:$port" --arg remote "$host:$remote_port" --arg mode "$mode" \
+    '{listen:$listen,remote:$remote,network:{no_tcp:false,use_udp:($mode == "both")}}'
+}
+
+realm_owned() {
+  [[ -f "$REALM_DIR/.onevps-managed" && ! -L "$REALM_DIR" && ! -L "$REALM_SERVICE" ]] &&
+    grep -qx '# Managed by OneVPS realm' "$REALM_SERVICE"
+}
+
+realm_write_service() {
+  cat <<EOF
+# Managed by OneVPS realm
+[Unit]
+Description=OneVPS Realm Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=true
+ExecStart=$REALM_BIN -c $REALM_DIR/config.json
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+realm_install() {
+  if realm_owned; then
+    [[ -x "$REALM_BIN" && -f "$REALM_DIR/config.json" ]] || { err "incomplete realm installation; inspect before reinstalling"; return 1; }
+    return 0
+  fi
+  if [[ -e "$REALM_DIR" || -L "$REALM_DIR" || -e "$REALM_BIN" || -L "$REALM_BIN" ||
+        -e "$REALM_SERVICE" || -L "$REALM_SERVICE" ]]; then
+    err "refusing to overwrite unmanaged realm paths"; return 1
+  fi
+  local target tmp asset url digest actual
+  case "$ARCH" in
+    amd64) target=x86_64-unknown-linux-musl ;;
+    arm64) target=aarch64-unknown-linux-musl ;;
+    armv7) target=armv7-unknown-linux-musleabihf ;;
+    *) err "unsupported realm architecture: $ARCH"; return 1 ;;
+  esac
+  tmp=$(mktemp -d) || return 1
+  asset="realm-$target.tar.gz"
+  info "downloading official realm $REALM_VERSION ($target)"
+  if ! curl -fsSL --connect-timeout 15 --max-time 60 \
+    "https://api.github.com/repos/zhboner/realm/releases/tags/$REALM_VERSION" > "$tmp/release.json"; then
+    rm -rf "$tmp"; return 1
+  fi
+  url=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .browser_download_url' "$tmp/release.json")
+  digest=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .digest' "$tmp/release.json")
+  if [[ "$url" != "https://github.com/zhboner/realm/releases/download/$REALM_VERSION/$asset" ||
+        ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    err "missing official asset or SHA-256 digest"; rm -rf "$tmp"; return 1
+  fi
+  if ! curl -fsSL --connect-timeout 15 --max-time 180 "$url" -o "$tmp/archive.tar.gz"; then
+    rm -rf "$tmp"; return 1
+  fi
+  actual=$(openssl dgst -sha256 "$tmp/archive.tar.gz")
+  if [[ "${actual##* }" != "${digest#sha256:}" ]]; then
+    err "realm checksum mismatch"; rm -rf "$tmp"; return 1
+  fi
+  if ! tar -xzf "$tmp/archive.tar.gz" -C "$tmp" realm ||
+     [[ ! -f "$tmp/realm" || -L "$tmp/realm" ]] ||
+     ! chmod 755 "$tmp/realm" || ! "$tmp/realm" --version; then
+    err "invalid realm binary"; rm -rf "$tmp"; return 1
+  fi
+  # Publish only after the downloaded binary has passed validation.
+  if ! mkdir -p "$REALM_DIR" || ! chmod 755 "$REALM_DIR" ||
+     ! install -m 755 "$tmp/realm" "$REALM_BIN" ||
+     ! printf '{"log":{"level":"warn"},"endpoints":[]}\n' > "$REALM_DIR/config.json" ||
+     ! chmod 644 "$REALM_DIR/config.json" ||
+     ! realm_write_service > "$REALM_SERVICE" || ! chmod 644 "$REALM_SERVICE" ||
+     ! touch "$REALM_DIR/.onevps-managed" || ! systemctl daemon-reload; then
+    rm -f "$REALM_BIN" "$REALM_SERVICE"
+    rm -rf "$REALM_DIR" "$tmp"
+    systemctl daemon-reload || true
+    err "realm installation failed"; return 1
+  fi
+  rm -rf "$tmp"
+  ok "realm installed; add a rule to start forwarding"
+}
+
+realm_restart() {
+  local pid port udp sockets
+  systemctl restart onevps-realm || return 1
+  sleep 2
+  systemctl is-active --quiet onevps-realm || return 1
+  pid=$(systemctl show -p MainPID --value onevps-realm) || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  # Realm can remain active when only some listeners bind successfully.
+  while read -r port udp; do
+    sockets=$(ss -H -lntp "sport = :$port") || return 1
+    [[ "$sockets" == *"pid=$pid,"* ]] || return 1
+    if [[ "$udp" == true ]]; then
+      sockets=$(ss -H -lnup "sport = :$port") || return 1
+      [[ "$sockets" == *"pid=$pid,"* ]] || return 1
+    fi
+  done < <(jq -r '.endpoints[] | "\(.listen | split(":") | last) \(.network.use_udp)"' "$REALM_DIR/config.json")
+}
+
+realm_apply() {
+  local candidate="$1" backup was_active=false was_enabled=false
+  realm_owned || { err "realm is not managed by OneVPS"; return 1; }
+  jq -e '.endpoints | type == "array"' "$candidate" >/dev/null || return 1
+  backup=$(mktemp "$REALM_DIR/.backup.XXXXXX") || return 1
+  cp -p "$REALM_DIR/config.json" "$backup" || { rm -f "$backup"; return 1; }
+  systemctl is-active --quiet onevps-realm && was_active=true
+  systemctl is-enabled --quiet onevps-realm && was_enabled=true
+  if chmod 644 "$candidate" && mv -f "$candidate" "$REALM_DIR/config.json"; then
+    if [[ $(jq '.endpoints | length' "$REALM_DIR/config.json") == 0 ]]; then
+      if systemctl stop onevps-realm && systemctl disable onevps-realm; then
+        rm -f "$backup"; return 0
+      fi
+    elif realm_restart && systemctl enable onevps-realm; then
+      rm -f "$backup"; return 0
+    fi
+  fi
+  mv -f "$backup" "$REALM_DIR/config.json" || { err "could not restore realm backup: $backup"; return 1; }
+  if $was_enabled; then systemctl enable onevps-realm || true; else systemctl disable onevps-realm || true; fi
+  if $was_active; then
+    realm_restart || err "old config restored, but service recovery failed; inspect journalctl -u onevps-realm"
+  else
+    systemctl stop onevps-realm || true
+  fi
+  err "realm change failed; previous configuration restored"
+  return 1
+}
+
+realm_add() {
+  local port host remote_port mode endpoint candidate sockets
+  port=$(ask 'Local listening port')
+  host=$(ask 'Destination IP or hostname (IPv6 without brackets)')
+  remote_port=$(ask 'Destination port')
+  mode=$(ask 'Protocol: tcp or both (TCP+UDP)' tcp)
+  endpoint=$(realm_endpoint "$port" "$host" "$remote_port" "$mode") || { err "invalid relay input"; return 1; }
+  command -v ss >/dev/null 2>&1 || { err "ss is required to check listening ports; install iproute2/iproute"; return 1; }
+  sockets=$(ss -H -lntu) || { err "cannot inspect listening ports"; return 1; }
+  if awk '{print $5}' <<<"$sockets" | grep -qE ":$port$"; then
+    err "port $port is already in use"; return 1
+  fi
+  warn "relay listens on all IPv4 interfaces; it adds no authentication or encryption"
+  confirm "Forward port $port to $host:$remote_port ($mode)?" || return 0
+  realm_install || return 1
+  if jq -e --arg listen "0.0.0.0:$port" 'any(.endpoints[]; .listen == $listen)' "$REALM_DIR/config.json" >/dev/null; then
+    err "a rule already uses this port"; return 1
+  fi
+  candidate=$(mktemp "$REALM_DIR/.candidate.XXXXXX") || return 1
+  if jq --argjson endpoint "$endpoint" '.endpoints += [$endpoint]' "$REALM_DIR/config.json" > "$candidate" &&
+     realm_apply "$candidate"; then
+    ok "relay added; allow port $port ($mode) in your firewall and cloud security group"
+  else
+    rm -f "$candidate"; return 1
+  fi
+}
+
+realm_list() {
+  jq -r '.endpoints | to_entries[] | "\(.key + 1)) \(.value.listen) -> \(.value.remote) [\(if .value.network.use_udp then "TCP+UDP" else "TCP" end)]"' \
+    "$REALM_DIR/config.json"
+}
+
+realm_delete() {
+  local index count candidate
+  realm_list
+  count=$(jq '.endpoints | length' "$REALM_DIR/config.json")
+  index=$(ask 'Rule number to delete (empty cancels)')
+  [[ -n "$index" ]] || return 0
+  [[ "$index" =~ ^[1-9][0-9]{0,5}$ ]] && (( index <= count )) || { err "invalid rule number"; return 1; }
+  confirm "Delete rule $index?" || return 0
+  candidate=$(mktemp "$REALM_DIR/.candidate.XXXXXX") || return 1
+  if jq --argjson index "$((index - 1))" 'del(.endpoints[$index])' "$REALM_DIR/config.json" > "$candidate" &&
+     realm_apply "$candidate"; then
+    ok "rule removed"
+  else
+    rm -f "$candidate"; return 1
+  fi
+}
+
+realm_uninstall() {
+  realm_owned || { err "refusing to remove unmanaged realm installation"; return 1; }
+  confirm 'Remove OneVPS realm and all its relay rules?' || return 0
+  systemctl stop onevps-realm && systemctl disable onevps-realm || return 1
+  rm -f "$REALM_BIN" "$REALM_SERVICE"
+  rm -rf "$REALM_DIR"
+  systemctl daemon-reload
+  ok "realm removed; firewall rules were not changed"
+}
+
+realm_menu() {
+  ensure_deps
+  while :; do
+    printf '\nRealm relay\n1) Install and add relay\n2) List rules / status\n3) Delete rule\n4) Restart\n5) Uninstall realm\n0) Back\n'
+    local choice
+    choice=$(ask 'Select')
+    case "$choice" in
+      0|"") return ;;
+      1) realm_add || warn "relay was not added" ;;
+      2|3|4|5)
+        if ! realm_owned; then warn "no OneVPS-managed realm installation"; continue; fi
+        case "$choice" in
+          2) realm_list; systemctl --no-pager status onevps-realm || true ;;
+          3) realm_delete || warn "rule was not removed" ;;
+          4) realm_restart || warn "restart failed; inspect journalctl -u onevps-realm" ;;
+          5) realm_uninstall || warn "uninstall failed" ;;
+        esac ;;
+      *) warn "invalid selection" ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------------------
 # Main menu
 # ----------------------------------------------------------------------------
 status_line() {
@@ -1582,6 +1859,7 @@ EOF
   7) BBR acceleration
   8) System optimization
   9) Uninstall
+  10) Realm relay
   0) Exit
 EOF
     case "$(ask 'Select')" in
@@ -1594,6 +1872,7 @@ EOF
       7) enable_bbr ;;
       8) optimize_system ;;
       9) uninstall ;;
+      10) realm_menu ;;
       0|"") exit 0 ;;
       *) ;;
     esac

@@ -86,8 +86,41 @@ bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onev
 7) BBR acceleration
 8) System optimization
 9) Uninstall
+10) Realm relay
 0) Exit
 ```
+
+## Realm 端口中转
+
+选择菜单 `10`，再选择 `1`，即可安装 realm 并添加中转，无需先安装 Xray。
+依次输入本地端口、目标 IP 或域名、目标端口，以及 `tcp`（默认）或 `both`（TCP+UDP）。
+例如：将本地 `10443` 端口通过 TCP 转发到 `203.0.113.20:443`。
+目标支持 IPv4、域名和不带方括号的 IPv6 地址；本地监听 `0.0.0.0`（IPv4）。
+
+**安全提醒：** realm 不会额外提供认证或加密。仅开放必要端口，按需在防火墙限制来源地址，
+并保留目标协议本身的安全保护。请手动放行主机防火墙和云安全组，脚本不会自动修改这些规则。
+现有 Xray 分享链接不会自动改写；客户端接入中转时应保留目标的 TLS／Reality 服务名称。
+
+子菜单支持查看规则及服务状态、删除规则、重启和独立卸载。删除最后一条规则会停止服务并取消开机启动。
+规则启用失败时恢复旧配置，并尝试恢复原服务状态。本地监听检查成功不代表目标可达，
+请通过客户端验证连接；故障日志使用 `journalctl -u onevps-realm` 查看。
+
+安装使用官方 [realm v2.9.6 发布包](https://github.com/zhboner/realm/releases/tag/v2.9.6)，
+按 GitHub 发布资产的 SHA-256 摘要校验，支持 amd64、arm64 和 armv7。
+后续添加规则复用已安装版本，不自动升级。
+依赖支持 `DynamicUser` 的 systemd（232+）、`tar` 及 `ss`；
+Debian/Ubuntu 的 `ss` 来自 `iproute2`，RHEL 系来自 `iproute`。
+服务使用动态非特权用户运行，仅授予绑定低端口所需的能力。
+
+| 资源 | 位置 |
+| --- | --- |
+| 二进制 | `/usr/local/bin/onevps-realm` |
+| 配置 | `/usr/local/etc/onevps-realm/config.json` |
+| 管理标记 | `/usr/local/etc/onevps-realm/.onevps-managed` |
+| 服务 | `/etc/systemd/system/onevps-realm.service` |
+
+上述路径存在非本脚本管理的文件时拒绝覆盖。其他 realm 安装不会被修改，但可能占用相同端口。
+菜单 `9` 仅卸载 Xray；卸载 realm 使用菜单 `10` → `5`，防火墙规则需自行清理。
 
 ## VLESS + REALITY
 
