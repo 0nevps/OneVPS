@@ -63,6 +63,23 @@ Runtime testing changes system services and files. Perform manual installation o
 disposable VPS or virtual machine that you are authorized to modify. Record the distribution, version,
 architecture, package manager, Xray version, and Caddy version used for the test.
 
+## Releases
+
+Push an existing stable version tag such as `v0.1.2` to trigger the Release workflow. It validates the tagged
+commit with the same checks as CI, then publishes `onevps.sh` and `SHA256SUMS` with generated release notes.
+Only the publishing job has permission to write releases.
+
+To backfill an existing tag, run the Release workflow from `main` and supply the tag:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v0.1.2
+```
+
+The workflow must already exist on the default branch. Manual dispatch requires repository Actions write
+access. Do not move or recreate published tags. Repeated runs verify existing assets without replacing them;
+incomplete or conflicting releases fail for manual inspection. Historical backfills do not replace a newer
+version as Latest. New releases remain drafts until both uploaded assets have been verified.
+
 ## Reporting Bugs
 
 Include:
@@ -92,6 +109,10 @@ firewall rules, Caddy routing, generated credentials, or systemd hardening.
 
 ## 中文说明
 
+- 推送 `v0.1.2` 格式的稳定版本 tag 后，Release workflow 验证该提交并自动发布脚本和校验文件。
+- 补发已有 tag 时，从 `main` 手动运行 Release，输入 tag；需要仓库 Actions 写权限，workflow 必须已在默认分支。
+- 不移动或重建已发布 tag；重复运行只验证已有资产，不覆盖文件。不完整或冲突的 Release 需人工检查。
+- 上传资产验证成功前保持草稿；补发旧版本不会替换较新版本的 Latest 标记。
 - 提交前先检索现有 issue；安全漏洞请按 [SECURITY.md](SECURITY.md) 私密报告。
 - 公开内容中不得包含节点链接、UUID、密码、私钥、WebSocket 路径或未脱敏日志。
 - 功能变更需同步更新中英文 README，并执行 Bash 语法、ShellCheck、自动测试和 Markdownlint。

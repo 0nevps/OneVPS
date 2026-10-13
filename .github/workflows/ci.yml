@@ -4,12 +4,18 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to validate for a release
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: validate-${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref || 'event' }}
   cancel-in-progress: true
 
 jobs:
@@ -21,6 +27,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
 
       - name: Validate Bash syntax
         run: bash -n onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh

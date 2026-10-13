@@ -62,6 +62,9 @@ the same workflow on another supported host, and contribute fixes in one place.
 The script runs as root and changes system services, firewall rules, and optional kernel settings. Review the
 script before running it, especially on an existing server.
 
+Stable version tags are published automatically after CI validation, with the script and checksum assets.
+See [release procedures](CONTRIBUTING.md#releases) for manual backfills.
+
 Recommended release installation with checksum verification:
 
 ```bash
