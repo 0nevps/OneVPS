@@ -502,9 +502,10 @@ unset -f mv
 assert_true "outbound replacement restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 assert_true "outbound staging directories cleaned" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
 assert_false "unknown target cannot silently succeed" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" missing <<<'{"mode":"direct"}'
-# Actual menu reads a secret silently and cancellation must not write anything.
-assert_true "cancelled outbound menu masks secret and preserves files" bash -c '
+# Proxy input stays visible; cancellation must not log credentials or write anything.
+assert_true "cancelled outbound menu uses visible input and preserves files" bash -c '
   source "$1"; XRAY_NODES="$2"
+  read() { local arg; for arg in "$@"; do [[ "$arg" != -s ]] || return 1; done; builtin read "$@"; }
   ask() { if [[ "$1" == Scope ]]; then printf "1\n"; else printf "3\n"; fi; }; confirm() { return 1; }
   before=$(cksum "$2")
   output=$(manage_outbound a1b2c3d4 <<<"socks5://secret-user:secret-password@proxy.example:1080" 2>&1)

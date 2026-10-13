@@ -1155,8 +1155,8 @@ manage_outbound() {
     1) outbound='"inherit"' ;;
     2) outbound='{"mode":"direct"}' ;;
     3)
-      printf 'Proxy link (hidden, Enter to cancel): ' >&2
-      IFS= read -r -s link || return 1
+      printf 'Proxy link (Enter to cancel): ' >&2
+      IFS= read -r link || return 1
       printf '\n' >&2
       [[ -n "$link" ]] || return 0
       outbound=$(printf '%s\n' "$link" | parse_outbound_link) || { err 'invalid or unsupported proxy link'; return 1; }

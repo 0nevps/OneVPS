@@ -100,8 +100,8 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 ## Node outbounds
 
 Choose **Set node outbound** (`8`) from a node's management menu, select **All users** or
-**Selected users**, then choose an explicit **Direct** connection, paste one proxy link (hidden input),
-or restore the default setting.
+**Selected users**, then choose an explicit **Direct** connection, paste one proxy link
+(visible input; credentials appear on screen), or restore the default setting.
 
 - **Selected users:** select one or more users on the current node, including its default client.
   Only the selected identities change. Restoring the default removes their overrides so they inherit
