@@ -622,32 +622,32 @@ mktemp_json() {
   echo "${t}.json"
 }
 
-rebuild_config() {
-  ensure_nodes_file
-
-  local inbounds n enabled type ib block_udp443
+render_config() {
+  local source="$1" output="$2"
+  validate_user_metadata "$source" || { err "invalid user metadata"; return 1; }
+  local inbounds n enabled type ib block_udp443 rows
+  rows=$(jq -c '.nodes[]' "$source") || return 1
   inbounds='[]'
   while IFS= read -r n; do
-    enabled=$(jq -r '.enabled' <<<"$n")
+    [[ -n "$n" ]] || continue
+    enabled=$(jq -r '.enabled' <<<"$n") || return 1
     [[ "$enabled" == "true" ]] || continue
-    type=$(jq -r '.type' <<<"$n")
+    type=$(jq -r '.type' <<<"$n") || return 1
     case "$type" in
-      vless-reality) ib=$(build_reality_inbound "$n") ;;
-      trojan-ws)     ib=$(build_trojan_inbound "$n") ;;
+      vless-reality) ib=$(build_reality_inbound "$n") || return 1 ;;
+      trojan-ws)     ib=$(build_trojan_inbound "$n") || return 1 ;;
       *) continue ;;
     esac
-    inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds")
-  done < <(jq -c '.nodes[]' "$XRAY_NODES")
+    inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds") || return 1
+  done <<<"$rows"
   block_udp443=$(jq -r '
     if ((.settings | type) == "object" and (.settings | has("block_udp443"))) then
       .settings.block_udp443
     else
       true
-    end' "$XRAY_NODES" 2>/dev/null || echo true)
+    end' "$source" 2>/dev/null || echo true)
   [[ "$block_udp443" == "false" ]] || block_udp443=true
 
-  local tmp_conf chk_err
-  tmp_conf=$(mktemp_json)
   jq -n --argjson inbounds "$inbounds" --argjson block_udp443 "$block_udp443" '
     def private_ip_rule: {
       type: "field",
@@ -678,8 +678,14 @@ rebuild_config() {
           "0": {handshake: 4, connIdle: 300, uplinkOnly: 2, downlinkOnly: 5}
         }
       }
-    }' > "$tmp_conf"
+    }' > "$output"
+}
 
+rebuild_config() {
+  ensure_nodes_file
+  local tmp_conf chk_err
+  tmp_conf=$(mktemp_json)
+  render_config "$XRAY_NODES" "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
   chk_err=$(mktemp)
   if ! validate_xray_config "$tmp_conf" "$chk_err"; then
     err "generated config failed validation:"
@@ -696,12 +702,215 @@ rebuild_config() {
   fi
 }
 
+# Default credentials remain in place; member labels use stable identity IDs.
+node_clients() {
+  jq -c '
+    .id as $node_id |
+    if .type == "vless-reality" then
+      [{id: .uuid, flow: "xtls-rprx-vision", email: (.tag + "@onevps")}] +
+      [(.clients // [])[] | {id: .uuid, flow: "xtls-rprx-vision", email: ($node_id + "/" + .user_id + "@onevps-user")}]
+    else
+      [{password: .password, email: (.tag + "@onevps")}] +
+      [(.clients // [])[] | {password: .password, email: ($node_id + "/" + .user_id + "@onevps-user")}]
+    end' <<<"$1"
+}
+
+validate_user_metadata() {
+  jq -e '
+    def nonempty: type == "string" and length > 0;
+    def unique_values: length == (unique | length);
+    (.users // []) as $users |
+    (if has("users") then (.users | type == "array") else true end) and
+    (.nodes | type == "array") and ($users | type == "array") and
+    ([$users[].id] | unique_values) and ([$users[].name] | unique_values) and
+    all($users[]; (.id | nonempty) and (.name | nonempty) and
+      (.name == (.name | gsub("^\\s+|\\s+$"; "")))) and
+    ([.nodes[].id] | unique_values) and
+    all(.nodes[];
+      . as $n | (.id | nonempty) and
+      (if has("clients") then (.clients | type == "array") else true end) and
+      ([ (.clients // [])[].user_id ] | unique_values) and
+      all((.clients // [])[];
+        . as $c | any($users[]; .id == $c.user_id) and
+        if $n.type == "vless-reality" then
+          (has("password") | not) and (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+        elif $n.type == "trojan-ws" then (has("uuid") | not) and (.password | nonempty)
+        else false end) and
+      if .type == "vless-reality" then
+        ([.uuid, (.clients // [])[].uuid] | map(ascii_downcase) | unique_values)
+      elif .type == "trojan-ws" then
+        ([.password, (.clients // [])[].password] | unique_values)
+      else ((.clients // []) | length == 0) end)
+  ' "$1" >/dev/null 2>&1
+}
+
+# Build a snapshot without modifying live files. Empty ID creates an identity.
+prepare_user_assignment() {
+  local source="$1" output="$2" uid="$3" name="$4" selections="$5"
+  local data node type credential field attempts
+  validate_user_metadata "$source" || { err "invalid user metadata"; return 1; }
+  data=$(cat "$source") || return 1
+  jq -e --argjson ids "$selections" '
+    . as $data | ($ids | type == "array" and length > 0) and
+    all($ids[]; . as $id | any($data.nodes[];
+      .id == $id and (.type == "vless-reality" or .type == "trojan-ws")))
+  ' <<<"$data" >/dev/null || { err "select valid nodes"; return 1; }
+  if [[ -z "$uid" ]]; then
+    name=$(jq -nr --arg n "$name" '$n | gsub("^\\s+|\\s+$"; "")') || return 1
+    [[ -n "$name" ]] || { err "name is required"; return 1; }
+    jq -e --arg n "$name" 'any((.users // [])[]; .name == $n)' <<<"$data" >/dev/null && {
+      err "user name already exists"; return 1;
+    }
+    uid="user-$(openssl rand -hex 16)" || return 1
+    data=$(jq --arg id "$uid" --arg name "$name" '.users = ((.users // []) + [{id:$id,name:$name}])' <<<"$data") || return 1
+  else
+    jq -e --arg id "$uid" 'any((.users // [])[]; .id == $id)' <<<"$data" >/dev/null || {
+      err "unknown user"; return 1;
+    }
+  fi
+  while IFS= read -r node; do
+    jq -e --arg id "$node" --arg uid "$uid" 'any(.nodes[] | select(.id == $id) | (.clients // [])[]; .user_id == $uid)' <<<"$data" >/dev/null && continue
+    type=$(jq -r --arg id "$node" '.nodes[] | select(.id == $id) | .type' <<<"$data") || return 1
+    field=password; [[ "$type" != vless-reality ]] || field=uuid
+    attempts=0
+    while :; do
+      attempts=$((attempts + 1))
+      (( attempts <= 10 )) || { err "could not generate unique credentials"; return 1; }
+      if [[ "$field" == uuid ]]; then credential=$(rand_uuid) || return 1
+      else credential=$(rand_password) || return 1; fi
+      [[ -n "$credential" ]] || continue
+      if ! jq -e --arg key "$field" --arg value "$credential" '
+        any(.nodes[]; ([.[$key], (.clients // [])[][$key]] | map(select(type == "string"))) |
+          any(.[]; if $key == "uuid" then ascii_downcase == ($value | ascii_downcase) else . == $value end))
+      ' <<<"$data" >/dev/null; then break; fi
+    done
+    data=$(jq --arg id "$node" --arg uid "$uid" --arg key "$field" --arg value "$credential" '
+      (.nodes[] | select(.id == $id)).clients |= ((. // []) + [{user_id:$uid, ($key):$value}])
+    ' <<<"$data") || return 1
+  done < <(jq -r 'unique[]' <<<"$selections")
+  printf '%s\n' "$data" > "$output" || return 1
+  validate_user_metadata "$output"
+}
+
+# A subshell scopes traps. Backups and candidates stay on the target filesystem.
+# Rollback covers detectable failures, not power-loss atomicity across two files.
+apply_user_assignment() (
+  umask 077
+  local tx active=false touched=false committed=false preserve=false
+  [[ -x "$XRAY_BIN" && -f "$XRAY_NODES" && -f "$XRAY_CONF" ]] || {
+    err "installed Xray and existing configuration required"; return 1;
+  }
+  tx=$(mktemp -d "$XRAY_DIR/.users.XXXXXXXX") || return 1
+  user_transaction_cleanup() {
+    local status=$? failed=false
+    trap - EXIT INT TERM HUP
+    if $touched && ! $committed; then
+      cp -p "$tx/nodes.backup" "$XRAY_NODES" || failed=true
+      cp -p "$tx/config.backup" "$XRAY_CONF" || failed=true
+      if $active; then
+        systemctl restart xray && systemctl is-active --quiet xray || failed=true
+      else
+        systemctl stop xray || failed=true
+        if systemctl is-active --quiet xray; then failed=true; fi
+      fi
+      if $failed; then
+        preserve=true
+        err "ROLLBACK FAILED; recovery files retained at $tx"
+      else
+        err "user assignment failed; restored configuration and service state"
+      fi
+      status=1
+    fi
+    if ! $preserve; then rm -rf "$tx"; fi
+    exit "$status"
+  }
+  trap user_transaction_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  prepare_user_assignment "$XRAY_NODES" "$tx/nodes.json" "$1" "$2" "$3" || return 1
+  render_config "$tx/nodes.json" "$tx/config.json" || return 1
+  if ! validate_xray_config "$tx/config.json" "$tx/check.log"; then
+    err "candidate Xray validation failed"; return 1
+  fi
+  cp -p "$XRAY_NODES" "$tx/nodes.backup" || return 1
+  cp -p "$XRAY_CONF" "$tx/config.backup" || return 1
+  # Copy attributes from each original before filling replacement contents.
+  cp -p "$XRAY_NODES" "$tx/nodes.next" && cp -p "$XRAY_CONF" "$tx/config.next" || return 1
+  cat "$tx/nodes.json" > "$tx/nodes.next" && cat "$tx/config.json" > "$tx/config.next" || return 1
+  if systemctl is-active --quiet xray; then active=true; fi
+  touched=true
+  mv -f "$tx/nodes.next" "$XRAY_NODES" || return 1
+  mv -f "$tx/config.next" "$XRAY_CONF" || return 1
+  systemctl restart xray && systemctl is-active --quiet xray || return 1
+  committed=true
+)
+
+show_user_links() {
+  local uid="$1" n rows
+  jq -e --arg uid "$uid" 'any((.users // [])[]; .id == $uid)' "$XRAY_NODES" >/dev/null || { err "unknown user"; return 1; }
+  rows=$(jq -c --arg uid "$uid" '
+    (.users // [] | map(select(.id == $uid)) | first) as $user |
+    .nodes[] | . as $node | (.clients // [])[] | select(.user_id == $uid) |
+    $node + {uuid:.uuid, password:.password, name:($node.name + " / " + $user.name)}
+  ' "$XRAY_NODES") || return 1
+  [[ -n "$rows" ]] || { info "no assigned nodes"; return; }
+  while IFS= read -r n; do
+    if [[ $(jq -r '.enabled' <<<"$n") != true ]]; then warn "disabled node"; fi
+    node_link "$n"
+  done <<<"$rows"
+}
+
+manage_users() {
+  ensure_nodes_file
+  local fixed_node="${1:-}" action uid name selection ids count item
+  while :; do
+    printf '\nConnection users\n1) Create and assign user\n2) Assign existing user\n3) Show user links\n0) Back\n'
+    action=$(ask 'Select')
+    case "$action" in 0|'') return ;; 1|2|3) ;; *) continue ;; esac
+    uid=""; name=""
+    if [[ "$action" == 1 ]]; then
+      name=$(ask 'User name (Enter to cancel)')
+      [[ -n "$name" ]] || continue
+    else
+      jq -r '(.users // []) | to_entries[] | "  \(.key + 1)) \(.value.name)"' "$XRAY_NODES"
+      selection=$(ask 'User number (Enter to cancel)')
+      [[ "$selection" =~ ^[1-9][0-9]*$ && ${#selection} -lt 9 ]] || continue
+      uid=$(jq -r --argjson i "$((selection - 1))" '(.users // [])[$i].id // empty' "$XRAY_NODES")
+      [[ -n "$uid" ]] || continue
+    fi
+    if [[ "$action" == 3 ]]; then show_user_links "$uid"; pause; continue; fi
+    if [[ -n "$fixed_node" ]]; then
+      ids=$(jq -nc --arg id "$fixed_node" '[$id]')
+    else
+      list_nodes
+      selection=$(ask 'Node numbers separated by spaces (Enter to cancel)')
+      [[ -n "$selection" ]] || continue
+      ids='[]'; count=$(node_count)
+      for item in $selection; do
+        if [[ ! "$item" =~ ^[1-9][0-9]*$ || ${#item} -ge 9 ]] || (( item > count )); then ids='[]'; break; fi
+        ids=$(jq -c --argjson ids "$ids" --argjson i "$((item - 1))" '$ids + [.nodes[$i].id]' "$XRAY_NODES")
+      done
+    fi
+    [[ "$ids" != '[]' ]] || { warn "no valid node selection"; continue; }
+    if apply_user_assignment "$uid" "$name" "$ids"; then
+      if [[ -z "$uid" ]]; then
+        uid=$(jq -r --arg name "$name" '($name | gsub("^\\s+|\\s+$"; "")) as $name | .users[] | select(.name == $name) | .id' "$XRAY_NODES")
+      fi
+      ok "connection user assigned"
+      show_user_links "$uid"
+    else err "connection user not applied"; fi
+    pause
+  done
+}
+
 build_reality_inbound() {
-  local n="$1"
+  local n="$1" clients
+  clients=$(node_clients "$n") || return 1
   jq -n \
     --arg tag "$(jq -r '.tag' <<<"$n")" \
     --argjson port "$(jq -r '.port' <<<"$n")" \
-    --arg uuid "$(jq -r '.uuid' <<<"$n")" \
+    --argjson clients "$clients" \
     --arg email "$(jq -r '.tag' <<<"$n")@onevps" \
     --arg sni "$(jq -r '.reality_sni' <<<"$n")" \
     --arg target "$(jq -r '.reality_target' <<<"$n"):$(jq -r '.reality_target_port // 443' <<<"$n")" \
@@ -713,9 +922,7 @@ build_reality_inbound() {
       port: $port,
       protocol: "vless",
       settings: {
-        clients: [
-          {id: $uuid, flow: "xtls-rprx-vision", email: $email}
-        ],
+        clients: $clients,
         decryption: "none"
       },
       streamSettings: {
@@ -741,11 +948,12 @@ build_reality_inbound() {
 # Trojan inbound: listens on loopback only; Caddy terminates TLS on :443 and
 # reverse-proxies the WS path here. No TLS at the Xray layer.
 build_trojan_inbound() {
-  local n="$1"
+  local n="$1" clients
+  clients=$(node_clients "$n") || return 1
   jq -n \
     --arg tag "$(jq -r '.tag' <<<"$n")" \
     --argjson port "$(jq -r '.port' <<<"$n")" \
-    --arg pw "$(jq -r '.password' <<<"$n")" \
+    --argjson clients "$clients" \
     --arg email "$(jq -r '.tag' <<<"$n")@onevps" \
     --arg path "$(jq -r '.ws_path' <<<"$n")" '
     {
@@ -754,7 +962,7 @@ build_trojan_inbound() {
       port: $port,
       protocol: "trojan",
       settings: {
-        clients: [ {password: $pw, email: $email} ]
+        clients: $clients
       },
       streamSettings: {
         network: "ws",
@@ -1110,12 +1318,13 @@ manage_nodes() {
       cat <<EOF
 
   Node actions:
-   1) Reset password
+   1) Reset default password
    2) Change domain
    3) Change WS path
    4) Rebuild Caddy route
    5) Enable/disable
    6) Delete node
+   7) Connection users
    0) Back
 EOF
       case "$(ask 'Select')" in
@@ -1125,6 +1334,7 @@ EOF
         4) rebuild_trojan_route "$id" ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
+        7) manage_users "$id" ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -1133,11 +1343,12 @@ EOF
 
   Node actions:
    1) Change port
-   2) Reset UUID
+   2) Reset default UUID
    3) Rotate Reality keypair / shortId
    4) Change Reality handshake target
    5) Enable/disable
    6) Delete node
+   7) Connection users
    0) Back
 EOF
       case "$(ask 'Select')" in
@@ -1147,6 +1358,7 @@ EOF
         4) edit_reality_target "$id" ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
+        7) manage_users "$id" ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -1184,6 +1396,9 @@ edit_port() {
 reset_uuid() {
   local id="$1" new_uuid
   new_uuid=$(ask_uuid)
+  if jq -e --arg id "$id" --arg value "$new_uuid" 'any(.nodes[] | select(.id == $id) | (.clients // [])[]; (.uuid | ascii_downcase) == ($value | ascii_downcase))' "$XRAY_NODES" >/dev/null; then
+    err "UUID conflicts with a connection user"; pause; return 1
+  fi
   jq_update_nodes --arg id "$id" --arg uuid "$new_uuid" '(.nodes[]|select(.id==$id)).uuid = $uuid'
   rebuild_config && ok "UUID reset" || err "apply failed"
   pause
@@ -1191,7 +1406,7 @@ reset_uuid() {
 
 rotate_reality_secret() {
   local id="$1" pk pubk sid
-  confirm "Rotate Reality keypair and shortId? Old client links will stop working." n || return
+  confirm "Rotate Reality keypair and shortId? Links for ALL users on this node will stop working." n || return
   read -r pk pubk < <(gen_x25519)
   sid=$(rand_short_id)
   jq_update_nodes --arg id "$id" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
@@ -1212,7 +1427,10 @@ edit_reality_target() {
 
 reset_trojan_password() {
   local id="$1" pw
-  pw=$(ask "New password (Enter for random)" "$(rand_password)")
+  pw=$(ask "New default password (Enter for random)" "$(rand_password)")
+  if jq -e --arg id "$id" --arg value "$pw" 'any(.nodes[] | select(.id == $id) | (.clients // [])[]; .password == $value)' "$XRAY_NODES" >/dev/null; then
+    err "password conflicts with a connection user"; pause; return 1
+  fi
   jq_update_nodes --arg id "$id" --arg pw "$pw" \
     '(.nodes[]|select(.id==$id)).password = $pw'
   rebuild_config && ok "password reset" || err "apply failed"
@@ -1854,12 +2072,13 @@ EOF
   2) Add node - VLESS + Reality + Vision + uTLS
   3) Add node - Trojan + WS (behind Caddy)
   4) Manage nodes
-  5) Show all share links
+  5) Show default node share links
   6) Restart service
   7) BBR acceleration
   8) System optimization
   9) Uninstall
   10) Realm relay
+  11) Manage connection users
   0) Exit
 EOF
     case "$(ask 'Select')" in
@@ -1873,6 +2092,7 @@ EOF
       8) optimize_system ;;
       9) uninstall ;;
       10) realm_menu ;;
+      11) manage_users ;;
       0|"") exit 0 ;;
       *) ;;
     esac

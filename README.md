@@ -88,14 +88,46 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 2) Add node - VLESS + Reality + Vision + uTLS
 3) Add node - Trojan + WS (behind Caddy)
 4) Manage nodes
-5) Show all share links
+5) Show default node share links
 6) Restart service
 7) BBR acceleration
 8) System optimization
 9) Uninstall
 10) Realm relay
+11) Manage connection users
 0) Exit
 ```
+
+## Connection users
+
+Use menu `11` to create a named connection user, assign existing nodes, or view that user's links.
+For a single node, choose menu `4`, select the node, then choose `7` (Connection users).
+Both paths can create a new identity or assign an existing identity. Multi-node assignments cover nodes
+managed by this OneVPS installation, not nodes on other VPS hosts.
+
+Each user receives an independent credential on each assigned node: a UUID for VLESS or a password for
+Trojan. Adding another node does not rotate existing credentials, and assigning the same node again does
+not create a duplicate. User names are trimmed, nonempty, and case-sensitive unique. Links are grouped by
+user; disabled nodes are explicitly marked and cannot accept connections until enabled.
+
+The original node UUID or password remains the **default client**. Existing links keep working, and menu
+`5` continues to show only default-client links. Default UUID/password reset actions affect only that client.
+Node-wide changes still affect all users: changing ports, domains, or WS paths changes their connection
+settings; rotating the REALITY keypair or short ID invalidates every user's old link on that node.
+Deleting a node removes its assignments but keeps user identities and their assignments on other nodes.
+An identity with no remaining assignments can be assigned nodes again.
+
+User changes require an installed Xray binary and successful configuration validation. A batch is applied
+with one Xray restart, which may start a previously stopped service. Detected installation or activation
+failures restore the previous metadata/configuration and attempt to restore the previous service state.
+Recovery failures are reported separately; this is not a guarantee against power loss during file replacement.
+Adding users does not change Caddy routes, firewall rules, or listening ports.
+
+Identities and credentials remain in `/usr/local/etc/xray/onevps-nodes.json`; protect this file and printed
+links as secrets. Compatibility covers OneVPS-managed metadata, not manual additions to generated
+`config.json`. Older script versions may omit added users when rebuilding configuration; do not downgrade
+and rebuild if you need to retain their access. This feature does not add subscriptions, quotas, expiry,
+user deletion, or managed-user credential rotation.
 
 ## Realm port relay
 

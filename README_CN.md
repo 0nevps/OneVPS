@@ -81,14 +81,42 @@ bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onev
 2) Add node - VLESS + Reality + Vision + uTLS
 3) Add node - Trojan + WS (behind Caddy)
 4) Manage nodes
-5) Show all share links
+5) Show default node share links
 6) Restart service
 7) BBR acceleration
 8) System optimization
 9) Uninstall
 10) Realm relay
+11) Manage connection users
 0) Exit
 ```
+
+## 连接用户
+
+菜单 `11` 支持创建具名连接用户、分配现有节点和查看该用户的链接。
+单节点操作可选择菜单 `4`，选定节点后进入 `7`（Connection users）。
+两个入口均可创建新身份或分配已有身份。跨节点仅限本 OneVPS 实例管理的节点，不跨 VPS 同步。
+
+同一用户在每个节点获得独立凭据：VLESS 使用 UUID，Trojan 使用密码。
+追加节点不会轮换已有凭据，重复分配同一节点不会新增重复成员。
+用户名去除首尾空白后不能为空，并按区分大小写的方式保持唯一。链接按用户展示；
+禁用节点会明确标识，启用前无法接受连接。
+
+原节点 UUID 或密码保留为**默认用户**，已有链接继续有效；菜单 `5` 仍仅展示默认用户链接。
+默认 UUID／密码重置仅影响默认用户。节点级设置仍影响所有用户：修改端口、域名或 WS 路径会改变
+连接参数；轮换 REALITY 密钥或 short ID 会使该节点所有用户的旧链接失效。
+删除节点会移除该节点的用户分配，但保留用户身份及其在其他节点的分配。
+没有剩余节点的用户身份可以再次分配节点。
+
+用户变更要求已安装 Xray，且候选配置通过校验。一次批量分配只重启一次 Xray，可能启动原本停止的服务。
+检测到文件安装或服务启用失败时，会恢复原元数据和配置，并尝试恢复原服务状态。
+恢复失败会单独报错；这不是文件替换期间断电安全的保证。
+添加用户不会修改 Caddy 路由、防火墙或监听端口。
+
+身份和凭据保存在 `/usr/local/etc/xray/onevps-nodes.json`，请将该文件及输出的链接作为秘密保护。
+兼容性保证针对 OneVPS 管理的元数据，不包含手工添加到生成文件 `config.json` 的内容。
+旧版脚本重新生成配置时可能忽略新增用户；需要保留其访问权限时，不要降级后重新生成配置。
+本功能不包含订阅、配额、到期、用户删除或新增用户凭据轮换。
 
 ## Realm 端口中转
 

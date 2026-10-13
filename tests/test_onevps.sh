@@ -279,4 +279,161 @@ printf 'invalid json\n' > "$candidate"
 assert_false "realm rejects malformed candidate" realm_apply "$candidate"
 assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
 
+# Connection users: retain legacy fixtures and isolate every system effect.
+cp "$FIXTURE" "$XRAY_NODES"
+user_candidate="$TEST_TMP/user-candidate.json"
+assert_true "legacy metadata is valid without migration" validate_user_metadata "$XRAY_NODES"
+assert_true "creates a trimmed Chinese identity on one node" prepare_user_assignment \
+  "$XRAY_NODES" "$user_candidate" '' '  测试用户  ' '["a1b2c3d4"]'
+assert_file_jq "single-node assignment preserves defaults and unknown metadata" "$user_candidate" \
+  '.users[0].name == "测试用户" and (.nodes[0].clients | length == 1) and .nodes[0].uuid == "123e4567-e89b-12d3-a456-426614174000"'
+uid=$(jq -r '.users[0].id' "$user_candidate")
+cp "$user_candidate" "$XRAY_NODES"
+member_uuid=$(jq -r '.nodes[0].clients[0].uuid' "$XRAY_NODES")
+assert_true "appends existing identity across protocols with duplicate selection" prepare_user_assignment \
+  "$XRAY_NODES" "$user_candidate" "$uid" '' '["a1b2c3d4","b2c3d4e5","b2c3d4e5"]'
+assert_file_jq "cross-protocol identity has independent member credentials" "$user_candidate" \
+  '(.users | length == 1) and (.nodes[1].clients | length == 1) and .nodes[0].clients[0].uuid != .nodes[1].clients[0].password'
+assert_eq "repeat assignment never rotates old UUID" "$member_uuid" "$(jq -r '.nodes[0].clients[0].uuid' "$user_candidate")"
+cp "$user_candidate" "$XRAY_NODES"
+assert_true "candidate renderer includes all members" render_config "$user_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "both protocols contain default and member clients" "$TEST_TMP/rendered.json" \
+  'all(.inbounds[]; .settings.clients | length == 2)'
+assert_eq "Reality transport unchanged" "$(jq -c '.streamSettings' <<<"$reality_inbound")" \
+  "$(jq -c '.inbounds[0].streamSettings' "$TEST_TMP/rendered.json")"
+user_links=$(show_user_links "$uid")
+assert_contains "user links include only member UUID" "$user_links" "vless://$member_uuid@"
+assert_contains "Chinese user name encoded in link" "$user_links" '%E6%B5%8B%E8%AF%95%E7%94%A8%E6%88%B7'
+assert_false "user links exclude default password" bash -c '[[ "$1" == *"test%2Bpass%40example"* ]]' _ "$user_links"
+assert_false "unknown user cannot export links" show_user_links missing
+# Exercise cancellation through the actual interactive entry point.
+printf '1\n\n0\n' > "$TEST_TMP/input"
+assert_true "cancelled creation leaves metadata unchanged" bash -c '
+  source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
+  before=$(cksum "$2")
+  exec 3< "$3"
+  ask() { local answer; IFS= read -r answer <&3; printf "%s\\n" "$answer"; }
+  manage_users a1b2c3d4
+  [[ "$before" == "$(cksum "$2")" ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$TEST_TMP/input"
+for selections in '[]' '["missing"]' '["a1b2c3d4","missing"]'; do
+  assert_false "rejects invalid selections $selections" prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' New "$selections"
+done
+assert_false "rejects duplicate trimmed name" prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' ' 测试用户 ' '["a1b2c3d4"]'
+assert_false "rejects blank name" prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' '   ' '["a1b2c3d4"]'
+assert_false "rejects missing identity" prepare_user_assignment "$XRAY_NODES" "$user_candidate" missing '' '["a1b2c3d4"]'
+for mutation in '.users = false' '.users = null' '.nodes[0].clients = false' '.nodes[0].clients = null' \
+  '.nodes[0].clients[0].password = "wrong-protocol"' '.nodes[1].clients[0].uuid = "wrong-protocol"' \
+  '.users += [.users[0]]' '.nodes[0].clients += [.nodes[0].clients[0]]' \
+  '.nodes[0].clients[0].user_id = "missing"' '.nodes[0].clients[0].uuid = (.nodes[0].uuid | ascii_upcase)' \
+  '.nodes[1].clients[0].password = .nodes[1].password'; do
+  jq "$mutation" "$XRAY_NODES" > "$user_candidate"
+  assert_false "rejects invalid membership: $mutation" validate_user_metadata "$user_candidate"
+done
+jq '.nodes[0].enabled = false | .extra = {retained:true} | .settings.block_udp443 = false' "$XRAY_NODES" > "$user_candidate"
+cp "$user_candidate" "$XRAY_NODES"
+assert_contains "disabled user links marked" "$(show_user_links "$uid")" 'disabled node'
+assert_true "disabled nodes retain member data when rendering" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
+assert_file_jq "disabled inbound omitted" "$TEST_TMP/rendered.json" '.inbounds | length == 1'
+jq 'del(.nodes[0])' "$XRAY_NODES" > "$user_candidate"
+assert_true "deleting node leaves valid identity and other memberships" validate_user_metadata "$user_candidate"
+jq '.nodes |= map(del(.clients))' "$XRAY_NODES" > "$user_candidate"
+assert_true "identity without members can be reassigned" prepare_user_assignment "$user_candidate" "$TEST_TMP/reassigned.json" "$uid" '' '["b2c3d4e5"]'
+# Default resets reject conflicts before touching metadata.
+pause() { :; }
+ask_uuid() { printf '%s\n' "$member_uuid"; }
+ask() { jq -r '.nodes[1].clients[0].password' "$XRAY_NODES"; }
+assert_false "default UUID reset rejects member collision" reset_uuid a1b2c3d4
+assert_false "default password reset rejects member collision" reset_trojan_password b2c3d4e5
+
+# Mock executable and service operations; never access host services.
+XRAY_BIN="$TEST_TMP/mock-xray"
+printf '#!/usr/bin/env bash\nif [[ "$1" == uuid ]]; then h=$(openssl rand -hex 16); printf "%%s-%%s-%%s-%%s-%%s\\n" "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"; else exit 0; fi\n' > "$XRAY_BIN"
+chmod +x "$XRAY_BIN"
+MOCK_VALIDATE_FAIL=false
+validate_xray_config() { ! $MOCK_VALIDATE_FAIL; }
+SERVICE_STATE="$TEST_TMP/service-state"
+printf 'active\n' > "$SERVICE_STATE"
+MOCK_SERVICE_MODE=ok
+systemctl() {
+  case "$1" in
+    is-active) [[ $(cat "$SERVICE_STATE") == active ]] ;;
+    restart)
+      if [[ "$MOCK_SERVICE_MODE" == fail ]]; then return 1; fi
+      if [[ "$MOCK_SERVICE_MODE" == once && ! -f "$TEST_TMP/restart-failed" ]]; then
+        touch "$TEST_TMP/restart-failed"; return 1
+      fi
+      if [[ "$MOCK_SERVICE_MODE" == inactive ]]; then printf 'inactive\n' > "$SERVICE_STATE"
+      else printf 'active\n' > "$SERVICE_STATE"; fi ;;
+    stop) printf 'inactive\n' > "$SERVICE_STATE" ;;
+    *) return 1 ;;
+  esac
+}
+render_config "$XRAY_NODES" "$XRAY_CONF"
+chmod 640 "$XRAY_NODES"
+chmod 600 "$XRAY_CONF"
+cp -p "$XRAY_NODES" "$TEST_TMP/before-nodes"
+cp -p "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "transaction applies a new cross-node user" apply_user_assignment '' Other '["a1b2c3d4","b2c3d4e5"]'
+assert_true "transaction preserves original permission modes" bash -c '
+  mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+  [[ $(mode "$1") == 640 && $(mode "$2") == 600 ]]
+' _ "$XRAY_NODES" "$XRAY_CONF"
+assert_file_jq "transaction preserves root unknown fields and settings" "$XRAY_NODES" '.extra.retained and (.settings.block_udp443 | not)'
+assert_file_jq "transaction commits both members" "$XRAY_NODES" 'all(.nodes[0:2][]; .clients | length == 2)'
+cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+cp "$XRAY_CONF" "$TEST_TMP/before-config"
+MOCK_VALIDATE_FAIL=true
+assert_false "validation failure leaves live files untouched" apply_user_assignment '' Bad '["a1b2c3d4"]'
+MOCK_VALIDATE_FAIL=false
+assert_true "validation failure preserves metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+MOCK_SERVICE_MODE=once
+assert_false "restart failure rolls back whole assignment" apply_user_assignment '' Bad '["a1b2c3d4"]'
+assert_true "restart failure restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "restart failure restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_eq "rollback restores active service" active "$(cat "$SERVICE_STATE")"
+MOCK_SERVICE_MODE=inactive
+printf 'inactive\n' > "$SERVICE_STATE"
+assert_false "inactive service after restart causes rollback" apply_user_assignment '' Bad '["b2c3d4e5"]'
+assert_eq "rollback restores stopped service" inactive "$(cat "$SERVICE_STATE")"
+MOCK_SERVICE_MODE=ok
+mv() {
+  if [[ "$*" == *config.next* ]]; then return 1; fi
+  command mv "$@"
+}
+assert_false "second file replacement failure rolls back both files" apply_user_assignment '' Bad '["b2c3d4e5"]'
+unset -f mv
+assert_true "replacement failure restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "replacement failure restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+mv() {
+  command mv "$@" || return 1
+  if [[ "$*" == *nodes.next* ]]; then bash -c 'kill -TERM "$PPID"'; fi
+}
+assert_false "ordinary interruption rolls back replaced metadata" apply_user_assignment '' Interrupted '["b2c3d4e5"]'
+unset -f mv
+assert_true "interruption restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "interruption restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "transaction cleanup removes secret staging directories" bash -c 'shopt -s nullglob; paths=("$1"/.users.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
+printf 'active\n' > "$SERVICE_STATE"
+MOCK_SERVICE_MODE=fail
+assert_false "rollback restart failure is not reported as success" apply_user_assignment '' Bad '["b2c3d4e5"]'
+recovery=$(printf '%s\n' "$XRAY_DIR"/.users.*)
+assert_true "failed rollback retains recovery files" test -f "$recovery/nodes.backup"
+rm -rf "$recovery"
+assert_true "generation rejects repeated credentials without touching source" bash -c '
+  source "$1"
+  fixture="$2"
+  rand_uuid() { jq -r ".nodes[0].uuid" "$fixture"; }
+  before=$(cksum "$2")
+  if prepare_user_assignment "$2" "$3" "" Collision "[\"a1b2c3d4\"]"; then exit 1; fi
+  [[ "$before" == "$(cksum "$2")" ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$user_candidate"
+# Candidate state, not live metadata, owns every rendered member.
+jq '.nodes[1].clients = []' "$XRAY_NODES" > "$user_candidate"
+assert_true "renders isolated candidate snapshot" render_config "$user_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "candidate never mixes old disk memberships" "$TEST_TMP/rendered.json" '.inbounds[0].settings.clients | length == 1'
+assert_false "malformed candidate renderer fails" render_config "$SERVICE_STATE" "$TEST_TMP/rendered.json"
+XRAY_BIN="$TEST_TMP/missing-xray"
+assert_false "user transaction requires Xray binary" apply_user_assignment '' Bad '["b2c3d4e5"]'
+
 printf '# %d tests passed\n' "$TEST_COUNT"
