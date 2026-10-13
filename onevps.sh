@@ -801,12 +801,19 @@ build_proxy_outbound() {
     else error("proxy required") end' <<<"$data"
 }
 
-# Emits only active node proxy outbounds and inbound-tag rules.
+# Identity overrides precede node inheritance; security blocks are prepended by render_config.
 build_outbound_routes() {
-  local source="$1" rows row object tag proxy proxies='[]' rules
-  rows=$(jq -c '
-    .nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws")) |
-    select(.outbound.mode == "proxy") | {tag:("node-out-" + .id),outbound:.outbound}' "$source") || return 1
+  local source="$1" rows row object tag proxy proxies='[]' rules assignments
+  assignments=$(jq -c '
+    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws")) | . as $n |
+      (if has("default_outbound") then
+        {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
+       else empty end),
+      ((.users // [])[] | select(has("outbound")) |
+        ([$n.id,.id]|tojson|@base64) as $key |
+        {tag:("user-out-" + $key),inbound:$n.tag,user:($key + "@onevps-user"),outbound}),
+      (if has("outbound") then {tag:("node-out-" + .id),inbound:.tag,outbound} else empty end)]' "$source") || return 1
+  rows=$(jq -c '.[] | select(.outbound.mode == "proxy")' <<<"$assignments") || return 1
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     tag=$(jq -r '.tag' <<<"$row") || return 1
@@ -814,10 +821,9 @@ build_outbound_routes() {
     proxy=$(build_proxy_outbound "$tag" <<<"$object") || return 1
     proxies=$(printf '%s\n%s\n' "$proxies" "$proxy" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
-  rules=$(jq -c '
-    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws"))] as $nodes |
-    [$nodes[] | select(has("outbound")) | {type:"field",inboundTag:[.tag],
-       outboundTag:(if .outbound.mode == "direct" then "direct" else "node-out-" + .id end)}]' "$source") || return 1
+  rules=$(jq -c '[.[] | {type:"field",inboundTag:[.inbound],
+    outboundTag:(if .outbound.mode == "direct" then "direct" else .tag end)} +
+    (if has("user") then {user:[.user]} else {} end)]' <<<"$assignments") || return 1
   printf '%s\n%s\n' "$proxies" "$rules" | jq -sc '{outbounds:.[0],rules:.[1]}'
 }
 
@@ -902,19 +908,19 @@ rebuild_config() {
   fi
 }
 
-# Render only the node's default credential; legacy membership fields are ignored.
+# Legacy top-level users and node.clients remain ignored.
 node_clients() {
   jq -c '
-    if .type == "vless-reality" then
-      [{id: .uuid, flow: "xtls-rprx-vision", email: (.tag + "@onevps")}]
-    else
-      [{password: .password, email: (.tag + "@onevps")}]
-    end' <<<"$1"
+    . as $n |
+    [{uuid:.uuid,password:.password,email:(.tag + "@onevps")}] +
+      [(.users // [])[] | . + {email:(([ $n.id, .id ] | tojson | @base64) + "@onevps-user")}] |
+    map(if $n.type == "vless-reality" then {id:.uuid,flow:"xtls-rprx-vision",email}
+        else {password,email} end)' <<<"$1"
 }
 
 validate_node_metadata() {
   local outbounds outbound
-  outbounds=$(jq -c '.nodes[] | select(has("outbound")) | .outbound' "$1" 2>/dev/null) || return 1
+  outbounds=$(jq -c '.nodes[] | (select(has("outbound")) | .outbound), (select(has("default_outbound")) | .default_outbound), ((.users // [])[] | select(has("outbound")) | .outbound)' "$1" 2>/dev/null) || return 1
   while IFS= read -r outbound; do
     [[ -n "$outbound" ]] || continue
     validate_outbound <<<"$outbound" || return 1
@@ -924,10 +930,24 @@ validate_node_metadata() {
     (.nodes | type == "array") and
     ([.nodes[].id] | length == (unique | length)) and
     all(.nodes[];
+      . as $n |
       (.id | nonempty) and
-      if .type == "vless-reality" then (.uuid | nonempty)
-      elif .type == "trojan-ws" then (.password | nonempty)
-      else true end)
+      (if .type == "vless-reality" then (.uuid | nonempty)
+       elif .type == "trojan-ws" then (.password | nonempty)
+       else true end) and
+      (if has("users") then (.users | type == "array") else true end) and
+      ((.users // []) as $users |
+        ([$users[].id] | length == (unique | length)) and
+        ([$users[].name] | length == (unique | length)) and
+        all($users[];
+          (.id | type == "string" and test("^[A-Za-z0-9_-]+$") and . != "default") and
+          (.name | type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]") | not)) and
+          (if $n.type == "vless-reality" then
+             (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))
+           elif $n.type == "trojan-ws" then (.password | nonempty)
+           else false end)) and
+        (if .type == "vless-reality" then ([.uuid, $users[].uuid] | map(ascii_downcase))
+         else [.password, $users[].password] end | length == (unique | length))))
   ' "$1" >/dev/null 2>&1
 }
 
@@ -989,15 +1009,27 @@ apply_candidate_transaction() (
 
 # Inherit is a command, never a stored mode. Object travels on stdin.
 prepare_outbound_assignment() {
-  local source="$1" output="$2" id="$3" outbound
+  local source="$1" output="$2" id="$3" scope="${4:-all}" selected="${5:-[]}" outbound
+  [[ "$scope" == all || "$scope" == selected ]] || return 1
+  if [[ "$scope" == selected ]]; then validate_node_selection "$source" "$id" "$selected" || return 1; fi
   outbound=$(jq -c -s -e 'select(length == 1) | .[0]') || return 1
   [[ "$outbound" == '"inherit"' ]] || validate_outbound <<<"$outbound" || return 1
   validate_node_metadata "$source" || return 1
   jq -e --arg id "$id" 'any(.nodes[]; .id == $id)' "$source" >/dev/null || return 1
-  printf '%s\n' "$outbound" | jq --slurpfile source "$source" --arg id "$id" '
+  printf '%s\n' "$outbound" | jq --slurpfile source "$source" --arg id "$id" --arg scope "$scope" --argjson selected "$selected" '
     . as $outbound | $source[0] |
     (.nodes[] | select(.id == $id)) |=
-      if $outbound == "inherit" then del(.outbound) else .outbound = $outbound end' > "$output" || return 1
+      if $scope == "all" then
+        (del(.default_outbound) | if has("users") then .users |= map(del(.outbound)) else . end |
+         if $outbound == "inherit" then del(.outbound) else .outbound = $outbound end)
+      else
+        (if $selected | index("default") then
+           if $outbound == "inherit" then del(.default_outbound) else .default_outbound = $outbound end
+         else . end |
+         if has("users") then .users |= map(.id as $uid | if $selected | index($uid) then
+           if $outbound == "inherit" then del(.outbound) else .outbound = $outbound end
+         else . end) else . end)
+      end' > "$output" || return 1
   validate_node_metadata "$output"
 }
 
@@ -1005,9 +1037,118 @@ apply_outbound_assignment() {
   apply_candidate_transaction prepare_outbound_assignment "$@"
 }
 
+validate_node_selection() {
+  jq -e --arg id "$2" --argjson selected "$3" '
+    .nodes[] | select(.id == $id) |
+    ["default", (.users // [])[].id] as $ids |
+    ($selected | type == "array" and length > 0 and length == (unique|length)) and
+    all($selected[]; . as $id | $ids | index($id) != null)' "$1" >/dev/null 2>&1
+}
+
+# Candidate mutation API: credentials travel on stdin, never external argv.
+prepare_node_user_change() {
+  local source="$1" output="$2" id="$3" action="$4" uid="${5:-}" payload
+  validate_node_metadata "$source" || return 1
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "trojan-ws"))' "$source" >/dev/null || return 1
+  case "$action" in
+    add|reset) payload=$(jq -cse 'select(length == 1) | .[0]') || return 1 ;;
+    delete)
+      [[ "$uid" != default ]] || return 1
+      jq -e --arg id "$id" --arg uid "$uid" '.nodes[] | select(.id == $id) | any((.users // [])[]; .id == $uid)' "$source" >/dev/null || return 1
+      payload=null ;;
+    *) return 1 ;;
+  esac
+  if [[ "$action" == reset ]] && jq -e --arg id "$id" '.nodes[] | select(.id == $id) | .type == "vless-reality"' "$source" >/dev/null; then
+    jq -e 'type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")' <<<"$payload" >/dev/null || return 1
+  fi
+  printf '%s\n' "$payload" | jq --slurpfile source "$source" --arg id "$id" --arg uid "$uid" --arg action "$action" '
+    . as $payload | $source[0] | (.nodes[] | select(.id == $id)) |=
+    if $action == "add" then .users = ((.users // []) + [$payload])
+    elif $action == "delete" then .users |= map(select(.id != $uid))
+    elif .type == "vless-reality" then .uuid = $payload
+    else .password = $payload end' > "$output" || return 1
+  validate_node_metadata "$output"
+}
+
+apply_node_user_change() {
+  apply_candidate_transaction prepare_node_user_change "$@"
+}
+
+node_user_link() {
+  local n="$1" uid="$2" selected
+  if [[ "$uid" == default ]]; then node_link "$n"; return; fi
+  selected=$(jq -ce --arg uid "$uid" '. as $n | (.users // [])[] | select(.id == $uid) |
+    . as $u | $n | .name += (" / " + $u.name) |
+    if .type == "vless-reality" then .uuid = $u.uuid else .password = $u.password end' <<<"$n") || return 1
+  node_link "$selected"
+}
+
+list_node_users() {
+  jq -r '[{id:"default",name:"Default client (reserved; cannot delete)"}] + (.users // []) |
+    to_entries[] | "\(.key + 1)) \(.value.name) [\(.value.id)]"' <<<"$1"
+}
+
+# Number selection is validated as one batch before any transaction.
+pick_node_users() {
+  local n="$1" answer ids
+  list_node_users "$n" >&2
+  ids=$(jq -c '["default", (.users // [])[].id]' <<<"$n") || return 1
+  answer=$(ask 'User numbers (space separated, Enter to cancel)') || return 1
+  printf '%s\n' "$answer" | jq -Rce --argjson ids "$ids" '
+    split(" ") | map(select(length > 0)) as $tokens |
+    if ($tokens|length) > 0 and all($tokens[]; test("^[1-9][0-9]*$")) then
+      $tokens | map(tonumber) |
+      if all(.[]; . <= ($ids|length)) and length == (unique|length) then
+        map($ids[. - 1]) else error("invalid selection") end
+    else error("invalid selection") end' 2>/dev/null
+}
+
+manage_node_users() {
+  local id="$1" n action name uid credential payload selected
+  while :; do
+    n=$(node_by_id "$id") || return 1
+    printf '\nUsers:\n'
+    list_node_users "$n"
+    printf '\nActions:\n1) Add user\n2) Delete user\n3) User share link\n0) Back\n'
+    action=$(ask 'Select')
+    case "$action" in
+      1)
+        name=$(ask 'User name (Enter to cancel)'); [[ -n "$name" ]] || continue
+        uid=$(openssl rand -hex 8) || return 1
+        if [[ $(jq -r '.type' <<<"$n") == vless-reality ]]; then
+          credential=$(rand_uuid) || return 1
+          payload=$(printf '%s\n' "$credential" | jq -Rc --arg id "$uid" --arg name "$name" '{id:$id,name:$name,uuid:.}') || return 1
+        else
+          credential=$(rand_password) || return 1
+          payload=$(printf '%s\n' "$credential" | jq -Rc --arg id "$uid" --arg name "$name" '{id:$id,name:$name,password:.}') || return 1
+        fi
+        apply_node_user_change "$id" add <<<"$payload" || { err 'user not added'; continue; }
+        ok 'user added' ;;
+      2|3)
+        selected=$(pick_node_users "$n") || continue
+        [[ $(jq length <<<"$selected") == 1 ]] || { warn 'select exactly one user'; continue; }
+        uid=$(jq -r '.[0]' <<<"$selected")
+        if [[ "$action" == 3 ]]; then node_user_link "$n" "$uid"; pause; continue; fi
+        [[ "$uid" != default ]] || { warn 'default client cannot be deleted'; continue; }
+        name=$(jq -r --arg uid "$uid" '.users[] | select(.id == $uid) | .name' <<<"$n")
+        confirm "Delete user $name from node $(jq -r '.name' <<<"$n")? Its credential will stop working." n || continue
+        apply_node_user_change "$id" delete "$uid" || { err 'user not deleted'; continue; }
+        ok 'user deleted' ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 manage_outbound() {
-  local id="$1" action link='' outbound
-  info 'Node outbound: applies to traffic entering this node.'
+  local id="$1" action link='' outbound scope selected='[]' n
+  n=$(node_by_id "$id") || return 1
+  printf '1) All users (overwrite every individual outbound)\n2) Selected users\n0) Cancel\n'
+  case "$(ask 'Scope')" in
+    1) scope=all ;;
+    2) scope=selected; selected=$(pick_node_users "$n") || return 0 ;;
+    *) return 0 ;;
+  esac
+  info 'Restore default means inherit for selected users; direct for all users.'
   printf '1) Restore default\n2) Explicit direct\n3) Proxy link\n0) Cancel\n'
   action=$(ask 'Select')
   case "$action" in
@@ -1024,7 +1165,7 @@ manage_outbound() {
   esac
   printf '%s\n' "$outbound" | jq -r 'if . == "inherit" then "Default" elif .mode == "direct" then "Explicit direct" else "\(.protocol) \(.server):\(.port)" end'
   confirm 'Apply outbound setting?' n || return 0
-  if apply_outbound_assignment "$id" <<<"$outbound"; then ok 'outbound applied'
+  if apply_outbound_assignment "$id" "$scope" "$selected" <<<"$outbound"; then ok 'outbound applied'
   else err 'outbound not applied'; return 1; fi
 }
 
@@ -1441,6 +1582,7 @@ manage_nodes() {
    4) Rebuild Caddy route
    5) Enable/disable
    6) Delete node
+   7) Manage node users
    8) Set node outbound
    0) Back
 EOF
@@ -1451,6 +1593,7 @@ EOF
         4) rebuild_trojan_route "$id" ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
+        7) manage_node_users "$id" || true ;;
         8) manage_outbound "$id" || true ;;
         0|"") return ;;
         *) continue ;;
@@ -1465,6 +1608,7 @@ EOF
    4) Change Reality handshake target
    5) Enable/disable
    6) Delete node
+   7) Manage node users
    8) Set node outbound
    0) Back
 EOF
@@ -1475,6 +1619,7 @@ EOF
         4) edit_reality_target "$id" ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
+        7) manage_node_users "$id" || true ;;
         8) manage_outbound "$id" || true ;;
         0|"") return ;;
         *) continue ;;
@@ -1513,8 +1658,8 @@ edit_port() {
 reset_uuid() {
   local id="$1" new_uuid
   new_uuid=$(ask_uuid)
-  jq_update_nodes --arg id "$id" --arg uuid "$new_uuid" '(.nodes[]|select(.id==$id)).uuid = $uuid'
-  rebuild_config && ok "UUID reset" || err "apply failed"
+  printf '%s\n' "$new_uuid" | jq -R . | apply_node_user_change "$id" reset || { err 'apply failed'; return 1; }
+  ok "UUID reset"
   pause
 }
 
@@ -1542,9 +1687,8 @@ edit_reality_target() {
 reset_trojan_password() {
   local id="$1" pw
   pw=$(ask "New default password (Enter for random)" "$(rand_password)")
-  jq_update_nodes --arg id "$id" --arg pw "$pw" \
-    '(.nodes[]|select(.id==$id)).password = $pw'
-  rebuild_config && ok "password reset" || err "apply failed"
+  printf '%s\n' "$pw" | jq -R . | apply_node_user_change "$id" reset || { err 'apply failed'; return 1; }
+  ok "password reset"
   pause
 }
 

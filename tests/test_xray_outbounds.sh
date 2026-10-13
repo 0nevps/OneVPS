@@ -28,13 +28,15 @@ printf '%s\n' "$private_key" "$public_key" | jq -Rn '[inputs]' > "$TEST_TMP/key-
 jq --slurpfile keys "$TEST_TMP/key-values.json" '
   .nodes |= map(if .type == "vless-reality" then
     .reality_private_key = $keys[0][0] | .reality_public_key = $keys[0][1]
-  else . end)
+  else . end) |
+  .nodes[0].users = [{id:"alice",name:"Alice",uuid:"123e4567-e89b-12d3-a456-426614174011"}] |
+  .nodes[1].users = [{id:"alice",name:"Alice",password:"disposable-local-password",outbound:{mode:"direct"}}]
 ' "$ROOT_DIR/tests/fixtures/nodes.json" > "$TEST_TMP/base.json"
 
 check_link() {
   local label="$1" link="$2"
   printf '%s\n' "$link" | parse_outbound_link > "$TEST_TMP/outbound.json"
-  prepare_outbound_assignment "$TEST_TMP/base.json" "$TEST_TMP/node.json" a1b2c3d4 < "$TEST_TMP/outbound.json"
+  prepare_outbound_assignment "$TEST_TMP/base.json" "$TEST_TMP/node.json" a1b2c3d4 selected '["default","alice"]' < "$TEST_TMP/outbound.json"
   render_config "$TEST_TMP/node.json" "$TEST_TMP/config.json"
   if ! "$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1; then
     printf 'not ok - real Xray rejected %s (log: %s)\n' "$label" "$TEST_TMP/check.log" >&2

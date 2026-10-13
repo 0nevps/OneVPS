@@ -99,10 +99,19 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 
 ## Node outbounds
 
-Choose **Set node outbound** (`8`) from a node's management menu to select an explicit
-**Direct** connection, paste one proxy link (hidden input), or restore the default setting.
-The setting applies to that node's default client. Without an explicit setting, traffic retains
-the existing direct behavior.
+Choose **Set node outbound** (`8`) from a node's management menu, select **All users** or
+**Selected users**, then choose an explicit **Direct** connection, paste one proxy link (hidden input),
+or restore the default setting.
+
+- **Selected users:** select one or more users on the current node, including its default client.
+  Only the selected identities change. Restoring the default removes their overrides so they inherit
+  the node outbound again.
+- **All users:** set the node outbound and clear every user override on that node, including the
+  default client's override. Newly added users inherit this outbound too. Restoring the default clears
+  both the node outbound and all user overrides, returning to default direct access.
+- Routing priority is safety blocks, user override, node outbound, then default direct access.
+  An explicit direct override bypasses the node's proxy outbound, but not safety blocks.
+  Operations never change another node's users or outbounds.
 
 Supported links:
 
@@ -150,16 +159,36 @@ XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_xray_outbounds.sh
 CI runs this check with Xray `26.3.27`. Configuration acceptance is not proof of upstream reachability;
 verify traffic through your intended exit separately.
 
-## Compatibility with former connection users
+## Node-local users
 
-Connection-user management and user-level outbound overrides have been removed. Each node now generates
-only its original default client; its UUID or Trojan password, share link, and node outbound are preserved.
-Replacing the script alone does not change the running Xray configuration. **The next configuration rebuild
-and application removes additional connection users and their routing rules, invalidating their links.**
+Use the user management entry in a node's menu to add users, delete users, and display individual
+share links. Users belong only to that node; there are no global accounts or cross-node assignments.
+Different nodes may use the same user name. Each new Reality user gets an independent UUID, and each
+Trojan user gets an independent password. New users inherit the node outbound.
+Names, user IDs, and credentials must be unique within the node; credentials must not collide with
+its default client either.
 
-Legacy `users` and node `clients` metadata fields are retained but ignored, not automatically cleaned up.
-Back up `onevps-nodes.json` and `config.json` before deploying this change. Restoring an older script and
-rebuilding may reactivate those retained users; retaining their metadata does not retain access in new configs.
+The original default client and share link are preserved. This reserved identity cannot be deleted
+through the user menu; its credentials remain managed by the existing node reset options.
+Deleting an added user requires confirmation. After successful application, that user's credentials
+and link no longer grant access, and their dedicated outbound rules are removed without changing other users.
+
+User additions, deletions, and outbound changes use the same candidate validation and transactional
+rollback flow, require an installed Xray binary, and restart the service. User share links contain
+access credentials and should be treated as secrets; they never contain upstream outbound credentials.
+
+### Compatibility with former global users
+
+New node-local users are stored in `.nodes[].users`. Legacy top-level `users` and node `clients`
+fields remain preserved but ignored. They are not automatically migrated, cleaned up, or reactivated.
+Add any users who still need access to their intended node and distribute their new links.
+Replacing the script alone does not change the running Xray configuration. On the next configuration
+rebuild and application, legacy extra clients and their routes are not retained, and their old links
+no longer authorize access.
+
+Back up `onevps-nodes.json` and `config.json` before deployment. Restoring an older script and rebuilding
+may reactivate retained global users while ignoring new node-local users and outbound overrides.
+Do not downgrade to preserve this version's access controls or outbound settings.
 
 ## Realm port relay
 

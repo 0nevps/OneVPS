@@ -306,6 +306,7 @@ done
 assert_true "default credential resets ignore old member collisions" bash -c '
   source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
   secure_xray_files() { :; }; rebuild_config() { :; }; pause() { :; }
+  apply_node_user_change() { jq . >/dev/null; }
   ask_uuid() { jq -r ".nodes[0].clients[0].uuid" "$XRAY_NODES"; }
   ask() { jq -r ".nodes[1].clients[0].password" "$XRAY_NODES"; }
   before=$(jq -c "{users,clients:[.nodes[].clients]}" "$2")
@@ -504,16 +505,16 @@ assert_false "unknown target cannot silently succeed" prepare_outbound_assignmen
 # Actual menu reads a secret silently and cancellation must not write anything.
 assert_true "cancelled outbound menu masks secret and preserves files" bash -c '
   source "$1"; XRAY_NODES="$2"
-  ask() { printf "3\n"; }; confirm() { return 1; }
+  ask() { if [[ "$1" == Scope ]]; then printf "1\n"; else printf "3\n"; fi; }; confirm() { return 1; }
   before=$(cksum "$2")
   output=$(manage_outbound a1b2c3d4 <<<"socks5://secret-user:secret-password@proxy.example:1080" 2>&1)
   [[ "$output" != *secret-user* && "$output" != *secret-password* && "$before" == "$(cksum "$2")" ]]
 ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
-# Both node menus keep option 8; removed options do not dispatch any action.
+# Both node menus expose local user management and outbound settings.
 for node_id in a1b2c3d4 b2c3d4e5; do
-  printf '7\n8\n2\n0\n' > "$TEST_TMP/menu-input"
-  assert_true "node menu $node_id keeps outbound 8 and ignores removed 7" bash -c '
+  printf '8\n1\n2\n0\n' > "$TEST_TMP/menu-input"
+  assert_true "node menu $node_id keeps outbound 8 and local users 7" bash -c '
     source "$1"; XRAY_NODES="$2"; selected="$3"; capture="$5"
     exec 3< "$4"
     ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
@@ -523,7 +524,7 @@ for node_id in a1b2c3d4 b2c3d4e5; do
     before=$(cksum "$2")
     output=$(manage_nodes)
     [[ "$output" == *"8) Set node outbound"* && "$output" != *"Connection users"* &&
-       "$(command cat "$capture")" == "$selected"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
+       "$(command cat "$capture")" == "$selected all []"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
   ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
 printf '11\n0\n' > "$TEST_TMP/menu-input"
@@ -582,5 +583,75 @@ assert_true "rebuild does not echo core validation secrets" bash -c '
   output=$(rebuild_config 2>&1) && exit 1
   [[ "$output" != *SECRET_CORE_OUTPUT* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
+
+# Node-local identities, scoped routing, batch selection, and transactions.
+cp "$FIXTURE" "$XRAY_NODES"
+render_config "$XRAY_NODES" "$XRAY_CONF"
+user_a='{"id":"alice","name":"Alice","uuid":"123e4567-e89b-12d3-a456-426614174011"}'
+user_b='{"id":"bob","name":"Bob","uuid":"123e4567-e89b-12d3-a456-426614174012"}'
+assert_true "add Reality user transaction" apply_node_user_change a1b2c3d4 add <<<"$user_a"
+assert_true "add second Reality user transaction" apply_node_user_change a1b2c3d4 add <<<"$user_b"
+assert_true "same user ID and name are independent across nodes" apply_node_user_change b2c3d4e5 add <<<'{"id":"alice","name":"Alice","password":"user+secret"}'
+assert_file_jq "both protocols retain default and add clients" "$XRAY_CONF" '.inbounds[0].settings.clients|length == 3'
+assert_contains "Reality user link uses independent credential" "$(node_user_link "$(node_by_id a1b2c3d4)" alice)" 'vless://123e4567-e89b-12d3-a456-426614174011@'
+assert_contains "Trojan user link encodes independent password" "$(node_user_link "$(node_by_id b2c3d4e5)" alice)" 'trojan://user%2Bsecret@'
+for mutation in '.nodes[0].users=null' '.nodes[0].users[0].id="default"' '.nodes[0].users[0].id="bad id"' '.nodes[0].users[0].name=" "' '.nodes[0].users[1].id="alice"' '.nodes[0].users[1].name="Alice"' '.nodes[0].users[0].uuid=.nodes[0].uuid' '.nodes[0].users[0].uuid="bad"' '.nodes[1].users[0].password=.nodes[1].password' '.nodes[0].default_outbound=null' '.nodes[0].users[0].outbound=null'; do
+  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
+  assert_false "reject invalid local user metadata $mutation" validate_node_metadata "$node_candidate"
+done
+assert_false "duplicate user addition rejected" apply_node_user_change a1b2c3d4 add <<<"$user_a"
+assert_false "default cannot be deleted" apply_node_user_change a1b2c3d4 delete default
+assert_false "unknown user cannot be deleted" apply_node_user_change a1b2c3d4 delete missing
+assert_false "default reset rejects local credential collision" apply_node_user_change a1b2c3d4 reset <<<'"123e4567-e89b-12d3-a456-426614174011"'
+assert_false "Trojan reset rejects local credential collision" apply_node_user_change b2c3d4e5 reset <<<'"user+secret"'
+assert_true "set inherited node proxy for all identities" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
+assert_true "selected batch sets default and Alice only" apply_outbound_assignment a1b2c3d4 selected '["default","alice"]' <<<"$second_proxy"
+assert_file_jq "default override does not change node inheritance" "$XRAY_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
+assert_file_jq "security blocks precede scoped identity routes and fallback" "$XRAY_CONF" 'all(.routing.rules[0:3][]; .outboundTag == "block") and .routing.rules[3].user == [.inbounds[0].settings.clients[0].email] and .routing.rules[4].user == [.inbounds[0].settings.clients[1].email] and all(.routing.rules[3:5][]; .inboundTag == ["reality-a1b2c3d4"]) and (.routing.rules[5]|has("user")|not)'
+for selected in '[]' '["missing"]' '["alice","missing"]' '["alice","alice"]' 'null'; do
+  assert_false "invalid selection is rejected as a batch $selected" apply_outbound_assignment a1b2c3d4 selected "$selected" <<<'{"mode":"direct"}'
+done
+assert_true "explicit direct overrides inherited proxy" apply_outbound_assignment a1b2c3d4 selected '["alice"]' <<<'{"mode":"direct"}'
+assert_true "restore selected inheritance" apply_outbound_assignment a1b2c3d4 selected '["alice"]' <<<'"inherit"'
+assert_file_jq "restore selected preserves default override" "$XRAY_NODES" '(.nodes[0].users[0]|has("outbound")|not) and .nodes[0].default_outbound.mode == "proxy"'
+other=$(jq -c '.nodes[1]' "$XRAY_NODES")
+assert_true "all users clears every override" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
+assert_file_jq "all clears default and individual overrides" "$XRAY_NODES" '(.nodes[0]|has("default_outbound")|not) and all(.nodes[0].users[]; has("outbound")|not)'
+assert_eq "other node unchanged by all users" "$other" "$(jq -c '.nodes[1]' "$XRAY_NODES")"
+assert_true "future user inherits node outbound" apply_node_user_change a1b2c3d4 add <<<'{"id":"future","name":"Future","uuid":"123e4567-e89b-12d3-a456-426614174013"}'
+assert_true "new user can receive dedicated outbound" apply_outbound_assignment a1b2c3d4 selected '["future"]' <<<"$second_proxy"
+assert_true "deleting user removes credential and proxy" apply_node_user_change a1b2c3d4 delete future
+assert_file_jq "deleted user leaves no runtime proxy or client" "$XRAY_CONF" '(.inbounds[0].settings.clients|length)==3 and (.outbounds|length)==3'
+jq '.nodes[0].enabled=false' "$XRAY_NODES" > "$node_candidate"
+render_config "$node_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "disabled node emits no local identities or outbounds" "$TEST_TMP/rendered.json" '(.inbounds|length)==1 and (.outbounds|length)==2'
+cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+cp "$XRAY_CONF" "$TEST_TMP/before-config"
+MOCK_VALIDATE_FAIL=true
+assert_false "user deletion validation failure is atomic" apply_node_user_change a1b2c3d4 delete alice
+MOCK_VALIDATE_FAIL=false
+rm -f "$TEST_TMP/restart-failed"
+MOCK_SERVICE_MODE=once
+assert_false "user deletion restart failure rolls back" apply_node_user_change a1b2c3d4 delete alice
+assert_true "user rollback restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "user rollback restores runtime" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+MOCK_SERVICE_MODE=ok
+# Drive the actual menus with only service/core operations stubbed above.
+(
+  ask() { local answer; IFS= read -r answer || return 1; printf '%s\n' "$answer"; }
+  confirm() { return 0; }; pause() { :; }
+  for id in a1b2c3d4 b2c3d4e5; do
+    manage_node_users "$id" <<<$'1\nMenu user\n0' >/dev/null
+    count=$(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|(.users|length)+1' "$XRAY_NODES")
+    manage_node_users "$id" <<<"$(printf '3\n%s\n0\n' "$count")" > "$TEST_TMP/menu-link"
+    command grep -q 'Menu%20user' "$TEST_TMP/menu-link" || exit 1
+    manage_outbound "$id" <<<$'2\n1 2\n2' >/dev/null
+    jq -e --arg id "$id" '.nodes[]|select(.id==$id)|.default_outbound.mode=="direct" and .users[0].outbound.mode=="direct"' "$XRAY_NODES" >/dev/null || exit 1
+    manage_outbound "$id" <<<$'1\n1' >/dev/null
+    manage_node_users "$id" <<<"$(printf '2\n%s\n0\n' "$count")" >/dev/null
+  done
+) || fail 'real node user and outbound menus'
+pass 'real menus add/link/select multiple/all/delete on both protocols'
+assert_file_jq "menu deletion preserves other users and removes all overrides" "$XRAY_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
 
 printf '# %d tests passed\n' "$TEST_COUNT"
