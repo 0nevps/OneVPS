@@ -622,10 +622,215 @@ mktemp_json() {
   echo "${t}.json"
 }
 
+# Decode a URI component exactly once; '+' is not a form-space.
+# Keep secret-bearing data in shell variables/stdin, never external argv.
+outbound_decode() {
+  local rest="$1" out='' char hex
+  while [[ -n "$rest" ]]; do
+    char=${rest:0:1}; rest=${rest:1}
+    if [[ "$char" == '%' ]]; then
+      hex=${rest:0:2}
+      [[ "$hex" =~ ^[0-9a-fA-F]{2}$ ]] || return 1
+      [[ "$hex" != 00 ]] || return 1
+      printf -v char '%b' "\\x$hex"
+      rest=${rest:2}
+    fi
+    [[ "$char" != [[:cntrl:]] ]] || return 1
+    out+="$char"
+  done
+  printf '%s' "$out"
+}
+
+# SIP002 base64url userinfo. Canonical re-encoding detects bad padding/bits.
+outbound_base64() {
+  local encoded="$1" bare normalized decoded check
+  [[ "$encoded" =~ ^[A-Za-z0-9_-]+={0,2}$ ]] || return 1
+  bare=${encoded%%=*}
+  (( ${#bare} % 4 != 1 )) || return 1
+  normalized=${bare//-/+}; normalized=${normalized//_/\/}
+  while (( ${#normalized} % 4 )); do normalized+='='; done
+  [[ "$encoded" != *=* || ${#encoded} == "${#normalized}" ]] || return 1
+  # JSON checks decoded bytes before Bash command substitution can strip NUL/LF.
+  decoded=$(printf '%s' "$normalized" | openssl base64 -d -A | jq -Rs -e '
+    select(length > 0 and (test("[\\x00-\\x1f\\x7f]") | not))') || return 1
+  check=$(printf '%s' "$decoded" | jq -jr '.' | openssl base64 -A) || return 1
+  [[ "$check" == "$normalized" ]] || return 1
+  printf '%s' "$decoded" | jq -jr '.'
+}
+
+# Strict, limited persistent schema. Revalidated on every render, including
+# disabled nodes and users with no assignments. No arbitrary Xray JSON accepted.
+validate_outbound() {
+  local data host
+  data=$(jq -cs -e '
+    def text: type == "string" and (test("[\\x00-\\x1f\\x7f]") | not);
+    def nonempty: text and length > 0;
+    def keys_only($allowed): (keys - $allowed | length) == 0;
+    def uuid: type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+    select(length == 1) | .[0] | select(type == "object") |
+    select(if .mode == "direct" then keys == ["mode"]
+    elif .mode == "proxy" then
+      (.server | nonempty) and (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+      if .protocol == "shadowsocks" then
+        keys_only(["mode","protocol","server","port","method","password"]) and
+        (.method == "aes-128-gcm" or .method == "aes-256-gcm" or .method == "chacha20-ietf-poly1305") and (.password | nonempty)
+      elif .protocol == "socks" then
+        keys_only(["mode","protocol","server","port","username","password"]) and
+        (if has("username") or has("password") then (.username | nonempty) and (.password | nonempty) else true end)
+      elif .protocol == "vless" then
+        keys_only(["mode","protocol","server","port","uuid","params"]) and (.uuid | uuid) and
+        (.params | type == "object" and
+          keys_only(["encryption","type","security","flow","sni","fp","pbk","sid","spx","host","path","serviceName","mode","alpn"]) and
+          all(.[]; text) and .encryption == "none" and
+          (.type == "tcp" or .type == "ws" or .type == "grpc") and
+          (.flow == "" or (.flow == "xtls-rprx-vision" and .type == "tcp")) and
+          (if has("sni") then (.sni | nonempty and test("^[A-Za-z0-9.-]+$")) else true end) and
+          (if has("fp") then (.fp | IN("chrome","firefox","safari","ios","android","edge","360","qq","random","randomized")) else true end) and
+          (if has("alpn") then (.alpn | test("^(h2|http/1\\.1)(,(h2|http/1\\.1))*$")) else true end) and
+          (if .security == "reality" then
+             .type == "tcp" and (.sni | nonempty) and (.fp | nonempty) and
+             (.pbk | type == "string" and test("^[A-Za-z0-9_-]{43}$")) and
+             (.sid | type == "string" and test("^([0-9a-fA-F]{2}){0,8}$")) and
+             (has("alpn") | not) and
+             (if has("spx") then (.spx | startswith("/")) else true end)
+           elif .security == "tls" then (has("pbk") or has("sid") or has("spx") | not)
+           else false end) and
+          (if .type == "ws" then
+             (has("serviceName") or has("mode") | not) and
+             (if has("path") then (.path | startswith("/")) else true end) and
+             (if has("host") then (.host | nonempty and test("^[A-Za-z0-9.:-]+$")) else true end)
+           elif .type == "grpc" then
+             (has("host") or has("path") | not) and
+             (if has("mode") then (.mode == "gun" or .mode == "multi") else true end) and
+             (if has("serviceName") then (.serviceName | nonempty) else true end)
+           else (has("host") or has("path") or has("serviceName") or has("mode") | not) end))
+      else false end
+    else false end)
+  ' 2>/dev/null) || return 1
+  host=$(jq -r '.server // empty' <<<"$data") || return 1
+  [[ -z "$host" ]] || realm_valid_host "$host"
+}
+
+parse_outbound_link() {
+  local link rest scheme authority query='' fragment='' auth='' host port key value pair params='{}' data credential method password user
+  IFS= read -r link || [[ -n "$link" ]] || return 1
+  [[ -n "$link" && "$link" != *[[:space:]]* && "$link" != *[[:cntrl:]]* ]] || return 1
+  # Exactly one URI; never silently discard a second line.
+  if IFS= read -r rest || [[ -n "$rest" ]]; then return 1; fi
+  [[ "$link" == *://* ]] || return 1
+  scheme=${link%%://*}; rest=${link#*://}
+  case "$scheme" in ss|vless|socks5) ;; *) return 1 ;; esac
+  if [[ "$rest" == *'#'* ]]; then fragment=${rest#*#}; rest=${rest%%#*}; outbound_decode "$fragment" >/dev/null || return 1; fi
+  if [[ "$rest" == *'?'* ]]; then query=${rest#*\?}; rest=${rest%%\?*}; [[ -n "$query" ]] || return 1; fi
+  authority=$rest
+  # SIP002 permits an optional slash after the authority, but no path.
+  if [[ "$scheme" == ss && "$authority" == */ ]]; then authority=${authority%/}; fi
+  [[ "$authority" != */* ]] || return 1
+  if [[ "$authority" == *@* ]]; then
+    auth=${authority%@*}; authority=${authority##*@}
+    [[ -n "$auth" && "$auth" != *@* ]] || return 1
+  fi
+  if [[ "$authority" == '['* ]]; then
+    [[ "$authority" == *']:'* ]] || return 1
+    host=${authority%%]*}; host=${host#\[}; port=${authority#*]:}
+    [[ "$host" == *:* ]] || return 1
+  else
+    [[ "$authority" == *:* ]] || return 1
+    host=${authority%:*}; port=${authority##*:}
+    [[ "$host" != *:* ]] || return 1
+  fi
+  realm_valid_host "$host" && realm_valid_port "$port" || return 1
+  data=$(printf '%s\n' "$host" "$port" | jq -Rsc 'split("\n") | {mode:"proxy",server:.[0],port:(.[1]|tonumber)}') || return 1
+  case "$scheme" in
+    ss)
+      [[ -z "$query" && -n "$auth" ]] || return 1
+      if [[ "$auth" == *:* ]]; then
+        method=$(outbound_decode "${auth%%:*}") && password=$(outbound_decode "${auth#*:}") || return 1
+      else
+        credential=$(outbound_base64 "$auth") || return 1
+        [[ "$credential" == *:* ]] || return 1
+        method=${credential%%:*}; password=${credential#*:}
+      fi
+      data=$(printf '%s\n%s\n%s\n' "$data" "$method" "$password" | jq -Rsc 'split("\n") | (.[0]|fromjson) + {protocol:"shadowsocks",method:.[1],password:.[2]}') || return 1 ;;
+    socks5)
+      [[ -z "$query" ]] || return 1
+      data=$(jq -c '. + {protocol:"socks"}' <<<"$data") || return 1
+      if [[ -n "$auth" ]]; then
+        [[ "$auth" == *:* ]] || return 1
+        user=$(outbound_decode "${auth%%:*}") && password=$(outbound_decode "${auth#*:}") || return 1
+        data=$(printf '%s\n%s\n%s\n' "$data" "$user" "$password" | jq -Rsc 'split("\n") | (.[0]|fromjson) + {username:.[1],password:.[2]}') || return 1
+      fi ;;
+    vless)
+      credential=$(outbound_decode "$auth") || return 1
+      [[ -n "$query" ]] || return 1
+      while :; do
+        pair=${query%%&*}; [[ "$pair" == *=* ]] || return 1
+        key=$(outbound_decode "${pair%%=*}") && value=$(outbound_decode "${pair#*=}") || return 1
+        case "$key" in encryption|type|security|flow|sni|fp|pbk|sid|spx|host|path|serviceName|mode|alpn) ;; *) return 1 ;; esac
+        params=$(printf '%s\n%s\n%s\n' "$params" "$key" "$value" | jq -Rsc -e 'split("\n") | .[1] as $k | .[2] as $v | (.[0]|fromjson) | select(has($k)|not) | . + {($k):$v}') || return 1
+        [[ "$query" == *'&'* ]] || break
+        query=${query#*&}
+      done
+      params=$(jq -c '{encryption:"none",type:"tcp",flow:""} + .' <<<"$params") || return 1
+      data=$(printf '%s\n%s\n%s\n' "$data" "$credential" "$params" | jq -Rsc 'split("\n") | (.[0]|fromjson) + {protocol:"vless",uuid:.[1],params:(.[2]|fromjson)}') || return 1 ;;
+  esac
+  validate_outbound <<<"$data" || return 1
+  printf '%s\n' "$data"
+}
+
+build_proxy_outbound() {
+  local tag="$1" data
+  data=$(jq -c '.') || return 1
+  validate_outbound <<<"$data" || return 1
+  jq -c --arg tag "$tag" '
+    {tag:$tag,protocol:.protocol} +
+    if .protocol == "shadowsocks" then {settings:{servers:[{address:.server,port:.port,method:.method,password:.password}]}}
+    elif .protocol == "socks" then {settings:{servers:[({address:.server,port:.port} +
+      if has("username") then {users:[{user:.username,pass:.password}]} else {} end)]}}
+    elif .protocol == "vless" then
+      .params as $p | {settings:{vnext:[{address:.server,port:.port,users:[{id:.uuid,encryption:"none",flow:$p.flow}]}]},
+      streamSettings:({network:$p.type,security:$p.security} +
+        (if $p.security == "reality" then {realitySettings:({serverName:$p.sni,fingerprint:$p.fp,publicKey:$p.pbk,shortId:$p.sid} + if $p|has("spx") then {spiderX:$p.spx} else {} end)}
+         else {tlsSettings:({allowInsecure:false} +
+           (if $p|has("sni") then {serverName:$p.sni} else {} end) +
+           (if $p|has("fp") then {fingerprint:$p.fp} else {} end) +
+           (if $p|has("alpn") then {alpn:($p.alpn|split(","))} else {} end))} end) +
+        (if $p.type == "ws" then {wsSettings:({path:($p.path // "/")} + if $p|has("host") then {host:$p.host} else {} end)}
+         elif $p.type == "grpc" then {grpcSettings:{serviceName:($p.serviceName // ""),multiMode:($p.mode == "multi")}}
+         else {} end))}
+    else error("proxy required") end' <<<"$data"
+}
+
+# Emits only active proxy outbounds and ordered user/node rules.
+build_outbound_routes() {
+  local source="$1" rows row object tag proxy proxies='[]' rules
+  rows=$(jq -c '
+    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws"))] as $nodes |
+    [(($nodes[]) | select(.outbound.mode == "proxy") | {tag:("node-out-" + .id),outbound:.outbound}),
+     ((.users // [])[] | . as $u | select(.outbound.mode == "proxy" and any($nodes[]; any((.clients // [])[]; .user_id == $u.id))) |
+       {tag:("user-out-" + .id),outbound:.outbound})][]' "$source") || return 1
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    tag=$(jq -r '.tag' <<<"$row") || return 1
+    object=$(jq -c '.outbound' <<<"$row") || return 1
+    proxy=$(build_proxy_outbound "$tag" <<<"$object") || return 1
+    proxies=$(printf '%s\n%s\n' "$proxies" "$proxy" | jq -sc '.[0] + [.[1]]') || return 1
+  done <<<"$rows"
+  rules=$(jq -c '
+    . as $data | [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws"))] as $nodes |
+    [$nodes[] | . as $n | (.clients // [])[] | . as $c | ($data.users // [])[] |
+      select(.id == $c.user_id and has("outbound")) |
+      {type:"field",inboundTag:[$n.tag],user:[($n.id + "/" + .id + "@onevps-user")],
+       outboundTag:(if .outbound.mode == "direct" then "direct" else "user-out-" + .id end)}] +
+    [$nodes[] | select(has("outbound")) | {type:"field",inboundTag:[.tag],
+       outboundTag:(if .outbound.mode == "direct" then "direct" else "node-out-" + .id end)}]' "$source") || return 1
+  printf '%s\n%s\n' "$proxies" "$rules" | jq -sc '{outbounds:.[0],rules:.[1]}'
+}
+
 render_config() {
   local source="$1" output="$2"
   validate_user_metadata "$source" || { err "invalid user metadata"; return 1; }
-  local inbounds n enabled type ib block_udp443 rows
+  local inbounds n enabled type ib block_udp443 rows routes
   rows=$(jq -c '.nodes[]' "$source") || return 1
   inbounds='[]'
   while IFS= read -r n; do
@@ -638,7 +843,7 @@ render_config() {
       trojan-ws)     ib=$(build_trojan_inbound "$n") || return 1 ;;
       *) continue ;;
     esac
-    inbounds=$(jq -c --argjson x "$ib" '. + [$x]' <<<"$inbounds") || return 1
+    inbounds=$(printf '%s\n%s\n' "$inbounds" "$ib" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
   block_udp443=$(jq -r '
     if ((.settings | type) == "object" and (.settings | has("block_udp443"))) then
@@ -648,7 +853,9 @@ render_config() {
     end' "$source" 2>/dev/null || echo true)
   [[ "$block_udp443" == "false" ]] || block_udp443=true
 
-  jq -n --argjson inbounds "$inbounds" --argjson block_udp443 "$block_udp443" '
+  routes=$(build_outbound_routes "$source") || return 1
+  printf '%s\n%s\n' "$inbounds" "$routes" | jq -s --argjson block_udp443 "$block_udp443" '
+    .[0] as $inbounds | .[1] as $routes |
     def private_ip_rule: {
       type: "field",
       ip: [
@@ -665,13 +872,13 @@ render_config() {
     {
       log: {loglevel: "warning"},
       inbounds: $inbounds,
-      outbounds: [
+      outbounds: ([
         {tag: "direct", protocol: "freedom", settings: {domainStrategy: "UseIP"}},
         {tag: "block", protocol: "blackhole", settings: {}}
-      ],
+      ] + $routes.outbounds),
       routing: {
         domainStrategy: "AsIs",
-        rules: ([private_ip_rule, bittorrent_rule] + (if $block_udp443 then [udp443_rule] else [] end))
+        rules: ([private_ip_rule, bittorrent_rule] + (if $block_udp443 then [udp443_rule] else [] end) + $routes.rules)
       },
       policy: {
         levels: {
@@ -688,8 +895,7 @@ rebuild_config() {
   render_config "$XRAY_NODES" "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
   chk_err=$(mktemp)
   if ! validate_xray_config "$tmp_conf" "$chk_err"; then
-    err "generated config failed validation:"
-    cat "$chk_err" >&2
+    err "generated config failed validation (details withheld to protect credentials)"
     rm -f "$tmp_conf" "$chk_err"
     return 1
   fi
@@ -716,6 +922,12 @@ node_clients() {
 }
 
 validate_user_metadata() {
+  local outbounds outbound
+  outbounds=$(jq -c '[.nodes[], (.users // [])[]] | .[] | select(has("outbound")) | .outbound' "$1" 2>/dev/null) || return 1
+  while IFS= read -r outbound; do
+    [[ -n "$outbound" ]] || continue
+    validate_outbound <<<"$outbound" || return 1
+  done <<<"$outbounds"
   jq -e '
     def nonempty: type == "string" and length > 0;
     def unique_values: length == (unique | length);
@@ -794,7 +1006,9 @@ prepare_user_assignment() {
 
 # A subshell scopes traps. Backups and candidates stay on the target filesystem.
 # Rollback covers detectable failures, not power-loss atomicity across two files.
-apply_user_assignment() (
+apply_candidate_transaction() (
+  local prepare="$1"
+  shift
   umask 077
   local tx active=false touched=false committed=false preserve=false
   [[ -x "$XRAY_BIN" && -f "$XRAY_NODES" && -f "$XRAY_CONF" ]] || {
@@ -817,7 +1031,7 @@ apply_user_assignment() (
         preserve=true
         err "ROLLBACK FAILED; recovery files retained at $tx"
       else
-        err "user assignment failed; restored configuration and service state"
+        err "candidate update failed; restored configuration and service state"
       fi
       status=1
     fi
@@ -828,7 +1042,7 @@ apply_user_assignment() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
-  prepare_user_assignment "$XRAY_NODES" "$tx/nodes.json" "$1" "$2" "$3" || return 1
+  "$prepare" "$XRAY_NODES" "$tx/nodes.json" "$@" || return 1
   render_config "$tx/nodes.json" "$tx/config.json" || return 1
   if ! validate_xray_config "$tx/config.json" "$tx/check.log"; then
     err "candidate Xray validation failed"; return 1
@@ -845,6 +1059,54 @@ apply_user_assignment() (
   systemctl restart xray && systemctl is-active --quiet xray || return 1
   committed=true
 )
+
+apply_user_assignment() {
+  apply_candidate_transaction prepare_user_assignment "$@"
+}
+
+# Inherit is a command, never a stored mode. Object travels on stdin.
+prepare_outbound_assignment() {
+  local source="$1" output="$2" scope="$3" id="$4" outbound
+  [[ "$scope" == nodes || "$scope" == users ]] || return 1
+  outbound=$(jq -c -s -e 'select(length == 1) | .[0]') || return 1
+  [[ "$outbound" == '"inherit"' ]] || validate_outbound <<<"$outbound" || return 1
+  validate_user_metadata "$source" || return 1
+  jq -e --arg scope "$scope" --arg id "$id" 'any((.[$scope] // [])[]; .id == $id)' "$source" >/dev/null || return 1
+  printf '%s\n' "$outbound" | jq --slurpfile source "$source" --arg scope "$scope" --arg id "$id" '
+    . as $outbound | $source[0] |
+    (.[$scope][] | select(.id == $id)) |=
+      if $outbound == "inherit" then del(.outbound) else .outbound = $outbound end' > "$output" || return 1
+  validate_user_metadata "$output"
+}
+
+apply_outbound_assignment() {
+  apply_candidate_transaction prepare_outbound_assignment "$@"
+}
+
+manage_outbound() {
+  local scope="$1" id="$2" action link='' outbound
+  if [[ "$scope" == users ]]; then
+    info 'Global user outbound: affects all current and future assigned nodes on this instance.'
+  else info 'Node outbound: default credentials and users inheriting this node.'; fi
+  printf '1) Restore default / inherit\n2) Explicit direct\n3) Proxy link\n0) Cancel\n'
+  action=$(ask 'Select')
+  case "$action" in
+    1) outbound='"inherit"' ;;
+    2) outbound='{"mode":"direct"}' ;;
+    3)
+      printf 'Proxy link (hidden, Enter to cancel): ' >&2
+      IFS= read -r -s link || return 1
+      printf '\n' >&2
+      [[ -n "$link" ]] || return 0
+      outbound=$(printf '%s\n' "$link" | parse_outbound_link) || { err 'invalid or unsupported proxy link'; return 1; }
+      link='' ;;
+    *) return 0 ;;
+  esac
+  printf '%s\n' "$outbound" | jq -r 'if . == "inherit" then "Default / inherit" elif .mode == "direct" then "Explicit direct" else "\(.protocol) \(.server):\(.port)" end'
+  confirm 'Apply outbound setting?' n || return 0
+  if apply_outbound_assignment "$scope" "$id" <<<"$outbound"; then ok 'outbound applied'
+  else err 'outbound not applied'; return 1; fi
+}
 
 show_user_links() {
   local uid="$1" n rows
@@ -865,9 +1127,9 @@ manage_users() {
   ensure_nodes_file
   local fixed_node="${1:-}" action uid name selection ids count item
   while :; do
-    printf '\nConnection users\n1) Create and assign user\n2) Assign existing user\n3) Show user links\n0) Back\n'
+    printf '\nConnection users\n1) Create and assign user\n2) Assign existing user\n3) Show user links\n4) Set global user outbound\n0) Back\n'
     action=$(ask 'Select')
-    case "$action" in 0|'') return ;; 1|2|3) ;; *) continue ;; esac
+    case "$action" in 0|'') return ;; 1|2|3|4) ;; *) continue ;; esac
     uid=""; name=""
     if [[ "$action" == 1 ]]; then
       name=$(ask 'User name (Enter to cancel)')
@@ -879,6 +1141,7 @@ manage_users() {
       uid=$(jq -r --argjson i "$((selection - 1))" '(.users // [])[$i].id // empty' "$XRAY_NODES")
       [[ -n "$uid" ]] || continue
     fi
+    if [[ "$action" == 4 ]]; then manage_outbound users "$uid" || true; pause; continue; fi
     if [[ "$action" == 3 ]]; then show_user_links "$uid"; pause; continue; fi
     if [[ -n "$fixed_node" ]]; then
       ids=$(jq -nc --arg id "$fixed_node" '[$id]')
@@ -907,15 +1170,11 @@ manage_users() {
 build_reality_inbound() {
   local n="$1" clients
   clients=$(node_clients "$n") || return 1
-  jq -n \
-    --arg tag "$(jq -r '.tag' <<<"$n")" \
-    --argjson port "$(jq -r '.port' <<<"$n")" \
-    --argjson clients "$clients" \
-    --arg email "$(jq -r '.tag' <<<"$n")@onevps" \
-    --arg sni "$(jq -r '.reality_sni' <<<"$n")" \
-    --arg target "$(jq -r '.reality_target' <<<"$n"):$(jq -r '.reality_target_port // 443' <<<"$n")" \
-    --arg pk "$(jq -r '.reality_private_key' <<<"$n")" \
-    --arg sid "$(jq -r '.reality_short_id' <<<"$n")" '
+  printf '%s\n%s\n' "$n" "$clients" | jq -s '
+    .[0] as $n | .[1] as $clients |
+    $n.tag as $tag | $n.port as $port | $n.reality_sni as $sni |
+    ($n.reality_target + ":" + (($n.reality_target_port // 443)|tostring)) as $target |
+    $n.reality_private_key as $pk | $n.reality_short_id as $sid |
     {
       tag: $tag,
       listen: "0.0.0.0",
@@ -950,12 +1209,9 @@ build_reality_inbound() {
 build_trojan_inbound() {
   local n="$1" clients
   clients=$(node_clients "$n") || return 1
-  jq -n \
-    --arg tag "$(jq -r '.tag' <<<"$n")" \
-    --argjson port "$(jq -r '.port' <<<"$n")" \
-    --argjson clients "$clients" \
-    --arg email "$(jq -r '.tag' <<<"$n")@onevps" \
-    --arg path "$(jq -r '.ws_path' <<<"$n")" '
+  printf '%s\n%s\n' "$n" "$clients" | jq -s '
+    .[0] as $n | .[1] as $clients |
+    $n.tag as $tag | $n.port as $port | $n.ws_path as $path |
     {
       tag: $tag,
       listen: "127.0.0.1",
@@ -1325,6 +1581,7 @@ manage_nodes() {
    5) Enable/disable
    6) Delete node
    7) Connection users
+   8) Set node outbound
    0) Back
 EOF
       case "$(ask 'Select')" in
@@ -1335,6 +1592,7 @@ EOF
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
         7) manage_users "$id" ;;
+        8) manage_outbound nodes "$id" || true ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -1349,6 +1607,7 @@ EOF
    5) Enable/disable
    6) Delete node
    7) Connection users
+   8) Set node outbound
    0) Back
 EOF
       case "$(ask 'Select')" in
@@ -1359,6 +1618,7 @@ EOF
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
         7) manage_users "$id" ;;
+        8) manage_outbound nodes "$id" || true ;;
         0|"") return ;;
         *) continue ;;
       esac

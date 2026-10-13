@@ -436,4 +436,169 @@ assert_false "malformed candidate renderer fails" render_config "$SERVICE_STATE"
 XRAY_BIN="$TEST_TMP/missing-xray"
 assert_false "user transaction requires Xray binary" apply_user_assignment '' Bad '["b2c3d4e5"]'
 
+# Outbound links: exercise the public stdin interface, never pass secrets to jq argv.
+parse_test_link() { printf '%s\n' "$1" | parse_outbound_link; }
+uuid='123e4567-e89b-12d3-a456-426614174000'
+for method in aes-128-gcm aes-256-gcm chacha20-ietf-poly1305; do
+  encoded=$(printf '%s' "$method:secret+:%password" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+  parsed=$(parse_test_link "ss://$encoded@[2001:db8::1]:443/#remark")
+  assert_jq "SIP002 $method preserves encoded credentials and IPv6" "$parsed" '.password == "secret+:%password" and .server == "2001:db8::1"'
+  assert_jq "SS builds upstream server" "$(build_proxy_outbound test <<<"$parsed")" '.protocol == "shadowsocks" and .settings.servers[0].port == 443'
+done
+parsed=$(parse_test_link 'ss://aes-128-gcm:secret%40%3A%25+@proxy.example:443')
+assert_jq "plain SIP002 decodes once and preserves plus" "$parsed" '.password == "secret@:%+"'
+parsed=$(parse_test_link 'socks5://user%3Aname:p%40ss%3A%25+@[::1]:1080#test')
+assert_jq "SOCKS percent auth round trip" "$(build_proxy_outbound socks-test <<<"$parsed")" '.settings.servers[0].users == [{user:"user:name",pass:"p@ss:%+"}]'
+assert_jq "SOCKS anonymous has no users" "$(parse_test_link 'socks5://localhost:1080' | build_proxy_outbound test)" '.settings.servers[0] | has("users") | not'
+for network in tcp ws grpc; do
+  extra=''
+  case "$network" in ws) extra='&host=cdn.example&path=%2Fws%3Fed%3D2048' ;; grpc) extra='&serviceName=service&mode=multi' ;; esac
+  parsed=$(parse_test_link "vless://$uuid@proxy.example:443?security=tls&type=$network&sni=proxy.example&fp=chrome&alpn=h2,http%2F1.1$extra")
+  assert_jq "VLESS TLS $network builds transport" "$(build_proxy_outbound test <<<"$parsed")" ".streamSettings.network == \"$network\" and .streamSettings.tlsSettings.allowInsecure == false"
+done
+parsed=$(parse_test_link "vless://$uuid@proxy.example:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef&spx=%2F&type=tcp")
+assert_jq "imports current Vision Reality link shape" "$(build_proxy_outbound test <<<"$parsed")" '.streamSettings.realitySettings.spiderX == "/" and .settings.vnext[0].users[0].flow == "xtls-rprx-vision"'
+for bad in \
+  'ss://aes-128-gcm:pw@example.com:443?plugin=obfs' \
+  'ss://2022-blake3-aes-128-gcm:pw@example.com:443' \
+  'ss://aes-128-gcm:%00@example.com:443' \
+  'ss://aes-128-gcm:%0A@example.com:443' \
+  'ss://aes-128-gcm:%GG@example.com:443' \
+  'ss://YWVzLTEyOC1nY206cHc===@example.com:443' \
+  'ss://YWVzLTEyOC1nY206cHcA@example.com:443' \
+  'socks5://user:@example.com:1080' 'socks5://a@b@example.com:1080' \
+  'socks5://example.com:0' 'socks5://example.com:65536' 'socks5://example.com:080' \
+  'socks5://999.1.1.1:80' 'socks5://2001:db8::1:80' 'socks5://example.com:80/path' \
+  'socks5://example.com:80?unknown=1' 'socks5://example.com:80#bad%0a' \
+  "vless://$uuid@example.com:443?security=tls&security=tls" \
+  "vless://$uuid@example.com:443?security=tls&unknown=1" \
+  "vless://$uuid@example.com:443?security=tls&allowInsecure=1" \
+  "vless://$uuid@example.com:443?security=none" \
+  "vless://$uuid@example.com:443?security=tls&type=xhttp" \
+  "vless://$uuid@example.com:443?security=tls&type=ws&flow=xtls-rprx-vision" \
+  "vless://$uuid@example.com:443?security=tls&type=tcp&path=%2F" \
+  "vless://$uuid@example.com:443?security=reality" \
+  "vless://$uuid@example.com:443?security=tls&type=grpc&mode=unknown" \
+  "vless://$uuid@example.com:443?security=tls&pbk=unused" \
+  "vless://$uuid@example.com:443?security=tls&"; do
+  assert_false "rejects unsupported or malformed link" parse_test_link "$bad"
+done
+assert_false "rejects multiline input" parse_test_link $'socks5://example.com:1080\nsocks5://other.example:1080'
+# Every saved field, including inactive entities, must validate.
+for invalid in 'null' '[]' '{"mode":"inherit"}' '{"mode":"direct","extra":1}' \
+  '{"mode":"proxy","protocol":"socks","server":"example.com","port":1080,"password":"pw"}' \
+  '{"mode":"proxy","protocol":"socks","server":"example.com","port":1080,"username":"a\n","password":"b"}'; do
+  assert_false "rejects invalid normalized outbound" validate_outbound <<<"$invalid"
+done
+cp "$FIXTURE" "$XRAY_NODES"
+prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' Routed '["a1b2c3d4","b2c3d4e5"]'
+cp "$user_candidate" "$XRAY_NODES"
+uid=$(jq -r '.users[0].id' "$XRAY_NODES")
+node_proxy=$(parse_test_link 'socks5://node.example:1080')
+user_proxy=$(parse_test_link 'ss://aes-256-gcm:secret@user.example:443')
+assert_true "prepare node outbound does not alter live source" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" nodes a1b2c3d4 <<<"$node_proxy"
+assert_file_jq "live node remains without outbound" "$XRAY_NODES" '.nodes[0] | has("outbound") | not'
+cp "$user_candidate" "$XRAY_NODES"
+assert_true "prepare global user proxy" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users "$uid" <<<"$user_proxy"
+render_config "$user_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "direct remains first and security blocks precede overrides" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and .routing.rules[0].outboundTag == "block" and .routing.rules[2].outboundTag == "block" and .routing.rules[3].user != null'
+assert_file_jq "one user outbound is shared across node-specific rules" "$TEST_TMP/rendered.json" '[.outbounds[]|select(.tag|startswith("user-out-"))]|length == 1'
+assert_file_jq "user rules precede node fallback for default credentials" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 6 and (.routing.rules[3:5]|all(.[]; .user|length == 1)) and .routing.rules[5].outboundTag == "node-out-a1b2c3d4" and (.routing.rules[5]|has("user")|not)'
+cp "$user_candidate" "$XRAY_NODES"
+assert_true "explicit user direct overrides node proxy" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users "$uid" <<<'{"mode":"direct"}'
+render_config "$user_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "direct users retain explicit overrides" "$TEST_TMP/rendered.json" '.routing.rules[3].outboundTag == "direct" and (.outbounds|length) == 3'
+cp "$user_candidate" "$XRAY_NODES"
+prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users "$uid" <<<'"inherit"'
+render_config "$user_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "inherit removes saved field and user rules" "$user_candidate" '.users[0]|has("outbound")|not'
+assert_file_jq "inherit uses node fallback" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 4 and .routing.rules[3].outboundTag == "node-out-a1b2c3d4"'
+jq '.nodes[0].enabled=false' "$user_candidate" > "$TEST_TMP/disabled.json"
+render_config "$TEST_TMP/disabled.json" "$TEST_TMP/rendered.json"
+assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 3 and (.outbounds|length) == 2'
+jq '.nodes[0].outbound=null' "$TEST_TMP/disabled.json" > "$TEST_TMP/invalid.json"
+assert_false "disabled node cannot hide corrupt outbound" render_config "$TEST_TMP/invalid.json" "$TEST_TMP/rendered.json"
+prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' Added '["a1b2c3d4"]'
+assert_file_jq "adding users preserves node and user outbound" "$user_candidate" '.nodes[0].outbound.protocol == "socks" and .users[0].outbound.mode == "direct"'
+# No outbound settings produce exactly the legacy two outbounds / three blocks.
+render_config "$FIXTURE" "$TEST_TMP/legacy.json"
+assert_file_jq "legacy render has no extra routes or outbounds" "$TEST_TMP/legacy.json" '(.routing.rules|length) == 3 and (.outbounds|length) == 2'
+# Shared transaction is exercised again with actual outbound candidates.
+XRAY_BIN="$TEST_TMP/mock-xray"
+MOCK_SERVICE_MODE=ok
+MOCK_VALIDATE_FAIL=false
+render_config "$XRAY_NODES" "$XRAY_CONF"
+assert_true "outbound transaction commits proxy to both files" apply_outbound_assignment users "$uid" <<<"$user_proxy"
+assert_file_jq "committed config contains user proxy" "$XRAY_CONF" 'any(.outbounds[]; .protocol == "shadowsocks")'
+cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+cp "$XRAY_CONF" "$TEST_TMP/before-config"
+MOCK_VALIDATE_FAIL=true
+assert_false "outbound core validation failure leaves live data unchanged" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+MOCK_VALIDATE_FAIL=false
+assert_true "outbound failed validation preserves metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+rm -f "$TEST_TMP/restart-failed"
+MOCK_SERVICE_MODE=once
+assert_false "outbound failed restart rolls back" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_true "outbound rollback restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound rollback restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+MOCK_SERVICE_MODE=ok
+mv() { if [[ "$*" == *config.next* ]]; then return 1; fi; command mv "$@"; }
+assert_false "outbound replacement failure rolls back" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+unset -f mv
+assert_true "outbound replacement restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound staging directories cleaned" bash -c 'shopt -s nullglob; paths=("$1"/.users.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
+assert_false "unknown target cannot silently succeed" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users missing <<<'{"mode":"direct"}'
+# Actual menu reads a secret silently and cancellation must not write anything.
+assert_true "cancelled outbound menu masks secret and preserves files" bash -c '
+  source "$1"; XRAY_NODES="$2"
+  ask() { printf "3\n"; }; confirm() { return 1; }
+  before=$(cksum "$2")
+  output=$(manage_outbound nodes a1b2c3d4 <<<"socks5://secret-user:secret-password@proxy.example:1080" 2>&1)
+  [[ "$output" != *secret-user* && "$output" != *secret-password* && "$before" == "$(cksum "$2")" ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
+
+MOCK_SERVICE_MODE=inactive
+printf 'inactive\n' > "$SERVICE_STATE"
+assert_false "outbound inactive restart rolls back stopped state" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_eq "outbound rollback keeps stopped service stopped" inactive "$(cat "$SERVICE_STATE")"
+MOCK_SERVICE_MODE=ok
+mv() {
+  command mv "$@" || return 1
+  if [[ "$*" == *nodes.next* ]]; then bash -c 'kill -TERM "$PPID"'; fi
+}
+assert_false "outbound signal after replacement rolls back" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+unset -f mv
+assert_true "outbound signal restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound signal restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+printf 'active\n' > "$SERVICE_STATE"
+MOCK_SERVICE_MODE=fail
+assert_false "outbound failed recovery preserves backups" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+recovery=$(printf '%s\n' "$XRAY_DIR"/.users.*)
+assert_true "outbound failed rollback keeps recovery metadata" test -f "$recovery/nodes.backup"
+assert_true "outbound recovery is private" bash -c '
+  mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+  [[ $(mode "$1") == 700 && $(mode "$1/nodes.json") == 600 ]]
+' _ "$recovery"
+rm -rf "$recovery"
+MOCK_SERVICE_MODE=ok
+assert_false "multiple JSON objects cannot bypass normalized validator" validate_outbound <<<'{"mode":"direct"} {"mode":"direct"}'
+# Capture jq/openssl argv around real parsing, rendering and assignment.
+# Only IDs, paths and filters may travel in external arguments.
+assert_true "outbound secrets never occur in external jq or openssl argv" bash -c '
+  source "$1"; XRAY_NODES="$2"; capture="$3"; output="$4"
+  jq() { printf "%s\n" "$@" >> "$capture"; command jq "$@"; }
+  openssl() { printf "%s\n" "$@" >> "$capture"; command openssl "$@"; }
+  proxy=$(printf "%s\n" "socks5://SECRET_USERNAME:SECRET_PASSWORD@proxy.example:1080" | parse_outbound_link)
+  prepare_outbound_assignment "$XRAY_NODES" "$output" nodes a1b2c3d4 <<<"$proxy"
+  render_config "$output" "$output.config"
+  ! command grep -q "SECRET_USERNAME\|SECRET_PASSWORD" "$capture"
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$TEST_TMP/argv" "$TEST_TMP/secret-candidate"
+# Validation logs are deliberately withheld even when the core prints a secret.
+assert_true "rebuild does not echo core validation secrets" bash -c '
+  source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
+  validate_xray_config() { printf "SECRET_CORE_OUTPUT\n" > "$2"; return 1; }
+  output=$(rebuild_config 2>&1) && exit 1
+  [[ "$output" != *SECRET_CORE_OUTPUT* ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
+
 printf '# %d tests passed\n' "$TEST_COUNT"

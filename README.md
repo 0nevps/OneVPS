@@ -129,6 +129,59 @@ links as secrets. Compatibility covers OneVPS-managed metadata, not manual addit
 and rebuild if you need to retain their access. This feature does not add subscriptions, quotas, expiry,
 user deletion, or managed-user credential rotation.
 
+## Node and user outbounds
+
+Choose **Set node outbound** (`8`) from a node's management menu, or **Set global user outbound** (`4`)
+from the connection-user menu. Choose an explicit
+**Direct** connection, paste one proxy link (hidden input), or restore the default/inherited setting.
+A user's explicit setting takes precedence over its node's setting. User settings apply to every assigned
+node in this installation, including future assignments; the original default client follows its node.
+An explicit user **Direct** setting overrides a node proxy, while restoring inheritance follows that proxy.
+Without either setting, traffic retains the existing direct behavior.
+
+Supported links:
+
+- **Shadowsocks:** SIP002 with `aes-128-gcm`, `aes-256-gcm`, or `chacha20-ietf-poly1305`;
+  Base64URL `method:password` userinfo or percent-encoded plain userinfo.
+  SS2022, plugins, and legacy whole-link Base64 encoding are not supported.
+- **VLESS:** TCP + Reality, or TCP / WebSocket / gRPC + TLS. This includes OneVPS-generated
+  TCP + Reality + Vision links. Unsupported transports, encryption options, and insecure TLS options
+  are rejected rather than silently ignored.
+- **SOCKS5:** `socks5://host:port` or `socks5://username:password@host:port`.
+  Percent-encode reserved characters in credentials. `socks://` and `socks5h://` are not supported.
+
+VLESS parameters are limited to `encryption`, `type`, `security`, `flow`, `sni`, `fp`, `pbk`, `sid`,
+`spx`, `host`, `path`, `serviceName`, `mode`, and `alpn`, and must fit the selected transport.
+Reality requires `sni`, `fp`, `pbk`, and `sid`; TLS does not accept Reality-only fields.
+`type` defaults to `tcp`, `encryption` to `none`, and `flow` to empty. Vision is TCP-only;
+gRPC `mode` accepts `gun` or `multi`. `alpn` accepts `h2` and/or `http/1.1` for TLS.
+WebSocket `path` is a literal path, not an early-data configuration. Unknown or duplicate keys are rejected.
+
+All formats accept a hostname, IPv4, or bracketed IPv6 address, an explicit port, and an optional `#name`.
+For example, `socks5://test:example%3Apassword@proxy.example.com:1080#Example` uses fictional credentials.
+Only one link is accepted; this is not a subscription importer or an arbitrary Xray JSON editor.
+
+Existing private-address, BitTorrent, and optional UDP/443 blocks run **before** outbound selection.
+Proxy failure does not automatically fall back to direct access. SOCKS5 does not encrypt traffic or
+credentials; use it only over a trusted/protected path. UDP availability depends on the upstream protocol
+and server, not merely on a valid link.
+
+Changes are validated with the installed Xray binary before activation and use the same backup, restart,
+and rollback behavior as user assignment. Invalid links or failed validation leave the active files untouched.
+Normalized proxy settings contain secrets in the metadata, generated configuration, and any recovery backups;
+protect these files. Upstream credentials are not added to client share links. Older scripts may ignore
+outbound settings and restore direct routing when rebuilding; do not downgrade and rebuild if the selected
+exit must be preserved.
+
+The independent core check requires a real binary and fails if it is missing:
+
+```bash
+XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_xray_outbounds.sh
+```
+
+CI runs this check with Xray `26.3.27`. Configuration acceptance is not proof of upstream reachability;
+verify traffic through your intended exit separately.
+
 ## Realm port relay
 
 Choose menu `10`, then `1` to install realm and add a relay without installing Xray.

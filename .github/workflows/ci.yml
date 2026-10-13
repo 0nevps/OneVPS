@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh tests/test_onevps.sh
+        run: bash -n onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh
 
       - name: Install test dependencies
         run: |
@@ -31,10 +31,23 @@ jobs:
           sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh
+        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh
 
       - name: Test configuration generation
         run: bash tests/test_onevps.sh
+
+      - name: Validate outbounds with Xray 26.3.27
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip \
+            -o "$work/xray.zip"
+          printf '%s  %s\n' \
+            23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae \
+            "$work/xray.zip" | sha256sum --check -
+          unzip -q "$work/xray.zip" -d "$work/core"
+          XRAY_TEST_BIN="$work/core/xray" bash tests/test_xray_outbounds.sh
 
       - name: Lint Markdown
         run: npx --yes markdownlint-cli2@0.23.2 "**/*.md"

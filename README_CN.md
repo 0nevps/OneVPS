@@ -118,6 +118,51 @@ bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onev
 旧版脚本重新生成配置时可能忽略新增用户；需要保留其访问权限时，不要降级后重新生成配置。
 本功能不包含订阅、配额、到期、用户删除或新增用户凭据轮换。
 
+## 节点与用户出站
+
+在单节点管理菜单中选择 `8`（Set node outbound），或在连接用户菜单中选择 `4`（Set global user outbound），
+可设置显式**直连**、粘贴一条代理链接
+（输入不回显），或恢复默认／继承设置。
+用户显式配置优先于节点配置，作用于本实例中该用户已分配及以后追加的所有节点；原节点默认凭据遵循节点配置。
+用户显式直连可以覆盖节点代理，恢复继承则重新使用节点代理。两级均未配置时，保持原有直连行为。
+
+支持的链接：
+
+- **Shadowsocks：** SIP002，支持 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`；
+  userinfo 可以是 Base64URL 编码的 `method:password`，或分别进行百分号编码的明文形式。
+  不支持 SS2022、插件或旧式整条链接 Base64 编码。
+- **VLESS：** TCP + Reality，以及 TCP / WebSocket / gRPC + TLS，包含 OneVPS 自身生成的
+  TCP + Reality + Vision 链接。不支持的传输、加密选项和不安全 TLS 选项会明确拒绝，不会静默忽略。
+- **SOCKS5：** `socks5://host:port` 或 `socks5://username:password@host:port`。
+  凭据中的保留字符需要百分号编码；不支持 `socks://` 和 `socks5h://`。
+
+VLESS 参数白名单为 `encryption`、`type`、`security`、`flow`、`sni`、`fp`、`pbk`、`sid`、
+`spx`、`host`、`path`、`serviceName`、`mode`、`alpn`，并须与所选传输匹配。
+Reality 必须提供 `sni`、`fp`、`pbk`、`sid`；TLS 不接受 Reality 专用字段。
+`type` 默认为 `tcp`，`encryption` 默认为 `none`，`flow` 默认为空。Vision 仅限 TCP；
+gRPC 的 `mode` 支持 `gun` 或 `multi`；TLS 的 `alpn` 支持 `h2` 和／或 `http/1.1`。
+WebSocket 的 `path` 按字面路径处理，不作为 early-data 配置。未知或重复参数会拒绝。
+
+上述格式支持域名、IPv4、方括号 IPv6、显式端口及可选 `#备注`。
+例如 `socks5://test:example%3Apassword@proxy.example.com:1080#Example` 使用虚构测试凭据。
+每次仅导入一条链接，不支持订阅或任意 Xray JSON 编辑。
+
+原有私网、BitTorrent 和可选 UDP/443 阻断规则**优先于**出站选择。代理失败不会自动回退直连。
+SOCKS5 不加密流量或凭据，请仅通过可信或受保护的链路使用；UDP 是否可用还取决于上游协议和服务端，
+不能仅凭链接合法就保证可用。
+
+变更先由已安装的 Xray 校验，再按用户分配相同的备份、重启和回滚流程应用。非法链接或校验失败不会修改在线文件。
+规范化代理配置仍包含秘密，元数据、生成配置及恢复备份均须妥善保护；上游凭据不会附加到客户端分享链接。
+旧版脚本可能忽略出站配置并在重新生成时恢复直连；需要保留指定出口时，不要降级后重新生成配置。
+
+独立内核检查必须指定真实二进制，缺少二进制会失败：
+
+```bash
+XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_xray_outbounds.sh
+```
+
+CI 使用 Xray `26.3.27` 执行此检查。配置通过不代表上游可达，仍需单独验证流量确实经过预期出口。
+
 ## Realm 端口中转
 
 选择菜单 `10`，再选择 `1`，即可安装 realm 并添加中转，无需先安装 Xray。
