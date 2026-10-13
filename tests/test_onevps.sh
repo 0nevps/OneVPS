@@ -279,72 +279,39 @@ printf 'invalid json\n' > "$candidate"
 assert_false "realm rejects malformed candidate" realm_apply "$candidate"
 assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
 
-# Connection users: retain legacy fixtures and isolate every system effect.
+# Legacy connection-user fields are preserved, but never validated or rendered.
 cp "$FIXTURE" "$XRAY_NODES"
-user_candidate="$TEST_TMP/user-candidate.json"
-assert_true "legacy metadata is valid without migration" validate_user_metadata "$XRAY_NODES"
-assert_true "creates a trimmed Chinese identity on one node" prepare_user_assignment \
-  "$XRAY_NODES" "$user_candidate" '' '  测试用户  ' '["a1b2c3d4"]'
-assert_file_jq "single-node assignment preserves defaults and unknown metadata" "$user_candidate" \
-  '.users[0].name == "测试用户" and (.nodes[0].clients | length == 1) and .nodes[0].uuid == "123e4567-e89b-12d3-a456-426614174000"'
-uid=$(jq -r '.users[0].id' "$user_candidate")
-cp "$user_candidate" "$XRAY_NODES"
-member_uuid=$(jq -r '.nodes[0].clients[0].uuid' "$XRAY_NODES")
-assert_true "appends existing identity across protocols with duplicate selection" prepare_user_assignment \
-  "$XRAY_NODES" "$user_candidate" "$uid" '' '["a1b2c3d4","b2c3d4e5","b2c3d4e5"]'
-assert_file_jq "cross-protocol identity has independent member credentials" "$user_candidate" \
-  '(.users | length == 1) and (.nodes[1].clients | length == 1) and .nodes[0].clients[0].uuid != .nodes[1].clients[0].password'
-assert_eq "repeat assignment never rotates old UUID" "$member_uuid" "$(jq -r '.nodes[0].clients[0].uuid' "$user_candidate")"
-cp "$user_candidate" "$XRAY_NODES"
-assert_true "candidate renderer includes all members" render_config "$user_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "both protocols contain default and member clients" "$TEST_TMP/rendered.json" \
-  'all(.inbounds[]; .settings.clients | length == 2)'
+node_candidate="$TEST_TMP/node-candidate.json"
+jq '.users = [{id:"old",outbound:{mode:"proxy",protocol:"invalid"}}] |
+    .nodes[0].clients = [{user_id:"old",uuid:.nodes[0].uuid}] |
+    .nodes[1].clients = [{user_id:"old",password:.nodes[1].password}] |
+    .extra = {retained:true} | .settings.block_udp443 = false' "$FIXTURE" > "$XRAY_NODES"
+assert_true "legacy fields do not require migration" validate_node_metadata "$XRAY_NODES"
+assert_true "legacy members do not affect rendering" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
+assert_file_jq "each enabled node keeps only its default client" "$TEST_TMP/rendered.json" \
+  'all(.inbounds[]; .settings.clients | length == 1) and .inbounds[0].settings.clients[0].id == "123e4567-e89b-12d3-a456-426614174000" and .inbounds[1].settings.clients[0].password == "test+pass@example"'
+assert_file_jq "legacy users emit no proxies or user routes" "$TEST_TMP/rendered.json" \
+  '(.outbounds|length) == 2 and all(.routing.rules[]; has("user")|not)'
 assert_eq "Reality transport unchanged" "$(jq -c '.streamSettings' <<<"$reality_inbound")" \
   "$(jq -c '.inbounds[0].streamSettings' "$TEST_TMP/rendered.json")"
-user_links=$(show_user_links "$uid")
-assert_contains "user links include only member UUID" "$user_links" "vless://$member_uuid@"
-assert_contains "Chinese user name encoded in link" "$user_links" '%E6%B5%8B%E8%AF%95%E7%94%A8%E6%88%B7'
-assert_false "user links exclude default password" bash -c '[[ "$1" == *"test%2Bpass%40example"* ]]' _ "$user_links"
-assert_false "unknown user cannot export links" show_user_links missing
-# Exercise cancellation through the actual interactive entry point.
-printf '1\n\n0\n' > "$TEST_TMP/input"
-assert_true "cancelled creation leaves metadata unchanged" bash -c '
+for mutation in '.users = false' '.users = null' '.users = "obsolete"' '.nodes[0].clients = false' '.nodes[0].clients = null' '.nodes[1].clients = {invalid:true}'; do
+  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
+  assert_true "ignores obsolete metadata: $mutation" render_config "$node_candidate" "$TEST_TMP/rendered.json"
+done
+for mutation in '.nodes = null' '.nodes[0].id = ""' '.nodes[1].id = .nodes[0].id' '.nodes[0].uuid = null' '.nodes[1].password = ""'; do
+  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
+  assert_false "rejects invalid node metadata: $mutation" validate_node_metadata "$node_candidate"
+done
+# Default resets no longer consult legacy members and preserve their metadata.
+assert_true "default credential resets ignore old member collisions" bash -c '
   source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
-  before=$(cksum "$2")
-  exec 3< "$3"
-  ask() { local answer; IFS= read -r answer <&3; printf "%s\\n" "$answer"; }
-  manage_users a1b2c3d4
-  [[ "$before" == "$(cksum "$2")" ]]
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$TEST_TMP/input"
-for selections in '[]' '["missing"]' '["a1b2c3d4","missing"]'; do
-  assert_false "rejects invalid selections $selections" prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' New "$selections"
-done
-assert_false "rejects duplicate trimmed name" prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' ' 测试用户 ' '["a1b2c3d4"]'
-assert_false "rejects blank name" prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' '   ' '["a1b2c3d4"]'
-assert_false "rejects missing identity" prepare_user_assignment "$XRAY_NODES" "$user_candidate" missing '' '["a1b2c3d4"]'
-for mutation in '.users = false' '.users = null' '.nodes[0].clients = false' '.nodes[0].clients = null' \
-  '.nodes[0].clients[0].password = "wrong-protocol"' '.nodes[1].clients[0].uuid = "wrong-protocol"' \
-  '.users += [.users[0]]' '.nodes[0].clients += [.nodes[0].clients[0]]' \
-  '.nodes[0].clients[0].user_id = "missing"' '.nodes[0].clients[0].uuid = (.nodes[0].uuid | ascii_upcase)' \
-  '.nodes[1].clients[0].password = .nodes[1].password'; do
-  jq "$mutation" "$XRAY_NODES" > "$user_candidate"
-  assert_false "rejects invalid membership: $mutation" validate_user_metadata "$user_candidate"
-done
-jq '.nodes[0].enabled = false | .extra = {retained:true} | .settings.block_udp443 = false' "$XRAY_NODES" > "$user_candidate"
-cp "$user_candidate" "$XRAY_NODES"
-assert_contains "disabled user links marked" "$(show_user_links "$uid")" 'disabled node'
-assert_true "disabled nodes retain member data when rendering" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
-assert_file_jq "disabled inbound omitted" "$TEST_TMP/rendered.json" '.inbounds | length == 1'
-jq 'del(.nodes[0])' "$XRAY_NODES" > "$user_candidate"
-assert_true "deleting node leaves valid identity and other memberships" validate_user_metadata "$user_candidate"
-jq '.nodes |= map(del(.clients))' "$XRAY_NODES" > "$user_candidate"
-assert_true "identity without members can be reassigned" prepare_user_assignment "$user_candidate" "$TEST_TMP/reassigned.json" "$uid" '' '["b2c3d4e5"]'
-# Default resets reject conflicts before touching metadata.
-pause() { :; }
-ask_uuid() { printf '%s\n' "$member_uuid"; }
-ask() { jq -r '.nodes[1].clients[0].password' "$XRAY_NODES"; }
-assert_false "default UUID reset rejects member collision" reset_uuid a1b2c3d4
-assert_false "default password reset rejects member collision" reset_trojan_password b2c3d4e5
+  secure_xray_files() { :; }; rebuild_config() { :; }; pause() { :; }
+  ask_uuid() { jq -r ".nodes[0].clients[0].uuid" "$XRAY_NODES"; }
+  ask() { jq -r ".nodes[1].clients[0].password" "$XRAY_NODES"; }
+  before=$(jq -c "{users,clients:[.nodes[].clients]}" "$2")
+  reset_uuid a1b2c3d4 && reset_trojan_password b2c3d4e5 &&
+  [[ "$before" == "$(jq -c "{users,clients:[.nodes[].clients]}" "$2")" ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
 # Mock executable and service operations; never access host services.
 XRAY_BIN="$TEST_TMP/mock-xray"
@@ -374,34 +341,34 @@ chmod 640 "$XRAY_NODES"
 chmod 600 "$XRAY_CONF"
 cp -p "$XRAY_NODES" "$TEST_TMP/before-nodes"
 cp -p "$XRAY_CONF" "$TEST_TMP/before-config"
-assert_true "transaction applies a new cross-node user" apply_user_assignment '' Other '["a1b2c3d4","b2c3d4e5"]'
+assert_true "transaction applies a node outbound" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 assert_true "transaction preserves original permission modes" bash -c '
   mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
   [[ $(mode "$1") == 640 && $(mode "$2") == 600 ]]
 ' _ "$XRAY_NODES" "$XRAY_CONF"
 assert_file_jq "transaction preserves root unknown fields and settings" "$XRAY_NODES" '.extra.retained and (.settings.block_udp443 | not)'
-assert_file_jq "transaction commits both members" "$XRAY_NODES" 'all(.nodes[0:2][]; .clients | length == 2)'
+assert_file_jq "transaction preserves legacy metadata" "$XRAY_NODES" '.users[0].id == "old" and all(.nodes[0:2][]; .clients | length == 1) and .nodes[0].outbound.mode == "direct"'
 cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 cp "$XRAY_CONF" "$TEST_TMP/before-config"
 MOCK_VALIDATE_FAIL=true
-assert_false "validation failure leaves live files untouched" apply_user_assignment '' Bad '["a1b2c3d4"]'
+assert_false "validation failure leaves live files untouched" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 MOCK_VALIDATE_FAIL=false
 assert_true "validation failure preserves metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 MOCK_SERVICE_MODE=once
-assert_false "restart failure rolls back whole assignment" apply_user_assignment '' Bad '["a1b2c3d4"]'
+assert_false "restart failure rolls back whole assignment" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 assert_true "restart failure restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 assert_true "restart failure restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
 assert_eq "rollback restores active service" active "$(cat "$SERVICE_STATE")"
 MOCK_SERVICE_MODE=inactive
 printf 'inactive\n' > "$SERVICE_STATE"
-assert_false "inactive service after restart causes rollback" apply_user_assignment '' Bad '["b2c3d4e5"]'
+assert_false "inactive service after restart causes rollback" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 assert_eq "rollback restores stopped service" inactive "$(cat "$SERVICE_STATE")"
 MOCK_SERVICE_MODE=ok
 mv() {
   if [[ "$*" == *config.next* ]]; then return 1; fi
   command mv "$@"
 }
-assert_false "second file replacement failure rolls back both files" apply_user_assignment '' Bad '["b2c3d4e5"]'
+assert_false "second file replacement failure rolls back both files" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 unset -f mv
 assert_true "replacement failure restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 assert_true "replacement failure restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
@@ -409,32 +376,24 @@ mv() {
   command mv "$@" || return 1
   if [[ "$*" == *nodes.next* ]]; then bash -c 'kill -TERM "$PPID"'; fi
 }
-assert_false "ordinary interruption rolls back replaced metadata" apply_user_assignment '' Interrupted '["b2c3d4e5"]'
+assert_false "ordinary interruption rolls back replaced metadata" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 unset -f mv
 assert_true "interruption restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 assert_true "interruption restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
-assert_true "transaction cleanup removes secret staging directories" bash -c 'shopt -s nullglob; paths=("$1"/.users.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
+assert_true "transaction cleanup removes secret staging directories" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
 printf 'active\n' > "$SERVICE_STATE"
 MOCK_SERVICE_MODE=fail
-assert_false "rollback restart failure is not reported as success" apply_user_assignment '' Bad '["b2c3d4e5"]'
-recovery=$(printf '%s\n' "$XRAY_DIR"/.users.*)
+assert_false "rollback restart failure is not reported as success" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
+recovery=$(printf '%s\n' "$XRAY_DIR"/.transaction.*)
 assert_true "failed rollback retains recovery files" test -f "$recovery/nodes.backup"
 rm -rf "$recovery"
-assert_true "generation rejects repeated credentials without touching source" bash -c '
-  source "$1"
-  fixture="$2"
-  rand_uuid() { jq -r ".nodes[0].uuid" "$fixture"; }
-  before=$(cksum "$2")
-  if prepare_user_assignment "$2" "$3" "" Collision "[\"a1b2c3d4\"]"; then exit 1; fi
-  [[ "$before" == "$(cksum "$2")" ]]
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$user_candidate"
-# Candidate state, not live metadata, owns every rendered member.
-jq '.nodes[1].clients = []' "$XRAY_NODES" > "$user_candidate"
-assert_true "renders isolated candidate snapshot" render_config "$user_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "candidate never mixes old disk memberships" "$TEST_TMP/rendered.json" '.inbounds[0].settings.clients | length == 1'
+# Candidate snapshot owns rendered settings, never live metadata.
+jq '.nodes[0].uuid = "123e4567-e89b-12d3-a456-426614174099"' "$XRAY_NODES" > "$node_candidate"
+assert_true "renders isolated candidate snapshot" render_config "$node_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "candidate default never mixes old disk credentials" "$TEST_TMP/rendered.json" '.inbounds[0].settings.clients[0].id == "123e4567-e89b-12d3-a456-426614174099"'
 assert_false "malformed candidate renderer fails" render_config "$SERVICE_STATE" "$TEST_TMP/rendered.json"
 XRAY_BIN="$TEST_TMP/missing-xray"
-assert_false "user transaction requires Xray binary" apply_user_assignment '' Bad '["b2c3d4e5"]'
+assert_false "node transaction requires Xray binary" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 
 # Outbound links: exercise the public stdin interface, never pass secrets to jq argv.
 parse_test_link() { printf '%s\n' "$1" | parse_outbound_link; }
@@ -491,35 +450,29 @@ for invalid in 'null' '[]' '{"mode":"inherit"}' '{"mode":"direct","extra":1}' \
   assert_false "rejects invalid normalized outbound" validate_outbound <<<"$invalid"
 done
 cp "$FIXTURE" "$XRAY_NODES"
-prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' Routed '["a1b2c3d4","b2c3d4e5"]'
-cp "$user_candidate" "$XRAY_NODES"
-uid=$(jq -r '.users[0].id' "$XRAY_NODES")
 node_proxy=$(parse_test_link 'socks5://node.example:1080')
-user_proxy=$(parse_test_link 'ss://aes-256-gcm:secret@user.example:443')
-assert_true "prepare node outbound does not alter live source" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" nodes a1b2c3d4 <<<"$node_proxy"
+second_proxy=$(parse_test_link 'ss://aes-256-gcm:secret@second.example:443')
+assert_true "prepare node outbound does not alter live source" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" a1b2c3d4 <<<"$node_proxy"
 assert_file_jq "live node remains without outbound" "$XRAY_NODES" '.nodes[0] | has("outbound") | not'
-cp "$user_candidate" "$XRAY_NODES"
-assert_true "prepare global user proxy" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users "$uid" <<<"$user_proxy"
-render_config "$user_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "direct remains first and security blocks precede overrides" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and .routing.rules[0].outboundTag == "block" and .routing.rules[2].outboundTag == "block" and .routing.rules[3].user != null'
-assert_file_jq "one user outbound is shared across node-specific rules" "$TEST_TMP/rendered.json" '[.outbounds[]|select(.tag|startswith("user-out-"))]|length == 1'
-assert_file_jq "user rules precede node fallback for default credentials" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 6 and (.routing.rules[3:5]|all(.[]; .user|length == 1)) and .routing.rules[5].outboundTag == "node-out-a1b2c3d4" and (.routing.rules[5]|has("user")|not)'
-cp "$user_candidate" "$XRAY_NODES"
-assert_true "explicit user direct overrides node proxy" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users "$uid" <<<'{"mode":"direct"}'
-render_config "$user_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "direct users retain explicit overrides" "$TEST_TMP/rendered.json" '.routing.rules[3].outboundTag == "direct" and (.outbounds|length) == 3'
-cp "$user_candidate" "$XRAY_NODES"
-prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users "$uid" <<<'"inherit"'
-render_config "$user_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "inherit removes saved field and user rules" "$user_candidate" '.users[0]|has("outbound")|not'
-assert_file_jq "inherit uses node fallback" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 4 and .routing.rules[3].outboundTag == "node-out-a1b2c3d4"'
-jq '.nodes[0].enabled=false' "$user_candidate" > "$TEST_TMP/disabled.json"
+cp "$node_candidate" "$XRAY_NODES"
+assert_true "prepare independent second node proxy" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<"$second_proxy"
+render_config "$node_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "direct first and security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and all(.routing.rules[0:3][]; .outboundTag == "block") and (.routing.rules|length) == 5'
+assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 4 and .routing.rules[3].outboundTag == "node-out-a1b2c3d4" and .routing.rules[4].outboundTag == "node-out-b2c3d4e5" and .routing.rules[3].inboundTag != .routing.rules[4].inboundTag and all(.routing.rules[]; has("user")|not)'
+cp "$node_candidate" "$XRAY_NODES"
+assert_true "explicit node direct replaces only selected proxy" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<'{"mode":"direct"}'
+render_config "$node_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.routing.rules[4].outboundTag == "direct" and .routing.rules[3].outboundTag == "node-out-a1b2c3d4" and (.outbounds|length) == 3'
+cp "$node_candidate" "$XRAY_NODES"
+prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<'"inherit"'
+render_config "$node_candidate" "$TEST_TMP/rendered.json"
+assert_file_jq "reset removes saved node field" "$node_candidate" '.nodes[1]|has("outbound")|not'
+assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 4 and .routing.rules[3].outboundTag == "node-out-a1b2c3d4"'
+jq '.nodes[0].enabled=false' "$node_candidate" > "$TEST_TMP/disabled.json"
 render_config "$TEST_TMP/disabled.json" "$TEST_TMP/rendered.json"
 assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 3 and (.outbounds|length) == 2'
 jq '.nodes[0].outbound=null' "$TEST_TMP/disabled.json" > "$TEST_TMP/invalid.json"
 assert_false "disabled node cannot hide corrupt outbound" render_config "$TEST_TMP/invalid.json" "$TEST_TMP/rendered.json"
-prepare_user_assignment "$XRAY_NODES" "$user_candidate" '' Added '["a1b2c3d4"]'
-assert_file_jq "adding users preserves node and user outbound" "$user_candidate" '.nodes[0].outbound.protocol == "socks" and .users[0].outbound.mode == "direct"'
 # No outbound settings produce exactly the legacy two outbounds / three blocks.
 render_config "$FIXTURE" "$TEST_TMP/legacy.json"
 assert_file_jq "legacy render has no extra routes or outbounds" "$TEST_TMP/legacy.json" '(.routing.rules|length) == 3 and (.outbounds|length) == 2'
@@ -528,52 +481,81 @@ XRAY_BIN="$TEST_TMP/mock-xray"
 MOCK_SERVICE_MODE=ok
 MOCK_VALIDATE_FAIL=false
 render_config "$XRAY_NODES" "$XRAY_CONF"
-assert_true "outbound transaction commits proxy to both files" apply_outbound_assignment users "$uid" <<<"$user_proxy"
-assert_file_jq "committed config contains user proxy" "$XRAY_CONF" 'any(.outbounds[]; .protocol == "shadowsocks")'
+assert_true "outbound transaction commits proxy to both files" apply_outbound_assignment b2c3d4e5 <<<"$second_proxy"
+assert_file_jq "committed config contains node proxy" "$XRAY_CONF" 'any(.outbounds[]; .protocol == "shadowsocks")'
 cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 cp "$XRAY_CONF" "$TEST_TMP/before-config"
 MOCK_VALIDATE_FAIL=true
-assert_false "outbound core validation failure leaves live data unchanged" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_false "outbound core validation failure leaves live data unchanged" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 MOCK_VALIDATE_FAIL=false
 assert_true "outbound failed validation preserves metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 rm -f "$TEST_TMP/restart-failed"
 MOCK_SERVICE_MODE=once
-assert_false "outbound failed restart rolls back" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_false "outbound failed restart rolls back" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 assert_true "outbound rollback restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 assert_true "outbound rollback restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
 MOCK_SERVICE_MODE=ok
 mv() { if [[ "$*" == *config.next* ]]; then return 1; fi; command mv "$@"; }
-assert_false "outbound replacement failure rolls back" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_false "outbound replacement failure rolls back" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 unset -f mv
 assert_true "outbound replacement restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "outbound staging directories cleaned" bash -c 'shopt -s nullglob; paths=("$1"/.users.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
-assert_false "unknown target cannot silently succeed" prepare_outbound_assignment "$XRAY_NODES" "$user_candidate" users missing <<<'{"mode":"direct"}'
+assert_true "outbound staging directories cleaned" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
+assert_false "unknown target cannot silently succeed" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" missing <<<'{"mode":"direct"}'
 # Actual menu reads a secret silently and cancellation must not write anything.
 assert_true "cancelled outbound menu masks secret and preserves files" bash -c '
   source "$1"; XRAY_NODES="$2"
   ask() { printf "3\n"; }; confirm() { return 1; }
   before=$(cksum "$2")
-  output=$(manage_outbound nodes a1b2c3d4 <<<"socks5://secret-user:secret-password@proxy.example:1080" 2>&1)
+  output=$(manage_outbound a1b2c3d4 <<<"socks5://secret-user:secret-password@proxy.example:1080" 2>&1)
   [[ "$output" != *secret-user* && "$output" != *secret-password* && "$before" == "$(cksum "$2")" ]]
 ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
+# Both node menus keep option 8; removed options do not dispatch any action.
+for node_id in a1b2c3d4 b2c3d4e5; do
+  printf '7\n8\n2\n0\n' > "$TEST_TMP/menu-input"
+  assert_true "node menu $node_id keeps outbound 8 and ignores removed 7" bash -c '
+    source "$1"; XRAY_NODES="$2"; selected="$3"; capture="$5"
+    exec 3< "$4"
+    ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
+    require_xray() { :; }; ensure_nodes_file() { :; }; clear() { :; }; node_link() { :; }
+    pick_node() { printf "%s\n" "$selected"; }; confirm() { return 0; }
+    apply_outbound_assignment() { printf "%s\n" "$*" > "$capture"; command cat >> "$capture"; }
+    before=$(cksum "$2")
+    output=$(manage_nodes)
+    [[ "$output" == *"8) Set node outbound"* && "$output" != *"Connection users"* &&
+       "$(command cat "$capture")" == "$selected"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
+  ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
+done
+printf '11\n0\n' > "$TEST_TMP/menu-input"
+assert_true "main menu removes and ignores connection-user option 11" bash -c '
+  source "$1"; exec 3< "$2"
+  clear() { :; }; status_line() { :; }
+  ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
+  manage_users() { printf "REMOVED_DISPATCH\n"; }
+  output=$(main_menu)
+  [[ "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
+for removed in manage_users show_user_links prepare_user_assignment apply_user_assignment validate_user_metadata; do
+  assert_false "removed function $removed is absent" declare -F "$removed"
+done
+
 MOCK_SERVICE_MODE=inactive
 printf 'inactive\n' > "$SERVICE_STATE"
-assert_false "outbound inactive restart rolls back stopped state" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_false "outbound inactive restart rolls back stopped state" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 assert_eq "outbound rollback keeps stopped service stopped" inactive "$(cat "$SERVICE_STATE")"
 MOCK_SERVICE_MODE=ok
 mv() {
   command mv "$@" || return 1
   if [[ "$*" == *nodes.next* ]]; then bash -c 'kill -TERM "$PPID"'; fi
 }
-assert_false "outbound signal after replacement rolls back" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
+assert_false "outbound signal after replacement rolls back" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 unset -f mv
 assert_true "outbound signal restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 assert_true "outbound signal restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
 printf 'active\n' > "$SERVICE_STATE"
 MOCK_SERVICE_MODE=fail
-assert_false "outbound failed recovery preserves backups" apply_outbound_assignment nodes a1b2c3d4 <<<'{"mode":"direct"}'
-recovery=$(printf '%s\n' "$XRAY_DIR"/.users.*)
+assert_false "outbound failed recovery preserves backups" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
+recovery=$(printf '%s\n' "$XRAY_DIR"/.transaction.*)
 assert_true "outbound failed rollback keeps recovery metadata" test -f "$recovery/nodes.backup"
 assert_true "outbound recovery is private" bash -c '
   mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
@@ -589,7 +571,7 @@ assert_true "outbound secrets never occur in external jq or openssl argv" bash -
   jq() { printf "%s\n" "$@" >> "$capture"; command jq "$@"; }
   openssl() { printf "%s\n" "$@" >> "$capture"; command openssl "$@"; }
   proxy=$(printf "%s\n" "socks5://SECRET_USERNAME:SECRET_PASSWORD@proxy.example:1080" | parse_outbound_link)
-  prepare_outbound_assignment "$XRAY_NODES" "$output" nodes a1b2c3d4 <<<"$proxy"
+  prepare_outbound_assignment "$XRAY_NODES" "$output" a1b2c3d4 <<<"$proxy"
   render_config "$output" "$output.config"
   ! command grep -q "SECRET_USERNAME\|SECRET_PASSWORD" "$capture"
 ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$TEST_TMP/argv" "$TEST_TMP/secret-candidate"

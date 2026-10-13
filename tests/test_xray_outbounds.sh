@@ -28,18 +28,14 @@ printf '%s\n' "$private_key" "$public_key" | jq -Rn '[inputs]' > "$TEST_TMP/key-
 jq --slurpfile keys "$TEST_TMP/key-values.json" '
   .nodes |= map(if .type == "vless-reality" then
     .reality_private_key = $keys[0][0] | .reality_public_key = $keys[0][1]
-  else . end) |
-  .users = [{id:"test-user", name:"Test user"}] |
-  .nodes[0].clients = [{user_id:"test-user",uuid:"123e4567-e89b-12d3-a456-426614174002"}] |
-  .nodes[1].clients = [{user_id:"test-user",password:"disposable-member-password"}]
+  else . end)
 ' "$ROOT_DIR/tests/fixtures/nodes.json" > "$TEST_TMP/base.json"
 
 check_link() {
   local label="$1" link="$2"
   printf '%s\n' "$link" | parse_outbound_link > "$TEST_TMP/outbound.json"
-  prepare_outbound_assignment "$TEST_TMP/base.json" "$TEST_TMP/node.json" nodes a1b2c3d4 < "$TEST_TMP/outbound.json"
-  prepare_outbound_assignment "$TEST_TMP/node.json" "$TEST_TMP/users.json" users test-user < "$TEST_TMP/outbound.json"
-  render_config "$TEST_TMP/users.json" "$TEST_TMP/config.json"
+  prepare_outbound_assignment "$TEST_TMP/base.json" "$TEST_TMP/node.json" a1b2c3d4 < "$TEST_TMP/outbound.json"
+  render_config "$TEST_TMP/node.json" "$TEST_TMP/config.json"
   if ! "$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1; then
     printf 'not ok - real Xray rejected %s (log: %s)\n' "$label" "$TEST_TMP/check.log" >&2
     # All input here is disposable test data, not user configuration.
@@ -64,7 +60,12 @@ check_link 'VLESS TLS gRPC' "vless://$uuid@proxy.example.com:443?encryption=none
 check_link 'VLESS TLS TCP Vision' "vless://$uuid@proxy.example.com:443?type=tcp&security=tls&flow=xtls-rprx-vision&fp=chrome&sni=proxy.example.com&alpn=h2%2Chttp%2F1.1"
 check_link 'VLESS TLS gRPC multi' "vless://$uuid@proxy.example.com:443?type=grpc&security=tls&sni=proxy.example.com&serviceName=proxy&mode=multi&alpn=h2"
 
-printf '%s\n' '{"mode":"direct"}' | prepare_outbound_assignment "$TEST_TMP/node.json" "$TEST_TMP/direct.json" users test-user
+printf '%s\n' '{"mode":"direct"}' | prepare_outbound_assignment "$TEST_TMP/node.json" "$TEST_TMP/direct.json" a1b2c3d4
 render_config "$TEST_TMP/direct.json" "$TEST_TMP/config.json"
 "$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1
-printf 'ok - real Xray accepts explicit user direct override\n'
+printf 'ok - real Xray accepts explicit node direct\n'
+
+printf '%s\n' '"inherit"' | prepare_outbound_assignment "$TEST_TMP/direct.json" "$TEST_TMP/reset.json" a1b2c3d4
+render_config "$TEST_TMP/reset.json" "$TEST_TMP/config.json"
+"$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1
+printf 'ok - real Xray accepts restored default node outbound\n'
