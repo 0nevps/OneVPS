@@ -64,7 +64,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.resolve.outputs.tag }}
-          SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
           sha256sum onevps.sh > SHA256SUMS
@@ -96,8 +95,9 @@ jobs:
             make_latest=true
           fi
 
+          # The existing tag pins the commit; a historical --target can require workflow-write access.
           gh release create "$TAG" onevps.sh SHA256SUMS \
-            --verify-tag --target "$SHA" --title "OneVPS $TAG" --generate-notes --draft
+            --verify-tag --title "OneVPS $TAG" --generate-notes --draft
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           gh release download "$TAG" --pattern onevps.sh --pattern SHA256SUMS --dir "$work"
