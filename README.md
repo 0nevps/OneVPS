@@ -39,9 +39,9 @@ the same workflow on another supported host, and contribute fixes in one place.
 - **Trojan + WS behind Caddy**: exposes only Caddy while the Xray inbound remains bound to loopback
 - **Configuration validation**: validates generated Xray configuration before replacing the active file
 - **Secure defaults**: random UUIDs, X25519 keys, short IDs, passwords, and WebSocket paths
-- **Restricted routing**: blocks private address ranges, BitTorrent traffic, and—by default—outbound UDP/443
+- **Restricted routing**: blocks private address ranges and BitTorrent traffic
 - **Least-privilege service**: runs Xray as `nobody` with only the low-port bind capability
-- **Operations**: manages nodes and share links, restarts the service, enables BBR, and applies optional system tuning
+- **Operations**: manages nodes and share links, restarts the service, enables BBR, and applies optional TCP tuning
 
 > Legacy sing-box nodes are not migrated automatically. OneVPS manages Xray under `/usr/local/etc/xray/`.
 
@@ -94,7 +94,7 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 5) Show default node share links
 6) Restart service
 7) BBR acceleration
-8) System optimization
+8) TCP optimization
 9) Uninstall
 10) Realm relay
 0) Exit
@@ -138,7 +138,7 @@ All formats accept a hostname, IPv4, or bracketed IPv6 address, an explicit port
 For example, `socks5://test:example%3Apassword@proxy.example.com:1080#Example` uses fictional credentials.
 Only one link is accepted; this is not a subscription importer or an arbitrary Xray JSON editor.
 
-Existing private-address, BitTorrent, and optional UDP/443 blocks run **before** outbound selection.
+Existing private-address and BitTorrent blocks run **before** outbound selection.
 Proxy failure does not automatically fall back to direct access. SOCKS5 does not encrypt traffic or
 credentials; use it only over a trusted/protected path. UDP availability depends on the upstream protocol
 and server, not merely on a valid link.
@@ -383,19 +383,33 @@ Support is best-effort because distribution releases, package repositories, Xray
 When reporting a compatibility problem, include the distribution, version, architecture, package manager, and
 sanitized command output.
 
-## BBR and System Tuning
+## BBR and TCP Tuning
 
-Menu option `7` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`.
+Menu option `7` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`. Status distinguishes the default qdisc
+from the interface's actual queues. Existing fq is unchanged; only a single default `pfifo_fast` root
+(handle `0:`, without filters) is eligible for replacement. Custom, multiqueue, fq_codel and unknown layouts
+are preserved. The already-enabled BBR path does not change queues.
 
-Menu option `8` applies optional, conservative tuning for long-running VPS workloads:
+Menu option `8` writes optional TCP settings to `/etc/sysctl.d/99-onevps-tune.conf`:
 
-- Raises TCP buffer ceilings without increasing every socket's default allocation
-- Enables TCP Fast Open and MTU probing and raises backlog limits
-- Sets the ephemeral port range to `10000-65535`
-- Can create a small swap file and cap journald disk usage
-- Can toggle Xray outbound UDP/443 blocking, which is enabled by default
+- Raises TCP buffer ceilings to `67108864`, preserving each current minimum and initial value after validation
+- Rejects unreadable/invalid triples or initial values above the target without overwriting the old file
+- Enables TCP Fast Open (requires application support) and MTU probing, and raises backlog limits
+- Sets the ephemeral port range to `10000-65535`; shared socket/backlog/port settings may affect non-TCP traffic
+- Uses `tcp_notsent_lowat` as an unsent-data readiness threshold, not a hard cap on all send memory
 
-Review these settings against the server's other workloads before applying them.
+Buffer ceilings are not preallocated and these settings do not guarantee a speedup. A file's existence does
+not prove runtime activation. Failed writes or sysctl loads are reported; a failed load may partially apply
+settings and does not trigger an atomic rollback. Unsupported keys are reported as failures too.
+
+Swap creation, swappiness, journald limits, conntrack tuning, slow-start-after-idle and FIN timeout overrides
+are no longer part of this option. Existing swap, fstab and journald files are not removed, and previously
+applied runtime values are not reset to guessed defaults. Reapplying updates only OneVPS's tuning file.
+
+OneVPS no longer adds or offers a toggle for the default UDP/443 block. Legacy `block_udp443` metadata is
+ignored and retained. An installed Xray configuration loses the old rule only after regeneration and successful
+application; this does not guarantee QUIC support in clients, upstreams or the network. Private-address,
+BitTorrent and node/user outbound rules remain. Review settings against other server workloads before applying.
 
 ## Uninstall
 

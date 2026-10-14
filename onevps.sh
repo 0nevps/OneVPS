@@ -18,6 +18,7 @@ XRAY_NODES=$XRAY_DIR/onevps-nodes.json
 XRAY_SERVICE=/etc/systemd/system/xray.service
 XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
+BBR_CONF=/etc/sysctl.d/99-bbr.conf
 REALITY_PROBE_ROUNDS=3
 REALM_DIR=/usr/local/etc/onevps-realm
 REALM_BIN=/usr/local/bin/onevps-realm
@@ -830,7 +831,7 @@ build_outbound_routes() {
 render_config() {
   local source="$1" output="$2"
   validate_node_metadata "$source" || { err "invalid node metadata"; return 1; }
-  local inbounds n enabled type ib block_udp443 rows routes
+  local inbounds n enabled type ib rows routes
   rows=$(jq -c '.nodes[]' "$source") || return 1
   inbounds='[]'
   while IFS= read -r n; do
@@ -845,16 +846,8 @@ render_config() {
     esac
     inbounds=$(printf '%s\n%s\n' "$inbounds" "$ib" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
-  block_udp443=$(jq -r '
-    if ((.settings | type) == "object" and (.settings | has("block_udp443"))) then
-      .settings.block_udp443
-    else
-      true
-    end' "$source" 2>/dev/null || echo true)
-  [[ "$block_udp443" == "false" ]] || block_udp443=true
-
   routes=$(build_outbound_routes "$source") || return 1
-  printf '%s\n%s\n' "$inbounds" "$routes" | jq -s --argjson block_udp443 "$block_udp443" '
+  printf '%s\n%s\n' "$inbounds" "$routes" | jq -s '
     .[0] as $inbounds | .[1] as $routes |
     def private_ip_rule: {
       type: "field",
@@ -868,7 +861,6 @@ render_config() {
       outboundTag: "block"
     };
     def bittorrent_rule: {type: "field", protocol: ["bittorrent"], outboundTag: "block"};
-    def udp443_rule: {type: "field", network: "udp", port: "443", outboundTag: "block"};
     {
       log: {loglevel: "warning"},
       inbounds: $inbounds,
@@ -878,7 +870,7 @@ render_config() {
       ] + $routes.outbounds),
       routing: {
         domainStrategy: "AsIs",
-        rules: ([private_ip_rule, bittorrent_rule] + (if $block_udp443 then [udp443_rule] else [] end) + $routes.rules)
+        rules: ([private_ip_rule, bittorrent_rule] + $routes.rules)
       },
       policy: {
         levels: {
@@ -1794,28 +1786,58 @@ del_node() {
 # BBR acceleration
 # ----------------------------------------------------------------------------
 apply_fq_qdisc() {
-  command -v ip >/dev/null 2>&1 || return 0
-  command -v tc >/dev/null 2>&1 || return 0
-  local dev
-  dev=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
-  [[ -n "$dev" ]] || return 0
-  tc qdisc replace dev "$dev" root fq 2>/dev/null || true
+  command -v ip >/dev/null 2>&1 && command -v tc >/dev/null 2>&1 || {
+    warn "ip/tc unavailable; actual root qdisc unchanged"; return 1;
+  }
+  local dev queues root
+  dev=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}') || {
+    warn "cannot query default interface; qdisc unchanged"; return 1;
+  }
+  [[ -n "$dev" ]] || { warn "default interface unknown; qdisc unchanged"; return 1; }
+  queues=$(tc qdisc show dev "$dev" 2>/dev/null) || {
+    warn "cannot query qdisc on $dev; unchanged"; return 1;
+  }
+  root=$(awk '$1 == "qdisc" && $4 == "root" {print $2}' <<<"$queues")
+  if [[ "$root" == fq ]]; then
+    info "$dev root qdisc is already fq"; return 0
+  fi
+  # Only a single, simple default queue is safe to replace. Preserve mq,
+  # classful/custom trees and unrecognized output, including child queues.
+  if [[ "$queues" == *$'\n'* || ! "$queues" =~ ^qdisc[[:blank:]]+pfifo_fast[[:blank:]]+0:[[:blank:]]+root[[:blank:]] ]]; then
+    warn "$dev root qdisc preserved ($root); custom, multiqueue or unknown layout"
+    return 0
+  fi
+  local filters
+  filters=$(tc filter show dev "$dev" root 2>/dev/null) || {
+    warn "cannot inspect filters on $dev; qdisc unchanged"; return 1;
+  }
+  [[ -z "$filters" ]] || { warn "$dev has filters; qdisc preserved"; return 0; }
+  if ! tc qdisc replace dev "$dev" root fq; then
+    err "failed to replace root qdisc on $dev"; return 1
+  fi
 }
 
 bbr_status() {
-  local qdisc cc
+  local qdisc cc dev actual="unknown"
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
   qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-  echo "congestion control: $cc  qdisc: $qdisc"
+  if command -v ip >/dev/null 2>&1 && command -v tc >/dev/null 2>&1; then
+    dev=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+    if [[ -n "$dev" ]]; then
+      actual=$(tc qdisc show dev "$dev" 2>/dev/null || echo "unknown")
+    fi
+  fi
+  echo "congestion control: $cc  default qdisc: $qdisc  interface qdisc: $actual"
 }
 
 apply_sysctl_file() {
   local file="$1"
-  command -v sysctl >/dev/null 2>&1 || { warn "sysctl not found, skipping $file"; return 0; }
-  if sysctl -e -p "$file" >/dev/null; then
-    return 0
+  command -v sysctl >/dev/null 2>&1 || { err "sysctl not found; cannot apply $file"; return 1; }
+  # Do not suppress unsupported-key or permission errors: neither is success.
+  if ! sysctl -p "$file"; then
+    err "failed to apply $file (possibly unsupported keys or permissions); some settings may already be applied"
+    return 1
   fi
-  warn "some sysctl settings failed for $file; unsupported keys are safe to ignore on constrained VPS kernels"
 }
 
 enable_bbr() {
@@ -1825,7 +1847,6 @@ enable_bbr() {
   qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
 
   if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
-    apply_fq_qdisc
     ok "BBR already enabled ($(bbr_status))"
     pause; return
   fi
@@ -1846,154 +1867,83 @@ enable_bbr() {
 
   confirm "Enable BBR?" y || { pause; return; }
 
-  cat > /etc/sysctl.d/99-bbr.conf <<EOF
+  if ! cat > "$BBR_CONF" <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-  apply_sysctl_file /etc/sysctl.d/99-bbr.conf
-  apply_fq_qdisc
+  then
+    err "cannot write $BBR_CONF"; return 1
+  fi
+  apply_sysctl_file "$BBR_CONF" || return 1
+  apply_fq_qdisc || return 1
 
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-  if [[ "$cc" == "bbr" ]]; then
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+  if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
     ok "BBR enabled ($(bbr_status))"
   else
     err "failed to enable BBR, current: $(bbr_status)"
+    return 1
   fi
   pause
 }
 
 # ----------------------------------------------------------------------------
-# System optimization (sysctl tuning / swap / journald cap)
+# TCP optimization
 # ----------------------------------------------------------------------------
 write_tune_conf() {
-  cat > "$TUNE_CONF" <<EOF
-# OneVPS system tuning
-# Raise buffer ceilings for high-BDP links without inflating every socket by default.
+  local key values min initial maximum rmem wmem
+  for key in tcp_rmem tcp_wmem; do
+    values=$(sysctl -n "net.ipv4.$key" 2>/dev/null) || {
+      err "cannot read $key; tuning file unchanged"; return 1;
+    }
+    # Restrict size before arithmetic to avoid overflow and reject multiline data.
+    if [[ ! "$values" =~ ^[[:blank:]]*[0-9]{1,10}[[:blank:]]+[0-9]{1,10}[[:blank:]]+[0-9]{1,10}[[:blank:]]*$ ]]; then
+      err "invalid $key triple; tuning file unchanged"; return 1
+    fi
+    read -r min initial maximum <<<"$values"
+    min=$((10#$min)); initial=$((10#$initial)); maximum=$((10#$maximum))
+    if (( min <= 0 || min > initial || initial > maximum || initial > 67108864 )); then
+      err "invalid $key bounds; tuning file unchanged"; return 1
+    fi
+    if [[ "$key" == tcp_rmem ]]; then rmem="$min $initial"; else wmem="$min $initial"; fi
+  done
+  if ! cat > "$TUNE_CONF" <<EOF
+# OneVPS TCP tuning
+# Ceilings are not preallocated; preserve current minimum and initial buffers.
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-# Conservative TCP behavior for proxy workloads.
+net.ipv4.tcp_rmem = $rmem 67108864
+net.ipv4.tcp_wmem = $wmem 67108864
+# TFO requires application support; no universal speedup is guaranteed.
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-# Many concurrent outbound connections, while avoiding common service ports.
+# Shared socket/backlog/port settings can also affect non-TCP traffic.
 net.ipv4.ip_local_port_range = 10000 65535
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
-# Cap unsent buffer per socket - lower latency for multiplexed proxy streams.
+# Unsent-data readiness threshold, not a hard cap on all send memory.
 net.ipv4.tcp_notsent_lowat = 131072
-# Drop closed connections sooner without being harsh on weak long-distance links.
-net.ipv4.tcp_fin_timeout = 30
-vm.swappiness = 10
 EOF
-  if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
-    echo "net.netfilter.nf_conntrack_max = 262144" >> "$TUNE_CONF"
+  then
+    err "cannot write $TUNE_CONF; tuning not applied"; return 1
   fi
-  apply_sysctl_file "$TUNE_CONF"
-  ok "network tuning applied ($TUNE_CONF)"
-}
-
-xray_udp443_block_enabled() {
-  [[ -f "$XRAY_NODES" ]] || { echo true; return; }
-  local enabled
-  enabled=$(jq -r '
-    if ((.settings | type) == "object" and (.settings | has("block_udp443"))) then
-      .settings.block_udp443
-    else
-      true
-    end' "$XRAY_NODES" 2>/dev/null || echo true)
-  [[ "$enabled" == "false" ]] && echo false || echo true
-}
-
-set_xray_udp443_block() {
-  local enabled="$1"
-  ensure_nodes_file
-  jq_update_nodes --argjson enabled "$enabled" '.settings.block_udp443 = $enabled'
-  rebuild_config && ok "Xray UDP/443 blocking set to $enabled" || err "failed to apply Xray routing setting"
-}
-
-optimize_xray_routing() {
-  [[ -x "$XRAY_BIN" || -f "$XRAY_NODES" ]] || return 0
-
-  local enabled
-  enabled=$(xray_udp443_block_enabled)
-  if [[ "$enabled" == "true" ]]; then
-    ok "Xray blocks outbound UDP/443 (QUIC/HTTP3) for safer proxy routing"
-    if confirm "Disable UDP/443 blocking for better QUIC/HTTP3 app compatibility?" n; then
-      set_xray_udp443_block false
-    fi
-  else
-    warn "Xray UDP/443 blocking is disabled; some apps may prefer QUIC/HTTP3"
-    if confirm "Enable UDP/443 blocking for safer/stabler proxy routing?" y; then
-      set_xray_udp443_block true
-    fi
-  fi
-}
-
-create_swap() {
-  local size_mb="$1" f=/swapfile
-  if [[ -f "$f" ]]; then
-    warn "$f already exists, skipping"
-    return
-  fi
-  info "creating ${size_mb}MiB swap file at $f ..."
-  if ! fallocate -l "${size_mb}M" "$f" 2>/dev/null; then
-    if ! dd if=/dev/zero of="$f" bs=1M count="$size_mb" status=none 2>/dev/null; then
-      warn "failed to allocate swap file (disk full?)"
-      rm -f "$f"; return
-    fi
-  fi
-  chmod 600 "$f"
-  if ! mkswap "$f" >/dev/null 2>&1 || ! swapon "$f" 2>/dev/null; then
-    warn "swap activation failed (note: btrfs needs a NOCOW swapfile); removing $f"
-    rm -f "$f"; return
-  fi
-  grep -q "^$f " /etc/fstab || echo "$f none swap sw 0 0" >> /etc/fstab
-  ok "swap enabled (${size_mb}MiB)"
+  apply_sysctl_file "$TUNE_CONF" || return 1
+  ok "TCP tuning applied ($TUNE_CONF)"
 }
 
 optimize_system() {
-  echo; info "System optimization (network sysctl / swap / journald cap)"
-
+  echo; info "TCP optimization"
   if [[ -f "$TUNE_CONF" ]]; then
-    ok "network tuning already applied ($TUNE_CONF)"
+    info "TCP tuning configuration file exists ($TUNE_CONF); runtime state not verified"
     if confirm "Re-apply (overwrite)?" n; then
-      write_tune_conf
+      write_tune_conf || err "TCP tuning failed; some settings may already be applied"
     fi
   else
-    if confirm "Apply network tuning (TCP/UDP buffers, TFO, backlog)?" y; then
-      write_tune_conf
+    if confirm "Apply TCP tuning (buffer ceilings, TFO, backlog)?" y; then
+      write_tune_conf || err "TCP tuning failed; some settings may already be applied"
     fi
   fi
-
-  local swap_kb mem_mb size_mb
-  swap_kb=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
-  if [[ "${swap_kb:-0}" -gt 0 ]]; then
-    ok "swap already present ($((swap_kb/1024)) MiB)"
-  else
-    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-    size_mb=512; [[ "$mem_mb" -le 1024 ]] && size_mb=1024
-    if confirm "No swap detected (RAM ${mem_mb}MiB). Create ${size_mb}MiB swap file?" y; then
-      create_swap "$size_mb"
-    fi
-  fi
-
-  if [[ -f /etc/systemd/journald.conf.d/onevps.conf ]]; then
-    ok "journald disk cap already set"
-  else
-    if confirm "Cap journald logs at 50MiB?" y; then
-      mkdir -p /etc/systemd/journald.conf.d
-      cat > /etc/systemd/journald.conf.d/onevps.conf <<EOF
-[Journal]
-SystemMaxUse=50M
-EOF
-      systemctl restart systemd-journald 2>/dev/null || true
-      ok "journald capped at 50MiB"
-    fi
-  fi
-
-  optimize_xray_routing
   pause
 }
 
@@ -2330,7 +2280,7 @@ EOF
   5) Show default node share links
   6) Restart service
   7) BBR acceleration
-  8) System optimization
+  8) TCP optimization
   9) Uninstall
   10) Realm relay
   0) Exit
@@ -2342,7 +2292,7 @@ EOF
       4) manage_nodes ;;
       5) show_links ;;
       6) restart_service ;;
-      7) enable_bbr ;;
+      7) enable_bbr || { err "BBR configuration failed; some settings may already be applied"; pause; } ;;
       8) optimize_system ;;
       9) uninstall ;;
       10) realm_menu ;;

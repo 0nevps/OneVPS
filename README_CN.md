@@ -33,9 +33,9 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 - **Trojan + WS（Caddy 后端）**：仅由 Caddy 对外，Xray 入站保持 loopback 监听
 - **配置校验**：替换现有配置前先验证新生成的 Xray 配置
 - **安全默认值**：随机 UUID、X25519 密钥、short ID、密码和 WebSocket 路径
-- **受限路由**：阻断私网地址、BitTorrent 流量，并默认阻断出站 UDP/443
+- **受限路由**：阻断私网地址和 BitTorrent 流量
 - **最小权限服务**：Xray 使用 `nobody` 运行，仅保留绑定低端口的能力
-- **运维能力**：节点与分享链接管理、服务重启、BBR 和可选系统优化
+- **运维能力**：节点与分享链接管理、服务重启、BBR 和可选 TCP 优化
 
 > 旧版 sing-box 节点不会自动迁移。OneVPS 使用 `/usr/local/etc/xray/` 管理 Xray。
 
@@ -86,7 +86,7 @@ bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onev
 5) Show default node share links
 6) Restart service
 7) BBR acceleration
-8) System optimization
+8) TCP optimization
 9) Uninstall
 10) Realm relay
 0) Exit
@@ -125,7 +125,7 @@ WebSocket 的 `path` 按字面路径处理，不作为 early-data 配置。未�
 例如 `socks5://test:example%3Apassword@proxy.example.com:1080#Example` 使用虚构测试凭据。
 每次仅导入一条链接，不支持订阅或任意 Xray JSON 编辑。
 
-原有私网、BitTorrent 和可选 UDP/443 阻断规则**优先于**出站选择。代理失败不会自动回退直连。
+原有私网和 BitTorrent 阻断规则**优先于**出站选择。代理失败不会自动回退直连。
 SOCKS5 不加密流量或凭据，请仅通过可信或受保护的链路使用；UDP 是否可用还取决于上游协议和服务端，
 不能仅凭链接合法就保证可用。
 
@@ -347,19 +347,30 @@ xray run -test -config /usr/local/etc/xray/config.json
 由于发行版、软件源、Xray 和 Caddy 会各自变化，兼容性支持按最大努力提供。报告兼容性问题时，请附发行版、版本、
 架构、包管理器和已脱敏的命令输出。
 
-## BBR 与系统优化
+## BBR 与 TCP 优化
 
-菜单 `7` 启用 BBR，并写入 `/etc/sysctl.d/99-bbr.conf`。
+菜单 `7` 启用 BBR，并写入 `/etc/sysctl.d/99-bbr.conf`。状态分别显示默认 qdisc 与网卡实际队列。
+已有 fq 不变；只有单一默认 `pfifo_fast` root（handle 为 `0:` 且无 filters）才允许替换。
+自定义、多队列、fq_codel 和未知布局会保留。BBR 已启用分支不会改变队列。
 
-菜单 `8` 为长期运行的 VPS 工作负载应用可选的保守设置：
+菜单 `8` 将可选 TCP 设置写入 `/etc/sysctl.d/99-onevps-tune.conf`：
 
-- 提高 TCP buffer 上限，但不增加每个 socket 的默认分配
-- 启用 TCP Fast Open、MTU probing，并提高 backlog
-- 设置临时端口范围为 `10000-65535`
-- 可创建小型 swap，并限制 journald 磁盘占用
-- 可切换 Xray 出站 UDP/443 阻断，默认开启
+- 将 TCP buffer 上限设为 `67108864`，校验后保留各自当前的最小值和初始值
+- 读取失败、三元组非法或初始值超过目标上限时拒绝操作，不覆盖旧配置
+- 启用 TCP Fast Open（需要应用配合）、MTU probing，并提高 backlog
+- 设置临时端口范围为 `10000-65535`；共享 socket、backlog 和端口设置可能同时影响非 TCP 流量
+- `tcp_notsent_lowat` 是未发送数据的就绪阈值，不是全部发送内存的硬上限
 
-应用前请确认这些设置适合服务器上的其他工作负载。
+缓冲上限不是预分配，这些设置不保证普遍提速。配置文件存在不代表运行时已生效。
+写入或 sysctl 加载失败会明确报告；加载失败可能已经部分生效，不执行原子回滚，不支持的键也报告为失败。
+
+此选项不再创建 swap，也不再设置 swappiness、journald 限额、conntrack、空闲后慢启动或 FIN timeout。
+不会删除现有 swap、fstab 或 journald 文件，也不会猜测系统默认值来重置历史运行参数。
+重新应用仅更新 OneVPS 自己的调优文件。
+
+OneVPS 不再添加默认 UDP/443 阻断或提供其开关。历史 `block_udp443` metadata 保留但忽略。
+已安装 Xray 中的旧规则仅在重新生成配置并成功应用后消失；这不保证客户端、上游或链路支持 QUIC。
+私网、BitTorrent 和节点/用户出站规则保持不变。应用前请确认设置适合服务器上的其他工作负载。
 
 ## 卸载
 

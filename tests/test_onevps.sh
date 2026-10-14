@@ -162,13 +162,17 @@ assert_file_jq "keeps private-network blocking" "$XRAY_CONF" \
   'any(.routing.rules[]; .ip? and (.ip | index("10.0.0.0/8")))'
 assert_file_jq "keeps BitTorrent blocking" "$XRAY_CONF" \
   'any(.routing.rules[]; .protocol? == ["bittorrent"])'
-assert_file_jq "blocks UDP/443 by default" "$XRAY_CONF" \
-  'any(.routing.rules[]; .network? == "udp" and .port? == "443")'
-
-jq '.settings.block_udp443 = false' "$FIXTURE" > "$XRAY_NODES"
-rebuild_config
-assert_file_jq "honors the UDP/443 opt-out" "$XRAY_CONF" \
+assert_file_jq "does not block UDP/443 by default" "$XRAY_CONF" \
   'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
+
+for legacy_udp443 in true false; do
+  jq --argjson legacy "$legacy_udp443" '.settings.block_udp443 = $legacy' "$FIXTURE" > "$XRAY_NODES"
+  rebuild_config
+  assert_file_jq "ignores legacy UDP/443 setting $legacy_udp443" "$XRAY_CONF" \
+    'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
+  assert_file_jq "preserves legacy metadata $legacy_udp443" "$XRAY_NODES" \
+    ".settings.block_udp443 == $legacy_udp443"
+done
 
 assert_true "realm accepts maximum port" realm_valid_port 65535
 for port in 0 65536 080 -1 '22;id' ''; do
@@ -458,25 +462,25 @@ assert_file_jq "live node remains without outbound" "$XRAY_NODES" '.nodes[0] | h
 cp "$node_candidate" "$XRAY_NODES"
 assert_true "prepare independent second node proxy" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<"$second_proxy"
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "direct first and security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and all(.routing.rules[0:3][]; .outboundTag == "block") and (.routing.rules|length) == 5'
-assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 4 and .routing.rules[3].outboundTag == "node-out-a1b2c3d4" and .routing.rules[4].outboundTag == "node-out-b2c3d4e5" and .routing.rules[3].inboundTag != .routing.rules[4].inboundTag and all(.routing.rules[]; has("user")|not)'
+assert_file_jq "direct first and security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and all(.routing.rules[0:2][]; .outboundTag == "block") and (.routing.rules|length) == 4'
+assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 4 and .routing.rules[2].outboundTag == "node-out-a1b2c3d4" and .routing.rules[3].outboundTag == "node-out-b2c3d4e5" and .routing.rules[2].inboundTag != .routing.rules[3].inboundTag and all(.routing.rules[]; has("user")|not)'
 cp "$node_candidate" "$XRAY_NODES"
 assert_true "explicit node direct replaces only selected proxy" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<'{"mode":"direct"}'
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.routing.rules[4].outboundTag == "direct" and .routing.rules[3].outboundTag == "node-out-a1b2c3d4" and (.outbounds|length) == 3'
+assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.routing.rules[3].outboundTag == "direct" and .routing.rules[2].outboundTag == "node-out-a1b2c3d4" and (.outbounds|length) == 3'
 cp "$node_candidate" "$XRAY_NODES"
 prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<'"inherit"'
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
 assert_file_jq "reset removes saved node field" "$node_candidate" '.nodes[1]|has("outbound")|not'
-assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 4 and .routing.rules[3].outboundTag == "node-out-a1b2c3d4"'
+assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 3 and .routing.rules[2].outboundTag == "node-out-a1b2c3d4"'
 jq '.nodes[0].enabled=false' "$node_candidate" > "$TEST_TMP/disabled.json"
 render_config "$TEST_TMP/disabled.json" "$TEST_TMP/rendered.json"
-assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 3 and (.outbounds|length) == 2'
+assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
 jq '.nodes[0].outbound=null' "$TEST_TMP/disabled.json" > "$TEST_TMP/invalid.json"
 assert_false "disabled node cannot hide corrupt outbound" render_config "$TEST_TMP/invalid.json" "$TEST_TMP/rendered.json"
 # No outbound settings produce exactly the legacy two outbounds / three blocks.
 render_config "$FIXTURE" "$TEST_TMP/legacy.json"
-assert_file_jq "legacy render has no extra routes or outbounds" "$TEST_TMP/legacy.json" '(.routing.rules|length) == 3 and (.outbounds|length) == 2'
+assert_file_jq "legacy render has no extra routes or outbounds" "$TEST_TMP/legacy.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
 # Shared transaction is exercised again with actual outbound candidates.
 XRAY_BIN="$TEST_TMP/mock-xray"
 MOCK_SERVICE_MODE=ok
@@ -608,7 +612,7 @@ assert_false "Trojan reset rejects local credential collision" apply_node_user_c
 assert_true "set inherited node proxy for all identities" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
 assert_true "selected batch sets default and Alice only" apply_outbound_assignment a1b2c3d4 selected '["default","alice"]' <<<"$second_proxy"
 assert_file_jq "default override does not change node inheritance" "$XRAY_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
-assert_file_jq "security blocks precede scoped identity routes and fallback" "$XRAY_CONF" 'all(.routing.rules[0:3][]; .outboundTag == "block") and .routing.rules[3].user == [.inbounds[0].settings.clients[0].email] and .routing.rules[4].user == [.inbounds[0].settings.clients[1].email] and all(.routing.rules[3:5][]; .inboundTag == ["reality-a1b2c3d4"]) and (.routing.rules[5]|has("user")|not)'
+assert_file_jq "security blocks precede scoped identity routes and fallback" "$XRAY_CONF" 'all(.routing.rules[0:2][]; .outboundTag == "block") and .routing.rules[2].user == [.inbounds[0].settings.clients[0].email] and .routing.rules[3].user == [.inbounds[0].settings.clients[1].email] and all(.routing.rules[2:4][]; .inboundTag == ["reality-a1b2c3d4"]) and (.routing.rules[4]|has("user")|not)'
 for selected in '[]' '["missing"]' '["alice","missing"]' '["alice","alice"]' 'null'; do
   assert_false "invalid selection is rejected as a batch $selected" apply_outbound_assignment a1b2c3d4 selected "$selected" <<<'{"mode":"direct"}'
 done
@@ -654,5 +658,123 @@ MOCK_SERVICE_MODE=ok
 ) || fail 'real node user and outbound menus'
 pass 'real menus add/link/select multiple/all/delete on both protocols'
 assert_file_jq "menu deletion preserves other users and removes all overrides" "$XRAY_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
+
+# Isolate all host tuning operations and paths, including child shells.
+(
+  TUNE_CONF="$TEST_TMP/tune.conf"
+  BBR_CONF="$TEST_TMP/bbr.conf"
+  pause() { :; }
+  confirm() { return 0; }
+  MOCK_RMEM='4096 131072 6291456'
+  MOCK_WMEM='8192 262144 4194304'
+  MOCK_LOAD=0
+  MOCK_READ=0
+  sysctl() {
+    if [[ "$1" == -p ]]; then
+      [[ "$2" == "$TUNE_CONF" || "$2" == "$BBR_CONF" ]] || return 99
+      return "$MOCK_LOAD"
+    fi
+    case "$2" in
+      net.ipv4.tcp_rmem) printf '%s\n' "$MOCK_RMEM"; return "$MOCK_READ" ;;
+      net.ipv4.tcp_wmem) printf '%s\n' "$MOCK_WMEM"; return "$MOCK_READ" ;;
+      net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
+      net.core.default_qdisc) printf 'fq\n' ;;
+      *) return 99 ;;
+    esac
+  }
+  write_tune_conf > "$TEST_TMP/tune-output"
+  command grep -qx 'net.ipv4.tcp_rmem = 4096 131072 67108864' "$TUNE_CONF" || exit 1
+  command grep -qx 'net.ipv4.tcp_wmem = 8192 262144 67108864' "$TUNE_CONF" || exit 1
+  if command grep -Eq 'swappiness|conntrack|slow_start_after_idle|fin_timeout' "$TUNE_CONF"; then exit 1; fi
+  cp "$TUNE_CONF" "$TEST_TMP/tune-original"
+  for MOCK_RMEM in 'garbage' '1 2' '1 2 3 4' '0 2 3' '4 2 6' '1 8 6' \
+    '1 67108865 99999999' '99999999999999999999999999 2 3' $'1 2 3\n1 2 3'; do
+    if write_tune_conf > "$TEST_TMP/tune-output" 2>&1; then exit 1; fi
+    cmp "$TUNE_CONF" "$TEST_TMP/tune-original" || exit 1
+  done
+  MOCK_RMEM='0004096 00087380 67108864'
+  write_tune_conf >/dev/null
+  command grep -qx 'net.ipv4.tcp_rmem = 4096 87380 67108864' "$TUNE_CONF" || exit 1
+  MOCK_WMEM='1 67108864 67108864'
+  write_tune_conf >/dev/null
+  MOCK_WMEM='invalid'
+  cp "$TUNE_CONF" "$TEST_TMP/tune-original"
+  if write_tune_conf >/dev/null 2>&1; then exit 1; fi
+  cmp "$TUNE_CONF" "$TEST_TMP/tune-original" || exit 1
+  MOCK_WMEM='8192 262144 4194304'
+  MOCK_READ=1
+  if write_tune_conf >/dev/null 2>&1; then exit 1; fi
+  cmp "$TUNE_CONF" "$TEST_TMP/tune-original" || exit 1
+  MOCK_READ=0
+  MOCK_LOAD=1
+  if write_tune_conf > "$TEST_TMP/tune-output" 2>&1; then exit 1; fi
+  if command grep -q 'TCP tuning applied' "$TEST_TMP/tune-output"; then exit 1; fi
+  optimize_system > "$TEST_TMP/tune-output" 2>&1
+  command grep -q 'configuration file exists' "$TEST_TMP/tune-output" || exit 1
+  command grep -q 'TCP tuning failed' "$TEST_TMP/tune-output" || exit 1
+  if command grep -q 'already applied' "$TEST_TMP/tune-output"; then exit 1; fi
+  MOCK_LOAD=0
+  TUNE_CONF="$TEST_TMP/nonexistent/tune.conf"
+  if write_tune_conf > "$TEST_TMP/tune-output" 2>&1; then exit 1; fi
+  if command grep -q 'TCP tuning applied' "$TEST_TMP/tune-output"; then exit 1; fi
+  # Missing sysctl must fail even inside an if (where errexit is disabled).
+  command() { if [[ "$*" == '-v sysctl' ]]; then return 1; fi; builtin command "$@"; }
+  if apply_sysctl_file "$TUNE_CONF" >/dev/null 2>&1; then exit 1; fi
+  unset -f command
+
+  MOCK_QUEUE='qdisc fq 0: root refcnt 2'
+  MOCK_QUERY=0
+  MOCK_REPLACE=0
+  MOCK_FILTER=''
+  ip() { printf '1.1.1.1 dev eth0 src 192.0.2.1\n'; }
+  tc() {
+    if [[ "$1 $2" == 'qdisc show' ]]; then printf '%s\n' "$MOCK_QUEUE"; return "$MOCK_QUERY"; fi
+    if [[ "$1 $2" == 'filter show' ]]; then printf '%s' "$MOCK_FILTER"; return 0; fi
+    if [[ "$*" == 'qdisc replace dev eth0 root fq' ]]; then
+      printf 'replace\n' >> "$TEST_TMP/tc-calls"; return "$MOCK_REPLACE"
+    fi
+    return 99
+  }
+  : > "$TEST_TMP/tc-calls"
+  for MOCK_QUEUE in 'qdisc fq 0: root refcnt 2' 'qdisc mq 0: root' \
+    'qdisc fq_codel 0: root' 'qdisc noqueue 0: root' 'qdisc htb 1: root' \
+    'qdisc pfifo_fast 1: root' 'unrecognized' \
+    $'qdisc pfifo_fast 0: root\nqdisc fq_codel 1: parent 0:1'; do
+    apply_fq_qdisc >/dev/null || exit 1
+    [[ ! -s "$TEST_TMP/tc-calls" ]] || exit 1
+  done
+  MOCK_QUEUE='qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap 1 2 2'
+  MOCK_QUERY=1
+  if apply_fq_qdisc >/dev/null 2>&1; then exit 1; fi
+  [[ ! -s "$TEST_TMP/tc-calls" ]] || exit 1
+  MOCK_QUERY=0
+  MOCK_FILTER='filter protocol ip pref 1'
+  apply_fq_qdisc >/dev/null
+  [[ ! -s "$TEST_TMP/tc-calls" ]] || exit 1
+  MOCK_FILTER=''
+  apply_fq_qdisc >/dev/null
+  [[ $(wc -l < "$TEST_TMP/tc-calls") -eq 1 ]] || exit 1
+  MOCK_REPLACE=1
+  if apply_fq_qdisc >/dev/null 2>&1; then exit 1; fi
+  : > "$TEST_TMP/tc-calls"
+  enable_bbr >/dev/null
+  [[ ! -s "$TEST_TMP/tc-calls" && ! -e "$BBR_CONF" ]] || exit 1
+  bbr_status > "$TEST_TMP/bbr-status"
+  command grep -q 'default qdisc: fq  interface qdisc: qdisc pfifo_fast' "$TEST_TMP/bbr-status" || exit 1
+) || fail 'isolated TCP tuning and qdisc safety regressions'
+pass 'isolated TCP tuning and qdisc safety regressions'
+
+# A direct call under ordinary set -e must stop before claiming success.
+if bash -c '
+  source "$1"
+  TUNE_CONF="$2"; BBR_CONF="$3"
+  sysctl() { if [[ "$1" == -n ]]; then printf "4096 65536 4194304\n"; else return 1; fi; }
+  write_tune_conf
+  printf "unreachable\n"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/errexit-tune" "$TEST_TMP/errexit-bbr" > "$TEST_TMP/errexit-output" 2>&1; then
+  fail 'direct sysctl failure obeys errexit'
+fi
+assert_false 'failed direct call never reports success or continues' \
+  command grep -Eq 'TCP tuning applied|unreachable' "$TEST_TMP/errexit-output"
 
 printf '# %d tests passed\n' "$TEST_COUNT"
