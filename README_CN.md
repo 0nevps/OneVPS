@@ -15,9 +15,6 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 
 - **VLESS + TCP + REALITY + Vision**：独立部署，无需自备域名或证书；
   客户端链接使用 `xtls-rprx-vision` 与 `chrome` uTLS 指纹。
-- **Trojan + WebSocket（Caddy 后端）**：sing-box 仅监听 `127.0.0.1`，Caddy 终结 TLS 并反代独立 WS 路径。
-  需要指向 VPS 的子域名，以及可达的 `80`/`443` 端口。
-  Trojan 入站路径必须匹配 `^/[A-Za-z0-9/_-]*$`，不允许空格、query 或 fragment；此限制与出站 WS 链接路径分开。
 - **Hysteria 2 + 原生 ACME**：独立 UDP，自动 HTTP-01 证书管理，可选 salamander 混淆。
 - 节点内用户、独立凭据与分享链接、节点出口及用户独立出口覆盖。
 - 候选配置校验、服务管理、独立 Realm 中转、BBR 与可选 TCP 优化。
@@ -33,7 +30,7 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 
 环境要求：使用 systemd 的 Linux、root 权限、amd64/arm64/armv7，以及 apt/dnf/yum/zypper。
 依赖包括 Bash、`curl`、`jq`、OpenSSL、CA 证书、解压与 SHA-256 工具。
-仅 Trojan + WS 需要 Caddy。发行版及架构兼容性仍需运行验证。
+发行版及架构兼容性仍需运行验证。
 
 ### 获取脚本
 
@@ -49,7 +46,7 @@ sudo bash onevps.sh
 ```
 
 脚本以 root 运行，可能修改服务、防火墙规则与可选内核参数。
-先从菜单安装核心，再添加 Reality 或 Trojan 节点。
+先从菜单安装核心，再添加 Reality 或 Hysteria 2 节点。
 核心固定为官方 **sing-box v1.14.3**，不跟随 latest；安装前对下载归档执行 SHA-256 校验，校验失败必须停止安装。
 
 OneVPS 正式版本包含 `onevps.sh` 与 `SHA256SUMS`。**旧发行版可能仍使用 Xray**，下载前请确认发布说明。
@@ -90,7 +87,7 @@ salamander、私网阻断和删除用户拒绝。运行测试将 ACME 替换为�
 
 ## 用户、分层出口与分享链接
 
-用户仅属于一个节点，不存在全局账号池。新增 Reality 用户使用独立 UUID，Trojan 用户使用独立密码。
+用户仅属于一个节点，不存在全局账号池。新增 Reality 用户使用独立 UUID，Hysteria 2 用户使用独立密码。
 同一节点内用户名及凭据必须唯一。保留的默认客户端通过节点重置操作管理，不通过用户菜单删除。
 删除新增用户并成功应用后，其访问权限失效，独立出口覆盖也随之移除。
 
@@ -127,7 +124,6 @@ SOCKS5 不加密流量或凭据，请使用可信或受保护的链路；UDP 能
 | 运行配置 | `/usr/local/etc/onevps/config.json` |
 | 节点元数据与秘密 | `/usr/local/etc/onevps/onevps-nodes.json`（`schema_version: 1`） |
 | 服务单元 | `/etc/systemd/system/onevps-sing-box.service` |
-| Trojan 备用页面 | `/var/lib/onevps/sites/<domain>/index.html` |
 
 ```bash
 /usr/local/bin/onevps-sing-box version
@@ -138,8 +134,7 @@ journalctl -u onevps-sing-box.service -f
 ```
 
 生成配置通过校验后才启用。核心使用非特权用户运行，并保留绑定低端口的能力；凭据文件需限制权限。
-Caddy 变更必须先校验再 reload，不替换其他站点。隐藏 WS 路径不能代替认证。
-核心与 Realm 分开卸载；共享的 Caddy 内容与主机级调优设置应予保留。
+核心与 Realm 分开卸载；外部服务与主机级调优设置予以保留。
 
 ## Realm、BBR 与 TCP
 
@@ -167,10 +162,10 @@ Realm 使用官方固定 `v2.9.6` 归档并验证 SHA-256，依赖支持 `Dynami
 运行验证使用 loopback 短命进程，不操作宿主服务。
 
 macOS arm64 上使用 **sing-box v1.14.3** 已通过 11 种出站配置检查，以及本地运行验证：
-Trojan WS 的 TCP/UDP 转发、错误密码拒绝、基于 `auth_user` 的分层路由、私网 CIDR 拒绝，
+Hysteria 2 的 TCP/UDP 转发、错误密码拒绝、基于 `auth_user` 的分层路由、私网 CIDR 拒绝，
 和以本地 TLS 1.3 服务为目标的 VLESS REALITY Vision 实际握手及 TCP 转发。
-这些结果仅覆盖同内核本地测试，不代表生产验证、其他客户端兼容性或 Caddy 集成已通过。
-单独通过配置 `check` 也不证明连通性。跨客户端/Caddy 互通和主机级失败路径仍需在临时主机验证，记录环境与结果。
+这些结果仅覆盖同内核本地测试，不代表生产验证、其他客户端兼容性已通过。
+单独通过配置 `check` 也不证明连通性。跨客户端互通和主机级失败路径仍需在临时主机验证，记录环境与结果。
 
 报告问题时附脱敏环境信息与准确版本。漏洞请按 [SECURITY.md](SECURITY.md) 私密报告，
 不要公开凭据或原始生产日志。

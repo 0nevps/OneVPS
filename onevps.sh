@@ -3,7 +3,6 @@
 # OneVPS - sing-box node setup script
 # Protocols:
 #   - VLESS + TCP + REALITY + XTLS Vision + uTLS (standalone)
-#   - Trojan + WebSocket behind Caddy (coexists with Caddy-proxied sites)
 #   - Hysteria 2 + native ACME HTTP-01 (standalone UDP)
 #
 set -euo pipefail
@@ -45,7 +44,6 @@ REALITY_DESTS=(
 PKG=""
 ARCH=""
 PUBIP=""
-CADDYFILE=""
 
 # ----------------------------------------------------------------------------
 # Output
@@ -410,286 +408,6 @@ port_taken_by_node() {
 }
 
 # ----------------------------------------------------------------------------
-# Caddy integration (for Trojan + WS nodes; shares Caddy's :443 + certs)
-# ----------------------------------------------------------------------------
-caddy_present() { command -v caddy >/dev/null 2>&1; }
-
-# Install Caddy from its official package repo (apt/dnf/yum). Non-zero if the
-# distro has no supported repo path.
-caddy_install_repo() {
-  case "$PKG" in
-    apt)
-      pkg_install debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
-      mkdir -p /usr/share/keyrings
-      # umask 077 (set script-wide) would make these root-only; apt reads the
-      # keyring and sources list as the unprivileged _apt user, so force 0644.
-      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || return 1
-      chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-        > /etc/apt/sources.list.d/caddy-stable.list || return 1
-      chmod 0644 /etc/apt/sources.list.d/caddy-stable.list
-      if DEBIAN_FRONTEND=noninteractive apt-get update -qq \
-         && apt-get install -y -qq caddy; then
-        return 0
-      fi
-      # Don't leave a broken/unsigned repo poisoning future apt runs.
-      rm -f /etc/apt/sources.list.d/caddy-stable.list
-      return 1
-      ;;
-    dnf)
-      dnf install -y -q 'dnf-command(copr)' || return 1
-      dnf copr enable -y @caddy/caddy || return 1
-      dnf install -y -q caddy
-      ;;
-    yum)
-      yum install -y -q yum-plugin-copr || return 1
-      yum copr enable -y @caddy/caddy || return 1
-      yum install -y -q caddy
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-# Fallback: drop the official static binary + systemd unit + caddy user.
-# Prefers the GitHub release tarball (a fast static asset); falls back to the
-# on-demand caddyserver.com build API. All downloads are time-limited so a slow
-# or blocked mirror fails fast instead of hanging.
-caddy_install_binary() {
-  local gh_arch td ver url
-  case "$ARCH" in
-    amd64) gh_arch="amd64" ;;
-    arm64) gh_arch="arm64" ;;
-    armv7) gh_arch="armv7" ;;
-  esac
-  td=$(mktemp -d)
-
-  ver=$(curl -fsSL --connect-timeout 10 --max-time 30 \
-          https://api.github.com/repos/caddyserver/caddy/releases/latest 2>/dev/null \
-        | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
-
-  if [[ -n "$ver" ]] && command -v tar >/dev/null 2>&1; then
-    url="https://github.com/caddyserver/caddy/releases/download/v${ver}/caddy_${ver}_linux_${gh_arch}.tar.gz"
-    info "downloading Caddy ${ver} (${gh_arch}) from GitHub..."
-    if curl -fL --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$td/caddy.tar.gz" \
-       && tar -xzf "$td/caddy.tar.gz" -C "$td" caddy 2>/dev/null; then
-      install -m 0755 "$td/caddy" /usr/local/bin/caddy || true
-    fi
-  fi
-
-  if ! caddy_present; then
-    local carch="$gh_arch"; [[ "$gh_arch" == armv7 ]] && carch="arm&arm=7"
-    info "trying caddyserver.com download API..."
-    if curl -fL --connect-timeout 15 --max-time 180 \
-        "https://caddyserver.com/api/download?os=linux&arch=${carch}" -o "$td/caddy"; then
-      install -m 0755 "$td/caddy" /usr/local/bin/caddy || true
-    fi
-  fi
-
-  rm -rf "$td"
-  caddy_present || { err "Caddy binary download failed"; return 1; }
-
-  id caddy >/dev/null 2>&1 || \
-    useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
-  mkdir -p /etc/caddy /var/lib/caddy /var/log/caddy
-
-  cat > /etc/systemd/system/caddy.service <<'EOF'
-[Unit]
-Description=Caddy
-Documentation=https://caddyserver.com/docs/
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-Type=notify
-User=caddy
-Group=caddy
-ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
-ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
-TimeoutStopSec=5s
-LimitNOFILE=1048576
-PrivateTmp=true
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-}
-
-# Guarantee Caddy is installed, has a Caddyfile, and is enabled. Non-zero on
-# failure. Sets CADDYFILE on success.
-ensure_caddy() {
-  if ! caddy_present; then
-    warn "Caddy not found; installing (required for Trojan nodes)"
-    if ! caddy_install_repo; then
-      warn "repo install unavailable; falling back to static binary"
-      caddy_install_binary || { err "Caddy install failed"; return 1; }
-    fi
-    caddy_present || { err "Caddy install failed"; return 1; }
-    ok "Caddy installed"
-  fi
-
-  local cf
-  cf=$(find_caddyfile)
-  if [[ -z "$cf" ]]; then
-    cf=/etc/caddy/Caddyfile
-    mkdir -p /etc/caddy
-    cat > "$cf" <<'EOF'
-# Managed alongside OneVPS. Caddy reverse-proxies real services here;
-# OneVPS appends marked Trojan-WS site blocks below.
-:80 {
-	respond "OK" 200
-}
-EOF
-    CADDYFILE="$cf"
-  fi
-
-  systemctl enable caddy >/dev/null 2>&1 || true
-  if ! systemctl is-active caddy >/dev/null 2>&1; then
-    systemctl start caddy >/dev/null 2>&1 || true
-  fi
-  return 0
-}
-
-find_caddyfile() {
-  [[ -n "$CADDYFILE" && -f "$CADDYFILE" ]] && { echo "$CADDYFILE"; return; }
-  local c
-  c=$(systemctl cat caddy 2>/dev/null \
-      | sed -n 's/.*--config[ =]\([^ ]*\).*/\1/p' | head -n1)
-  if [[ -n "$c" && -f "$c" ]]; then CADDYFILE="$c"; echo "$c"; return; fi
-  for c in /etc/caddy/Caddyfile /etc/Caddyfile /usr/local/etc/caddy/Caddyfile; do
-    [[ -f "$c" ]] && { CADDYFILE="$c"; echo "$c"; return; }
-  done
-  echo ""
-}
-
-# Reload Caddy after validating. Returns non-zero on validation/reload failure.
-caddy_reload() {
-  local file="$1"
-  if caddy_present; then
-    if ! caddy validate --adapter caddyfile --config "$file" >/dev/null 2>&1; then
-      err "Caddyfile validation failed ($file)"
-      return 1
-    fi
-  fi
-  if systemctl is-active caddy >/dev/null 2>&1; then
-    systemctl reload caddy >/dev/null 2>&1 && return 0
-  fi
-  if caddy_present; then
-    caddy reload --adapter caddyfile --config "$file" >/dev/null 2>&1 && return 0
-  fi
-  err "failed to reload Caddy"
-  return 1
-}
-
-# Web root served for non-WS traffic on a Trojan subdomain.
-caddy_site_root() { echo "/var/lib/onevps/sites/$1"; }
-
-# Drop a small static landing page so casual probes see a site, not a 404.
-# Never overwrites an existing index.html (user may customize it).
-ensure_site_content() {
-  local domain="$1" root
-  root=$(caddy_site_root "$domain")
-  mkdir -p "$root"
-  if [[ ! -f "$root/index.html" ]]; then
-    cat > "$root/index.html" <<'HTML'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>403 Forbidden</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-@keyframes floatA{0%,100%{transform:translateY(0)}50%{transform:translateY(-18px)}}
-@keyframes floatB{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-12px) rotate(3deg)}}
-@keyframes blob{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(30px,-20px) scale(1.12)}}
-@keyframes pop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
-@keyframes blink{0%,90%,100%{transform:scaleY(1)}95%{transform:scaleY(.1)}}
-@keyframes shake{0%,100%{transform:rotate(0)}25%{transform:rotate(-12deg)}75%{transform:rotate(12deg)}}
-</style>
-</head>
-<body>
-<div style="position:relative;min-height:100vh;width:100%;overflow:hidden;background:radial-gradient(1200px 800px at 75% 15%, #241d33 0%, #181520 55%, #131019 100%);font-family:'Outfit','Noto Sans SC',system-ui,sans-serif;color:#ece8f2;display:flex;align-items:center;justify-content:center;padding:48px 32px">
-  <div style="position:relative;z-index:2;display:flex;align-items:center;justify-content:center;max-width:760px;width:100%">
-    <div style="display:flex;flex-direction:column;gap:28px">
-      <div style="display:inline-flex;align-items:center;gap:10px;align-self:flex-start;padding:7px 14px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);font-size:13px;letter-spacing:.04em;color:#b9b2c9;font-weight:500">
-        <span style="width:8px;height:8px;border-radius:50%;background:#ff4d42;box-shadow:0 0 12px #ff4d42"></span>
-        HTTP 403 · FORBIDDEN
-      </div>
-      <div style="display:flex;align-items:baseline;gap:6px;font-weight:800;line-height:.85;font-size:clamp(96px,16vw,196px);letter-spacing:-.04em">
-        <span>4</span>
-        <span>0</span>
-        <span>3</span>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:10px">
-        <h1 style="font-size:clamp(26px,3.4vw,40px);font-weight:700;letter-spacing:-.01em;line-height:1.15">Access Forbidden</h1>
-      </div>
-      <p style="font-size:16px;line-height:1.7;color:#b9b2c9;max-width:52ch">
-        You don't have permission to view this page. Try signing in again, or reach out if you think this is a mistake.
-      </p>
-    </div>
-  </div>
-</div>
-</body>
-</html>
-HTML
-  fi
-  chmod -R a+rX /var/lib/onevps 2>/dev/null || true
-}
-
-# Append a marked site block routing a secret WS path to a local sing-box inbound.
-# Requests to the secret path are proxied to sing-box (reverse_proxy handles the
-# WebSocket upgrade); every other path returns HTTP 403 with the styled 403
-# page, so the rest of the subdomain looks like a locked-down site.
-# Reverts the append if Caddy reload fails. Returns non-zero on failure.
-caddy_add_route() {
-  local id="$1" domain="$2" path="$3" port="$4" file="$5" root
-  root=$(caddy_site_root "$domain")
-  ensure_site_content "$domain"
-  cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
-  {
-    printf '\n# OneVPS-trojan:%s BEGIN\n' "$id"
-    printf '%s {\n' "$domain"
-    printf '\tencode zstd gzip\n'
-    printf '\troot * %s\n' "$root"
-    printf '\thandle %s {\n' "$path"
-    printf '\t\treverse_proxy 127.0.0.1:%s\n' "$port"
-    printf '\t}\n'
-    printf '\thandle {\n'
-    printf '\t\terror 403\n'
-    printf '\t}\n'
-    printf '\thandle_errors {\n'
-    printf '\t\trewrite * /index.html\n'
-    printf '\t\tfile_server\n'
-    printf '\t}\n'
-    printf '}\n'
-    printf '# OneVPS-trojan:%s END\n' "$id"
-  } >> "$file" || return 1
-  if ! caddy_reload "$file"; then
-    err "reverting Caddyfile change"
-    caddy_remove_route "$id" "$file"
-    caddy_reload "$file" || true
-    return 1
-  fi
-  return 0
-}
-
-# Remove the marked block for a node id (does not reload; caller reloads).
-caddy_remove_route() {
-  local id="$1" file="$2"
-  [[ -f "$file" ]] || return 0
-  cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
-  sed -i "/# OneVPS-trojan:$id BEGIN/,/# OneVPS-trojan:$id END/d" "$file"
-}
-
-# ----------------------------------------------------------------------------
 # [3] Node storage + config generation
 # ----------------------------------------------------------------------------
 ensure_nodes_file() {
@@ -913,7 +631,7 @@ build_proxy_outbound() {
 build_outbound_routes() {
   local source="$1" rows row object tag proxy proxies='[]' rules assignments
   assignments=$(jq -c '
-    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2")) | . as $n |
+    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "hysteria2")) | . as $n |
       (if has("default_outbound") then
         {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
        else empty end),
@@ -948,7 +666,6 @@ render_config() {
     type=$(jq -r '.type' <<<"$n") || return 1
     case "$type" in
       vless-reality) ib=$(build_reality_inbound "$n") || return 1 ;;
-      trojan-ws)     ib=$(build_trojan_inbound "$n") || return 1 ;;
       hysteria2)     ib=$(build_hysteria2_inbound "$n") || return 1 ;;
       *) continue ;;
     esac
@@ -1013,9 +730,8 @@ validate_node_metadata() {
     .schema_version == 1 and (has("users") | not) and (has("clients") | not) and
     (.nodes | type == "array") and
     all(.nodes[]; (has("clients") | not) and (has("spider_x") | not) and
-      (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2") and
-      (if .type == "trojan-ws" then (.ws_path | type == "string" and test("^/[A-Za-z0-9/_-]*$"))
-       elif .type == "hysteria2" then
+      (.type == "vless-reality" or .type == "hysteria2") and
+      (if .type == "hysteria2" then
          (.domain | type == "string" and length <= 253 and
            test("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$")) and
          (.acme_email | type == "string" and test("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")) and
@@ -1037,7 +753,7 @@ validate_node_metadata() {
       (.enabled | type == "boolean") and
       (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
       (if .type == "vless-reality" then (.uuid | nonempty)
-       elif .type == "trojan-ws" or .type == "hysteria2" then (.password | nonempty)
+       elif .type == "hysteria2" then (.password | nonempty)
        else true end) and
       (if has("users") then (.users | type == "array") else true end) and
       ((.users // []) as $users |
@@ -1048,7 +764,7 @@ validate_node_metadata() {
           (.name | type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]") | not)) and
           (if $n.type == "vless-reality" then
              (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))
-           elif $n.type == "trojan-ws" or $n.type == "hysteria2" then (.password | nonempty)
+           elif $n.type == "hysteria2" then (.password | nonempty)
            else false end)) and
         (if .type == "vless-reality" then ([.uuid, $users[].uuid] | map(ascii_downcase))
          else [.password, $users[].password] end | length == (unique | length))))
@@ -1243,7 +959,7 @@ validate_node_selection() {
 prepare_node_user_change() {
   local source="$1" output="$2" id="$3" action="$4" uid="${5:-}" payload
   validate_node_metadata "$source" || return 1
-  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2"))' "$source" >/dev/null || return 1
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "hysteria2"))' "$source" >/dev/null || return 1
   case "$action" in
     add|reset) payload=$(jq -cse 'select(length == 1) | .[0]') || return 1 ;;
     delete)
@@ -1390,19 +1106,6 @@ build_reality_inbound() {
           private_key: $n.reality_private_key, short_id: [$n.reality_short_id]
         }
       }
-    }'
-}
-
-# Trojan inbound: listens on loopback only; Caddy terminates TLS on :443 and
-# reverse-proxies the WS path here. No TLS at the sing-box layer.
-build_trojan_inbound() {
-  local n="$1" clients
-  clients=$(node_clients "$n") || return 1
-  printf '%s\n%s\n' "$n" "$clients" | jq -s '
-    .[0] as $n | .[1] as $clients |
-    {
-      type: "trojan", tag: $n.tag, listen: "127.0.0.1", listen_port: $n.port,
-      users: $clients, transport: {type:"ws",path:$n.ws_path}
     }'
 }
 
@@ -1570,7 +1273,7 @@ add_reality_node() {
 }
 
 # ----------------------------------------------------------------------------
-# [4b] Add Trojan + WS node (behind Caddy)
+# [4b] Add Hysteria 2 node with native ACME
 # ----------------------------------------------------------------------------
 add_hysteria2_node() {
   require_singbox
@@ -1620,79 +1323,11 @@ add_hysteria2_node() {
   pause
 }
 
-add_trojan_node() {
-  require_singbox
-  ensure_nodes_file
-  echo; info "Add node - Trojan + WebSocket (behind Caddy)"
-
-  if ! ensure_caddy; then
-    err "Caddy required for Trojan nodes but could not be installed"
-    pause; return
-  fi
-  local cfile
-  cfile=$(find_caddyfile)
-  if [[ -z "$cfile" ]]; then
-    err "Caddyfile still not found after install"
-    pause; return
-  fi
-  info "using Caddyfile: $cfile"
-
-  local name domain password path id port node
-  name=$(ask "Node name" "trojan-$(openssl rand -hex 2)")
-
-  domain=$(normalize_domain "$(ask "Trojan subdomain (DNS A/AAAA -> this server)")")
-  while ! is_valid_domain "$domain"; do
-    warn "invalid domain"
-    domain=$(normalize_domain "$(ask "Trojan subdomain")")
-  done
-  if grep -qiF "$domain" "$cfile" 2>/dev/null; then
-    err "$domain already appears in $cfile; pick another subdomain or remove the existing block first"
-    pause; return
-  fi
-
-  password=$(ask "Password (Enter for random)" "$(rand_password)")
-  path="/$(openssl rand -hex 8)"
-  id=$(openssl rand -hex 4)
-  port=$(rand_port)   # loopback-only inbound; firewall untouched
-
-  node=$(jq -n \
-    --arg id "$id" --arg name "$name" --arg tag "trojan-$id" \
-    --argjson port "$port" --arg pw "$password" \
-    --arg domain "$domain" --arg path "$path" --arg cfile "$cfile" '
-    {
-      id: $id,
-      type: "trojan-ws",
-      name: $name,
-      tag: $tag,
-      port: $port,
-      password: $pw,
-      domain: $domain,
-      ws_path: $path,
-      caddy_file: $cfile,
-      enabled: true
-    }')
-
-  if ! caddy_add_route "$id" "$domain" "$path" "$port" "$cfile"; then
-    err "Caddy update failed, rolled back"
-    pause; return
-  fi
-
-  if jq_update_nodes --argjson node "$node" '.nodes += [$node]'; then
-    ok "Trojan node added"
-    info "ensure DNS A/AAAA for $domain points here so Caddy can issue its cert"
-    node_link "$(node_by_id "$id")"
-  else
-    err "sing-box config generation failed, rolled back"
-    caddy_remove_route "$id" "$cfile"; caddy_reload "$cfile" || true
-  fi
-  pause
-}
-
 # ----------------------------------------------------------------------------
 # Share links
 # ----------------------------------------------------------------------------
 node_link() {
-  local n="$1" type name port link addr uuid sni pubk sid fp pw domain path
+  local n="$1" type name port link addr uuid sni pubk sid fp pw domain
   type=$(jq -r '.type' <<<"$n")
   name=$(jq -r '.name' <<<"$n")
   port=$(jq -r '.port' <<<"$n")
@@ -1723,16 +1358,6 @@ node_link() {
     printf '\n%s-- %s (Hysteria 2 / ACME) --%s\n' "$c_grn" "$name" "$c_rst"
     printf '%s#%s\n' "$link" "$(urlenc "$name")"
     info "UDP/$port; native HTTP-01 renewal requires TCP/80 while the node is enabled"
-  elif [[ "$type" == "trojan-ws" ]]; then
-    pw=$(jq -r '.password' <<<"$n")
-    domain=$(jq -r '.domain' <<<"$n")
-    path=$(jq -r '.ws_path' <<<"$n")
-    link="trojan://$(urlenc "$pw")@${domain}:443?security=tls&sni=${domain}&type=ws&host=${domain}&path=$(urlenc "$path")#$(urlenc "$name")"
-    echo
-    printf '%s-- %s (Trojan + WS behind Caddy) --%s\n' "$c_grn" "$name" "$c_rst"
-    echo "$link"
-    printf '%sDomain: %s  path: %s  upstream: 127.0.0.1:%s%s\n' "$c_ylw" \
-      "$domain" "$path" "$port" "$c_rst"
   fi
 }
 
@@ -1754,7 +1379,6 @@ list_nodes() {
     i=$((i+1))
     en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
     case "$(jq -r '.type' <<<"$n")" in
-      trojan-ws) kind="trojan"; dest=$(jq -r '.domain' <<<"$n") ;;
       hysteria2) kind="hy2/udp"; dest=$(jq -r '.domain' <<<"$n") ;;
       *)         kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
     esac
@@ -1793,37 +1417,11 @@ manage_nodes() {
       printf '\n1) Change UDP port\n2) Reset default password\n3) Enable/disable\n4) Delete node\n5) Manage node users\n6) Set node outbound\n0) Back\n'
       case "$(ask 'Select')" in
         1) edit_port "$id" ;;
-        2) reset_trojan_password "$id" ;;
+        2) reset_node_password "$id" ;;
         3) toggle_enabled "$id" ;;
         4) del_node "$id"; return ;;
         5) manage_node_users "$id" || true ;;
         6) manage_outbound "$id" || true ;;
-        0|"") return ;;
-        *) continue ;;
-      esac
-    elif [[ "$type" == "trojan-ws" ]]; then
-      cat <<EOF
-
-  Node actions:
-   1) Reset default password
-   2) Change domain
-   3) Change WS path
-   4) Rebuild Caddy route
-   5) Enable/disable
-   6) Delete node
-   7) Manage node users
-   8) Set node outbound
-   0) Back
-EOF
-      case "$(ask 'Select')" in
-        1) reset_trojan_password "$id" ;;
-        2) edit_trojan_domain "$id" ;;
-        3) edit_trojan_path "$id" ;;
-        4) rebuild_trojan_route "$id" ;;
-        5) toggle_enabled "$id" ;;
-        6) del_node "$id"; return ;;
-        7) manage_node_users "$id" || true ;;
-        8) manage_outbound "$id" || true ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -1916,97 +1514,11 @@ edit_reality_target() {
   pause
 }
 
-reset_trojan_password() {
+reset_node_password() {
   local id="$1" pw
   pw=$(ask "New default password (Enter for random)" "$(rand_password)")
   printf '%s\n' "$pw" | jq -R . | apply_node_user_change "$id" reset || { err 'apply failed'; return 1; }
   ok "password reset"
-  pause
-}
-
-edit_trojan_domain() {
-  local id="$1" n cf port path olddom newdom
-  n=$(node_by_id "$id")
-  cf=$(jq -r '.caddy_file' <<<"$n")
-  port=$(jq -r '.port' <<<"$n")
-  path=$(jq -r '.ws_path' <<<"$n")
-  olddom=$(jq -r '.domain' <<<"$n")
-  newdom=$(normalize_domain "$(ask "New subdomain (DNS A/AAAA -> this server)" "$olddom")")
-  while ! is_valid_domain "$newdom"; do
-    warn "invalid domain"
-    newdom=$(normalize_domain "$(ask "New subdomain")")
-  done
-  if [[ "$newdom" == "$olddom" ]]; then warn "unchanged"; pause; return; fi
-
-  update_trojan_route "$id" "$cf" "$newdom" "$path" "$port" domain "$newdom" || return 1
-  ok "domain changed to $newdom"
-  info "ensure DNS for $newdom points here so Caddy can issue its cert"
-  pause
-}
-
-# Caddy edit is rolled back byte-for-byte when metadata/core activation fails.
-update_trojan_route() (
-  local id="$1" cf="$2" domain="$3" path="$4" port="$5" field="$6" value="$7" backup committed=false
-  [[ "$path" =~ ^/[A-Za-z0-9/_-]*$ ]] || { err 'WS path must contain only letters, digits, /, _ and -'; return 1; }
-  backup=$(mktemp) || return 1
-  cp -p "$cf" "$backup" || { rm -f "$backup"; return 1; }
-  route_cleanup() {
-    local status=$?
-    trap - EXIT INT TERM HUP
-    if ! $committed; then
-      if ! cp -p "$backup" "$cf" || ! caddy_reload "$cf"; then
-        err "Caddy rollback failed; backup retained at $backup"; exit 1
-      fi
-    fi
-    rm -f "$backup"
-    exit "$status"
-  }
-  trap route_cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
-  caddy_remove_route "$id" "$cf" || return 1
-  if grep -qiF "$domain" "$cf"; then err 'domain already in Caddyfile'; return 1; fi
-  caddy_add_route "$id" "$domain" "$path" "$port" "$cf" || return 1
-  if [[ -n "$field" ]]; then
-    jq_update_nodes --arg id "$id" --arg field "$field" --arg value "$value" \
-      '(.nodes[]|select(.id==$id))[$field] = $value' || return 1
-  fi
-  committed=true
-)
-
-edit_trojan_path() {
-  local id="$1" n cf port domain newpath
-  n=$(node_by_id "$id")
-  cf=$(jq -r '.caddy_file' <<<"$n")
-  port=$(jq -r '.port' <<<"$n")
-  domain=$(jq -r '.domain' <<<"$n")
-  newpath=$(ask "New WS path" "$(jq -r '.ws_path' <<<"$n")")
-  [[ "$newpath" == /* ]] || newpath="/$newpath"
-  update_trojan_route "$id" "$cf" "$domain" "$newpath" "$port" ws_path "$newpath" || return 1
-  ok "WS path changed to $newpath"
-  pause
-}
-
-# Regenerate the Caddy block for an existing node from its stored fields,
-# without changing the password/path/port (share link stays valid). Use after
-# updating the script to roll an old node onto the current Caddy template.
-rebuild_trojan_route() {
-  local id="$1" n cf domain path port
-  n=$(node_by_id "$id")
-  cf=$(jq -r '.caddy_file' <<<"$n")
-  domain=$(jq -r '.domain' <<<"$n")
-  path=$(jq -r '.ws_path' <<<"$n")
-  port=$(jq -r '.port' <<<"$n")
-  if [[ ! -f "$cf" ]]; then
-    cf=$(find_caddyfile)
-    [[ -n "$cf" ]] || { err "Caddyfile not found"; pause; return; }
-  fi
-  if update_trojan_route "$id" "$cf" "$domain" "$path" "$port" caddy_file "$cf"; then
-    ok "Caddy route rebuilt for $domain"
-  else
-    err "rebuild failed"
-  fi
   pause
 }
 
@@ -2018,39 +1530,15 @@ toggle_enabled() {
 }
 
 del_node() (
-  local id="$1" n port type cf='' backup='' committed=false
+  local id="$1" n port type
   confirm "Delete this node?" n || return
   n=$(node_by_id "$id") || return 1
   port=$(jq -r '.port' <<<"$n")
   type=$(jq -r '.type' <<<"$n")
-  delete_cleanup() {
-    local status=$?
-    trap - EXIT INT TERM HUP
-    if [[ -n "$backup" ]] && ! $committed; then
-      if ! cp -p "$backup" "$cf" || ! caddy_reload "$cf"; then
-        err "Caddy rollback failed; backup retained at $backup"; exit 1
-      fi
-    fi
-    [[ -z "$backup" ]] || rm -f "$backup"
-    exit "$status"
-  }
-  trap delete_cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
-  if [[ "$type" == "trojan-ws" ]]; then
-    cf=$(jq -r '.caddy_file' <<<"$n")
-    if [[ -f "$cf" ]]; then
-      backup=$(mktemp) || return 1
-      cp -p "$cf" "$backup" || { rm -f "$backup"; backup=''; return 1; }
-      caddy_remove_route "$id" "$cf" && caddy_reload "$cf" || return 1
-    fi
-  fi
   jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))' || { err 'delete failed'; return 1; }
-  committed=true
   if [[ "$type" == hysteria2 ]]; then
     warn "ACME data and TCP/80, UDP/$port firewall rules retained; review shared use before cleanup"
-  elif [[ "$type" != trojan-ws ]]; then close_port "$port" tcp; fi
+  else close_port "$port" tcp; fi
   ok 'deleted'
   pause
 )
@@ -2235,22 +1723,9 @@ uninstall() {
   singbox_owned || { err 'refusing to remove unmanaged sing-box resources'; return 1; }
   validate_node_metadata "$SINGBOX_NODES" || { err 'invalid metadata; inspect before uninstalling'; return 1; }
   warn "Remove only $SINGBOX_BIN, $SINGBOX_SERVICE, $SINGBOX_CONF and $SINGBOX_NODES"
-  warn 'Realm, BBR/TCP tuning, Caddy and custom site content are kept'
+  warn 'Realm, BBR/TCP tuning and external services are kept'
   warn "ACME accounts, certificates and private keys in $SINGBOX_ACME_DIR are kept; renewal stops with the service"
   confirm 'Confirm uninstall?' n || return
-  local n id cf backup
-  # Remove only our marked routes; failed Caddy reload aborts core removal.
-  while IFS= read -r n; do
-    id=$(jq -r '.id' <<<"$n"); cf=$(jq -r '.caddy_file' <<<"$n")
-    [[ -f "$cf" ]] || continue
-    backup=$(mktemp) || return 1
-    cp -p "$cf" "$backup" || { rm -f "$backup"; return 1; }
-    if ! caddy_remove_route "$id" "$cf" || ! caddy_reload "$cf"; then
-      cp -p "$backup" "$cf" && caddy_reload "$cf" || err "Caddy recovery failed; backup: $backup"
-      err 'Caddy cleanup failed; core retained'; return 1
-    fi
-    rm -f "$backup"
-  done < <(jq -c '.nodes[] | select(.type == "trojan-ws")' "$SINGBOX_NODES")
   systemctl stop onevps-sing-box && systemctl disable onevps-sing-box || return 1
   rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES" "$SINGBOX_DIR/.onevps-managed" || return 1
   # Never recursively remove a directory that may contain user files.
@@ -2562,7 +2037,6 @@ EOF
 
   1) Install / update sing-box-core
   2) Add node - VLESS + Reality + Vision + uTLS
-  3) Add node - Trojan + WS (behind Caddy)
   4) Manage nodes
   5) Show default node share links
   6) Restart service
@@ -2576,7 +2050,6 @@ EOF
     case "$(ask 'Select')" in
       1) install_singbox; pause ;;
       2) add_reality_node ;;
-      3) add_trojan_node ;;
       4) manage_nodes ;;
       5) show_links ;;
       6) restart_service ;;

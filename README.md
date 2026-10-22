@@ -15,10 +15,6 @@ OneVPS is a Bash tool for deploying and operating **sing-box v1.14.3** nodes on 
 
 - **VLESS + TCP + REALITY + Vision**: standalone deployment without your own domain or certificate;
   client links use `xtls-rprx-vision` and the `chrome` uTLS fingerprint.
-- **Trojan + WebSocket behind Caddy**: sing-box listens only on `127.0.0.1`; Caddy terminates TLS and
-  proxies a dedicated WebSocket path. Requires a subdomain pointing to the VPS and reachable ports `80`/`443`.
-  Trojan inbound paths must match `^/[A-Za-z0-9/_-]*$`: no spaces, query strings or fragments.
-  This restriction is separate from outbound WebSocket link paths.
 - **Hysteria 2 + native ACME**: standalone UDP, automatic HTTP-01 certificate management and optional salamander.
 - Node-local users, independent credentials and share links, node outbounds and per-user outbound overrides.
 - Candidate configuration validation, service management, independent Realm relays, BBR and optional TCP tuning.
@@ -35,7 +31,7 @@ Back up existing deployments and resolve conflicts explicitly before proceeding.
 
 Requirements: Linux with systemd, root access, amd64/arm64/armv7, and apt/dnf/yum/zypper.
 Dependencies include Bash, `curl`, `jq`, OpenSSL, CA certificates, archive and SHA-256 tools.
-Caddy is required only for Trojan + WS. Distribution and architecture compatibility still needs runtime validation.
+Distribution and architecture compatibility still needs runtime validation.
 
 ### Obtaining the script
 
@@ -51,7 +47,7 @@ sudo bash onevps.sh
 ```
 
 The script runs as root and can change services, firewall rules and optional kernel settings.
-Use the install-core menu entry first, then add a Reality or Trojan node.
+Use the install-core menu entry first, then add a Reality or Hysteria 2 node.
 The core is pinned to the official **sing-box v1.14.3** release, not a floating latest version;
 installation verifies the downloaded archive's SHA-256 before installing it. Verification failure must stop installation.
 
@@ -101,7 +97,7 @@ remain unverified; use an authorized disposable host and ACME staging before pro
 ## Users, outbounds and links
 
 Users belong to one node, not a global account pool. Each additional Reality user receives an independent UUID;
-each Trojan user receives an independent password. Names and credentials must be unique within the node.
+each Hysteria 2 user receives an independent password. Names and credentials must be unique within the node.
 The reserved default client is managed through the node's reset actions, not deleted through the user menu.
 Deleting an added user revokes its access and removes its outbound override after successful application.
 
@@ -140,7 +136,6 @@ restore the previous service state; this is not a power-loss-safe transaction gu
 | Runtime configuration | `/usr/local/etc/onevps/config.json` |
 | Node metadata and secrets | `/usr/local/etc/onevps/onevps-nodes.json` (`schema_version: 1`) |
 | Service unit | `/etc/systemd/system/onevps-sing-box.service` |
-| Trojan fallback page | `/var/lib/onevps/sites/<domain>/index.html` |
 
 ```bash
 /usr/local/bin/onevps-sing-box version
@@ -151,9 +146,8 @@ journalctl -u onevps-sing-box.service -f
 ```
 
 Generated configuration is validated before activation. The core runs unprivileged with permission to bind low
-ports; credentials require restricted file permissions. Caddy configuration changes must validate before reload,
-without replacing unrelated sites. A secret WS path is not a substitute for authentication.
-Uninstalling the core is separate from removing Realm; preserve shared Caddy content and host-wide tuning settings.
+ports; credentials require restricted file permissions.
+Uninstalling the core is separate from removing Realm; external services and host-wide tuning settings are preserved.
 
 ## Realm, BBR and TCP
 
@@ -181,10 +175,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for syntax, ShellCheck, unit, Markdown an
 Runtime tests use short-lived loopback processes, not host services.
 
 The macOS arm64 run with **sing-box v1.14.3** passed 11 outbound configuration checks and local runtime tests for
-Trojan WS TCP/UDP forwarding, wrong-password rejection, `auth_user`-based layered routing, private-CIDR rejection,
+Hysteria 2 TCP/UDP forwarding, wrong-password rejection, `auth_user`-based layered routing, private-CIDR rejection,
 and a real VLESS REALITY Vision handshake/TCP forwarding against a local TLS 1.3 target.
-These results cover same-core local tests, not production readiness, other client implementations or Caddy integration.
-Generated configuration `check` alone is not connectivity proof. Cross-client/Caddy interoperability and host-level
+These results cover same-core local tests, not production readiness, other client implementations.
+Generated configuration `check` alone is not connectivity proof. Cross-client interoperability and host-level
 failure-path testing remain follow-up work on disposable hosts; record exact environments and results.
 
 Report bugs with sanitized environment details and exact versions. Report vulnerabilities privately via

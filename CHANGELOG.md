@@ -5,6 +5,11 @@ All notable changes to OneVPS are documented in this file. The project follows
 
 ## [Unreleased]
 
+### Removed
+
+- Trojan support and its dedicated Caddy installation, route management and rollback code.
+- No migration or legacy-node handling is provided; external services, sites and certificates are left untouched.
+
 ### Added
 
 - Independent realm port relay menu with verified v2.9.6 downloads for amd64, arm64, and armv7.

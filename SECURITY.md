@@ -27,7 +27,7 @@ The local `archive/xray` branch is historical, not a separately maintained secur
 - Core downloads must pass SHA-256 verification before installation. A checksum from the same upstream is an
   integrity check, not independent publisher authentication.
 - Real sing-box `check` is required before activation; it does not prove safe routing or end-to-end connectivity.
-- SOCKS5 and Realm add no encryption. Keep Trojan WS loopback-only behind Caddy and restrict exposed ports.
+- SOCKS5 and Realm add no encryption. Restrict exposed ports; Hysteria 2 requires public TCP/80 for ACME renewal.
 
 ## Reporting a Vulnerability
 
@@ -43,7 +43,7 @@ Include as much of the following as possible:
 - A description of the issue and its security impact
 - The affected OneVPS commit
 - Reproduction steps or a minimal proof of concept
-- The affected distribution, architecture, sing-box version, and Caddy version
+- The affected distribution, architecture, and sing-box version
 - Whether default configuration is affected
 - Suggested mitigations or fixes, if known
 
@@ -53,7 +53,7 @@ passwords, private keys, WebSocket paths, API tokens, or unnecessary public IP a
 ## Response Process
 
 Maintainers aim to acknowledge a complete report within seven days. Investigation and remediation time depends
-on impact, reproducibility, and whether coordination with sing-box, Caddy, a Linux distribution, or another upstream
+on impact, reproducibility, and whether coordination with sing-box, a Linux distribution, or another upstream
 project is required.
 
 The expected process is:
@@ -72,13 +72,13 @@ constraints prevent it.
 In scope:
 
 - The `onevps.sh` code in this repository
-- Generated sing-box and Caddy configuration
+- Generated sing-box configuration
 - Credential generation, storage permissions, and share-link handling
 - Installation, update, service, firewall, and system-tuning operations performed by OneVPS
 
 Usually out of scope unless OneVPS causes or worsens the issue:
 
-- Vulnerabilities in sing-box, Caddy, Realm, Linux, systemd, or package repositories
+- Vulnerabilities in sing-box, Realm, Linux, systemd, or package repositories
 - Compromised hosts unrelated to OneVPS behavior
 - Social engineering, denial-of-service traffic, or attacks against infrastructure not owned by the reporter
 - Reports that expose third-party credentials or personal data
@@ -95,4 +95,4 @@ Usually out of scope unless OneVPS causes or worsens the issue:
 - `main` 是固定 sing-box v1.14.3 的全新安装重写，尚在实施与验证；旧发行版可能仍使用 Xray。
 - 元数据为 `schema_version: 1`，不支持迁移或双内核；旧配置或服务冲突必须停止操作，不自动覆盖或接管。
 - 保护 `/usr/local/etc/onevps/` 内的配置、元数据、备份和分享链接；核心下载必须先校验 SHA-256。
-- 真实内核 `check` 不等于互通或生产验证；SOCKS5 和 Realm 不增加加密，Trojan WS 应只监听本机。
+- 真实内核 `check` 不等于互通或生产验证；SOCKS5 和 Realm 不增加加密；HY2 ACME 续期需要公网 TCP/80。

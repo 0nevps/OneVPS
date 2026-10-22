@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        OneVPS is intentionally focused on Xray deployment and operations.
+        OneVPS is intentionally focused on sing-box deployment and operations.
         Explain the operational problem before describing a preferred solution.
 
   - type: textarea
@@ -36,7 +36,7 @@ body:
     id: environments
     attributes:
       label: Relevant environments
-      description: List distributions, architectures, Xray versions, or Caddy versions.
+      description: List distributions, architectures, sing-box versions, or Realm versions.
 
   - type: textarea
     id: risks
@@ -51,5 +51,5 @@ body:
       options:
         - label: I searched existing issues and the project roadmap.
           required: true
-        - label: This request fits OneVPS's Xray-focused scope.
+        - label: This request fits OneVPS's sing-box-focused scope.
           required: true

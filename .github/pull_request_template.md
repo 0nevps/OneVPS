@@ -27,7 +27,7 @@ Describe compatibility, security, migration, credential, firewall, systemd, and 
 
 - [ ] The change is focused and does not include unrelated formatting.
 - [ ] Tests cover new or changed pure logic.
-- [ ] Generated Xray or Caddy configuration is validated before activation.
+- [ ] Generated sing-box configuration is validated before activation.
 - [ ] English and Chinese documentation are synchronized when behavior changes.
 - [ ] Logs, fixtures, and screenshots contain no live credentials or identifying server data.
 - [ ] Security-sensitive details use Private Vulnerability Reporting instead of this pull request.

@@ -47,8 +47,8 @@ body:
     id: component_versions
     attributes:
       label: Component versions
-      description: Include sing-box, systemd, Caddy and Realm versions when relevant.
-      placeholder: sing-box 1.14.3; systemd 257; Caddy 2.x
+      description: Include sing-box, systemd and Realm versions when relevant.
+      placeholder: sing-box 1.14.3; systemd 257; Realm 2.9.6
 
   - type: textarea
     id: installation_state

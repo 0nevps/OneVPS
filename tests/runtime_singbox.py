@@ -1,6 +1,5 @@
 """Loopback-only forwarding tests; never install or change host services."""
 
-import copy
 import http.client
 import http.server
 import json
@@ -120,66 +119,13 @@ try:
     upstream = http_server(b"upstream")
     servers.extend([direct, upstream])
     destination_port = direct.server_port
-    relay_port, server_port = free_port(), free_port()
+    relay_port = free_port()
     relay = {
         "inbounds": [{"type": "socks", "tag": "relay", "listen": "127.0.0.1", "listen_port": relay_port}],
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "route": {"rules": [{"action": "route", "outbound": "direct", "override_address": "127.0.0.1", "override_port": upstream.server_port}]},
     }
     start("relay", relay, relay_port)
-    generated = json.loads(pathlib.Path(BASE).read_text())
-    inbound = next(item for item in generated["inbounds"] if item["type"] == "trojan")
-    inbound["listen_port"] = server_port
-    default_user, alice = inbound["users"]
-    generated["inbounds"] = [inbound]
-    proxy = next(item for item in generated["outbounds"] if item["type"] == "socks")
-    proxy["server_port"] = relay_port
-    # Exercise generated identity rules, not hand-written replicas. Loopback is allowed
-    # only in this functional fixture; generated security rules are tested below.
-    generated["route"]["rules"] = [
-        rule for rule in generated["route"]["rules"]
-        if rule.get("action") not in ("sniff", "reject")
-    ]
-    start("server", generated, server_port)
-
-    def client(name, password, target=server_port):
-        port = free_port()
-        config = {
-            "inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": port}],
-            "outbounds": [{"type": "trojan", "tag": "proxy", "server": "127.0.0.1", "server_port": target,
-                           "password": password, "transport": copy.deepcopy(inbound["transport"])}],
-        }
-        start(name, config, port)
-        return port
-
-    default_port = client("default-client", default_user["password"])
-    alice_port = client("alice-client", alice["password"])
-    assert request(default_port, destination_port) == b"upstream", "default user missed node proxy"
-    assert request(alice_port, destination_port) == b"direct", "user direct override missed"
-    print("ok - Trojan WS credentials select isolated default and user routes")
-    wrong_port = client("wrong-client", "invalid-disposable-password")
-    try:
-        result = request(wrong_port, destination_port)
-    except (OSError, http.client.HTTPException):
-        pass
-    else:
-        raise AssertionError("invalid password forwarded data: " + repr(result))
-    print("ok - invalid Trojan password cannot forward")
-
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as echo:
-        echo.bind(("127.0.0.1", 0))
-        echo.settimeout(6)
-
-        def echo_once():
-            data, address = echo.recvfrom(4096)
-            echo.sendto(data, address)
-
-        worker = threading.Thread(target=echo_once, daemon=True)
-        worker.start()
-        udp_request(alice_port, echo.getsockname()[1])
-        worker.join(timeout=6)
-    print("ok - Trojan WS forwards UDP through explicit direct user route")
-
     # A local TLS 1.3 HTTP/2 target avoids relying on public Reality handshake sites.
     certificate, key = WORK / "target.crt", WORK / "target.key"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -199,6 +145,7 @@ try:
     reality_inbound["listen_port"] = reality_port
     reality_inbound["tls"]["server_name"] = "localhost"
     reality_inbound["tls"]["reality"]["handshake"] = {"server": "127.0.0.1", "server_port": target.server_port}
+    reality.pop("certificate_providers", None)
     reality["inbounds"] = [reality_inbound]
     reality["outbounds"] = [{"type": "direct", "tag": "direct"}]
     reality["route"]["rules"] = []
@@ -216,23 +163,6 @@ try:
     start("reality-client", reality_client, reality_client_port)
     assert request(reality_client_port, destination_port) == b"direct"
     print("ok - VLESS Reality Vision completes a real local handshake and forwards TCP")
-
-    blocked = copy.deepcopy(generated)
-    blocked_port = free_port()
-    blocked["inbounds"][0]["listen_port"] = blocked_port
-    original = json.loads(pathlib.Path(BASE).read_text())
-    security = [rule for rule in original["route"]["rules"] if rule.get("action") in ("sniff", "reject")]
-    assert any("127.0.0.0/8" in rule.get("ip_cidr", []) for rule in security)
-    blocked["route"]["rules"] = security + blocked["route"]["rules"]
-    start("blocked-server", blocked, blocked_port)
-    blocked_client = client("blocked-client", default_user["password"], blocked_port)
-    try:
-        result = request(blocked_client, destination_port)
-    except (OSError, http.client.HTTPException):
-        pass
-    else:
-        raise AssertionError("private-address guard forwarded data: " + repr(result))
-    print("ok - generated private-address rejection precedes outbound routing")
 
     def hy2_server(name, fixture="runtime-hy2.json", guard=False):
         config = json.loads((WORK / fixture).read_text())
@@ -326,7 +256,8 @@ try:
     print("ok - HY2 matching salamander forwards TCP")
     cannot_forward(hy2_client("hy2-obfs-mismatch", obfuscated, hy2_alice["password"], obfs="wrong-salamander"), "mismatched salamander")
     guarded = hy2_server("hy2-guarded-server", guard=True)
-    cannot_forward(hy2_client("hy2-guarded-client", guarded, hy2_alice["password"]), "private CIDR rejection")
+    cannot_forward(hy2_client("hy2-guarded-client", guarded, hy2_alice["password"]), "private CIDR rejection before user direct")
+    cannot_forward(hy2_client("hy2-guarded-default", guarded, hy2_default["password"]), "private CIDR rejection before node proxy")
     deleted = hy2_server("hy2-deleted-server", "runtime-hy2-deleted.json")
     survivor = hy2_client("hy2-surviving-client", deleted, hy2_bob["password"])
     assert request(survivor, destination_port) == b"upstream"

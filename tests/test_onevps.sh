@@ -104,7 +104,6 @@ assert_true "random passwords are 32 lowercase hex characters" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{32}$ ]]' _ "$(rand_password)"
 
 reality_node=$(jq -c '.nodes[] | select(.id == "a1b2c3d4")' "$FIXTURE")
-trojan_node=$(jq -c '.nodes[] | select(.id == "b2c3d4e5")' "$FIXTURE")
 
 reality_inbound=$(build_reality_inbound "$reality_node")
 assert_jq "builds a public VLESS Reality inbound" "$reality_inbound" \
@@ -118,15 +117,6 @@ assert_jq "sets Reality target and secret fields" "$reality_inbound" \
 assert_jq "enables Vision on native TCP" "$reality_inbound" \
   '.users[0].flow == "xtls-rprx-vision" and (has("transport") | not)'
 
-trojan_inbound=$(build_trojan_inbound "$trojan_node")
-assert_jq "builds a loopback-only Trojan inbound" "$trojan_inbound" \
-  '.listen == "127.0.0.1" and .listen_port == 20001 and .type == "trojan"'
-assert_jq "sets Trojan WebSocket transport without TLS" "$trojan_inbound" \
-  '.users[0].password == "test+pass@example"
-   and .transport.type == "ws"
-   and (.tls.enabled // false | not)
-   and .transport.path == "/secret-path"'
-
 # Hysteria 2 uses native ACME, scoped passwords and protocol-aware ports.
 hy2_node='{"id":"hy2-test","type":"hysteria2","name":"HY2 / Test","tag":"hy2-test","domain":"hy2.example.com","acme_email":"ops@example.com","port":443,"password":"test+pass@hy2","enabled":true,"users":[{"id":"alice","name":"Alice","password":"alice-password"}]}'
 jq --argjson node "$hy2_node" '.nodes += [$node]' "$FIXTURE" > "$TEST_TMP/hy2.json"
@@ -135,7 +125,7 @@ render_config "$TEST_TMP/hy2.json" "$TEST_TMP/hy2-config.json"
 assert_file_jq "native ACME uses HTTP-01 only and persistent storage" "$TEST_TMP/hy2-config.json" \
   '.certificate_providers | length == 1 and .[0].type == "acme" and .[0].provider == "letsencrypt" and .[0].disable_tls_alpn_challenge and (.[0].disable_http_challenge|not) and .[0].data_directory == "/var/lib/onevps-acme"'
 assert_file_jq "HY2 TLS references shared provider and preserves identities" "$TEST_TMP/hy2-config.json" \
-  '[.inbounds[] | select(.type == "hysteria2")][0] | .tls.certificate_provider == "acme-hy2.example.com" and .tls.enabled and (.users|length)==2 and .users[0].name == "hy2-test@onevps"'
+  '[.inbounds[] | select(.tag == "hy2-test")][0] | .tls.certificate_provider == "acme-hy2.example.com" and .tls.enabled and (.users|length)==2 and .users[0].name == "hy2-test@onevps"'
 assert_contains "HY2 link encodes password and name" "$(node_link "$hy2_node")" \
   'hysteria2://test%2Bpass%40hy2@hy2.example.com:443/?sni=hy2.example.com#HY2%20%2F%20Test'
 assert_contains "HY2 user link selects independent password" "$(node_user_link "$hy2_node" alice)" \
@@ -160,7 +150,7 @@ assert_file_jq "disabled HY2 emits neither inbound nor unused provider" "$TEST_T
 assert_true "HY2 ports are scoped by transport" bash -c '
   source "$1"; SINGBOX_NODES="$2"
   port_taken_by_node 443 udp && port_taken_by_node 443 tcp &&
-    ! port_taken_by_node 20001 udp && ! port_taken_by_node 443 udp hy2-test
+    port_taken_by_node 20001 udp && ! port_taken_by_node 443 udp hy2-test
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/hy2.json"
 
 assert_true "ACME readiness failure rolls back both live files" bash -c '
@@ -196,13 +186,6 @@ assert_contains "encodes VLESS display name" "$reality_link_output" \
 assert_false "share link omits unsupported spider path" \
   bash -c '[[ "$1" == *spx=* ]]' _ "$reality_link_output"
 
-# URI escaping is tested independently from the runtime path validator.
-trojan_link_output=$(node_link "$(jq -c '.ws_path = "/secret path"' <<<"$trojan_node")")
-assert_contains "encodes the Trojan password" "$trojan_link_output" \
-  "trojan://test%2Bpass%40example@node.example.com:443?"
-assert_contains "encodes the Trojan WebSocket path" "$trojan_link_output" \
-  "path=%2Fsecret%20path#Trojan%20Test"
-
 SINGBOX_DIR="$TEST_TMP/singbox"
 SINGBOX_CONF="$SINGBOX_DIR/config.json"
 SINGBOX_NODES="$SINGBOX_DIR/onevps-nodes.json"
@@ -219,6 +202,9 @@ render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
 secure_singbox_files() { :; }
 validate_singbox_config() { :; }
 systemctl() { :; }
+hysteria2_preflight() { :; }
+verify_hysteria2_nodes() { :; }
+open_port() { :; }
 
 rebuild_config
 assert_file_jq "includes only enabled nodes" "$SINGBOX_CONF" \
@@ -366,7 +352,7 @@ for mutation in 'del(.schema_version)' '.schema_version = 0' '.schema_version = 
   assert_false "rejects old or incompatible metadata: $mutation" validate_node_metadata "$node_candidate"
   assert_false "refuses to render incompatible metadata: $mutation" render_config "$node_candidate" "$TEST_TMP/rendered.json"
 done
-for mutation in '.nodes = null' '.nodes[0].id = ""' '.nodes[1].id = .nodes[0].id' '.nodes[0].uuid = null' '.nodes[1].password = ""'; do
+for mutation in '.nodes[1].type = "unsupported"' '.nodes = null' '.nodes[0].id = ""' '.nodes[1].id = .nodes[0].id' '.nodes[0].uuid = null' '.nodes[1].password = ""'; do
   jq "$mutation" "$SINGBOX_NODES" > "$node_candidate"
   assert_false "rejects invalid node metadata: $mutation" validate_node_metadata "$node_candidate"
 done
@@ -581,8 +567,9 @@ assert_true "cancelled outbound menu uses visible input and preserves files" bas
 
 # Both node menus expose local user management and outbound settings.
 for node_id in a1b2c3d4 b2c3d4e5; do
-  printf '8\n1\n2\n0\n' > "$TEST_TMP/menu-input"
-  assert_true "node menu $node_id keeps outbound 8 and local users 7" bash -c '
+  outbound_action=8; [[ "$node_id" != b2c3d4e5 ]] || outbound_action=6
+  printf '%s\n1\n2\n0\n' "$outbound_action" > "$TEST_TMP/menu-input"
+  assert_true "node menu $node_id exposes outbound and local users" bash -c '
     source "$1"; SINGBOX_NODES="$2"; selected="$3"; capture="$5"
     exec 3< "$4"
     ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
@@ -591,7 +578,7 @@ for node_id in a1b2c3d4 b2c3d4e5; do
     apply_outbound_assignment() { printf "%s\n" "$*" > "$capture"; command cat >> "$capture"; }
     before=$(cksum "$2")
     output=$(manage_nodes)
-    [[ "$output" == *"8) Set node outbound"* && "$output" != *"Connection users"* &&
+    [[ "$output" == *"Set node outbound"* && "$output" != *"Connection users"* &&
        "$(command cat "$capture")" == "$selected all []"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
   ' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
@@ -648,6 +635,7 @@ assert_true "outbound secrets never occur in external jq or openssl argv" bash -
 # Validation logs are deliberately withheld even when the core prints a secret.
 assert_true "rebuild does not echo core validation secrets" bash -c '
   source "$1"; SINGBOX_NODES="$2"; SINGBOX_DIR=$(dirname "$2"); SINGBOX_BIN="$3"; SINGBOX_CONF="$4"
+  hysteria2_preflight() { :; }
   validate_singbox_config() { touch "$SINGBOX_DIR/validator-called"; printf "SECRET_CORE_OUTPUT\n" > "$2"; return 1; }
   output=$(rebuild_config 2>&1) && exit 1
   [[ -f "$SINGBOX_DIR/validator-called" && "$output" != *SECRET_CORE_OUTPUT* ]]
@@ -664,12 +652,12 @@ assert_true "same user ID and name are independent across nodes" apply_node_user
 assert_file_jq "both protocols retain default and add users" "$SINGBOX_CONF" '(.inbounds[0].users|length) == 3 and (.inbounds[1].users|length) == 2'
 assert_file_jq "runtime names retain stable node-scoped authentication identities" "$SINGBOX_CONF" \
   '.inbounds[0].users[0].name == "reality-a1b2c3d4@onevps" and
-   .inbounds[1].users[0].name == "trojan-b2c3d4e5@onevps" and
+   .inbounds[1].users[0].name == "hy2-b2c3d4e5@onevps" and
    .inbounds[0].users[1].name == ((["a1b2c3d4","alice"]|tojson|@base64) + "@onevps-user") and
    .inbounds[0].users[1].name != .inbounds[1].users[1].name and
    all(.inbounds[].users[]; (has("email")|not) and (has("id")|not))'
 assert_contains "Reality user link uses independent credential" "$(node_user_link "$(node_by_id a1b2c3d4)" alice)" 'vless://123e4567-e89b-12d3-a456-426614174011@'
-assert_contains "Trojan user link encodes independent password" "$(node_user_link "$(node_by_id b2c3d4e5)" alice)" 'trojan://user%2Bsecret@'
+assert_contains "HY2 user link encodes independent password" "$(node_user_link "$(node_by_id b2c3d4e5)" alice)" 'hysteria2://user%2Bsecret@'
 for mutation in '.nodes[0].users=null' '.nodes[0].users[0].id="default"' '.nodes[0].users[0].id="bad id"' '.nodes[0].users[0].name=" "' '.nodes[0].users[1].id="alice"' '.nodes[0].users[1].name="Alice"' '.nodes[0].users[0].uuid=.nodes[0].uuid' '.nodes[0].users[0].uuid="bad"' '.nodes[1].users[0].password=.nodes[1].password' '.nodes[0].default_outbound=null' '.nodes[0].users[0].outbound=null'; do
   jq "$mutation" "$SINGBOX_NODES" > "$node_candidate"
   assert_false "reject invalid local user metadata $mutation" validate_node_metadata "$node_candidate"
@@ -678,7 +666,7 @@ assert_false "duplicate user addition rejected" apply_node_user_change a1b2c3d4 
 assert_false "default cannot be deleted" apply_node_user_change a1b2c3d4 delete default
 assert_false "unknown user cannot be deleted" apply_node_user_change a1b2c3d4 delete missing
 assert_false "default reset rejects local credential collision" apply_node_user_change a1b2c3d4 reset <<<'"123e4567-e89b-12d3-a456-426614174011"'
-assert_false "Trojan reset rejects local credential collision" apply_node_user_change b2c3d4e5 reset <<<'"user+secret"'
+assert_false "HY2 reset rejects local credential collision" apply_node_user_change b2c3d4e5 reset <<<'"user+secret"'
 assert_true "set inherited node proxy for all identities" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
 assert_true "selected batch sets default and Alice only" apply_outbound_assignment a1b2c3d4 selected '["default","alice"]' <<<"$second_proxy"
 assert_file_jq "default override does not change node inheritance" "$SINGBOX_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
@@ -729,104 +717,43 @@ MOCK_SERVICE_MODE=ok
 pass 'real menus add/link/select multiple/all/delete on both protocols'
 assert_file_jq "menu deletion preserves other users and removes all overrides" "$SINGBOX_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
 
-# Caddy changes and core transactions share rollback without touching host services.
-assert_true "Trojan route edits and deletion restore Caddy and core state on failure" bash -c '
+# Shared password reset and node deletion retain transactional safety on both protocols.
+assert_true "password reset and node deletion preserve shared state and rollback" bash -c '
   source "$1"
-  root="$2/caddy-transaction"; mkdir -p "$root"
-  export TMPDIR="$root"
-  SINGBOX_DIR="$root"; SINGBOX_BIN="$root/core"
-  SINGBOX_NODES="$root/nodes.json"; SINGBOX_CONF="$root/config.json"
-  caddy_file="$root/Caddyfile"
+  SINGBOX_DIR="$2/node-lifecycle"; mkdir -p "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"
+  SINGBOX_BIN="$SINGBOX_DIR/core"
   printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
-  jq --arg cf "$caddy_file" ".nodes[1].caddy_file = \$cf" "$3" > "$SINGBOX_NODES"
-  render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
-  printf "original Caddy content\n" > "$caddy_file"
-  cp "$caddy_file" "$root/caddy.before"
-  cp "$SINGBOX_NODES" "$root/nodes.before"; cp "$SINGBOX_CONF" "$root/config.before"
-  core_fail=false; recovery_fail=false
-  pause() { :; }; confirm() { return 0; }; secure_singbox_files() { :; }
-  close_port() { return 99; }
+  cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  pause() { :; }; confirm() { return 0; }; ask() { printf "new-default-password\n"; }
+  hysteria2_preflight() { :; }; verify_hysteria2_nodes() { :; }; open_port() { :; }
+  close_port() { printf "%s\n" "$*" >> "$SINGBOX_DIR/closed"; }
+  fail_restart=false
   systemctl() {
-    case "$1" in
-      is-active) return 0 ;;
-      restart)
-        if $core_fail && [[ ! -f "$root/core-failed" ]]; then touch "$root/core-failed"; return 1; fi
-        return 0 ;;
-      *) return 99 ;;
-    esac
-  }
-  caddy_remove_route() { printf "other site\n" > "$2"; }
-  caddy_reload() {
-    printf "reload\n" >> "$root/reloads"
-    if $recovery_fail && cmp -s "$1" "$root/caddy.before"; then return 1; fi
+    if [[ "$1" == restart ]] && $fail_restart && [[ ! -e "$SINGBOX_DIR/failed" ]]; then
+      touch "$SINGBOX_DIR/failed"; return 1
+    fi
     return 0
   }
-  caddy_add_route() { printf "%s %s %s\n" "$2" "$3" "$4" >> "$5"; caddy_reload "$5"; }
-  mktemp() {
-    local generated
-    if (($# == 0)); then
-      generated=$(command mktemp "$root/caddy-backup.XXXXXXXX") || return 1
-      printf "%s\n" "$generated" > "$root/last-backup"
-    else
-      generated=$(command mktemp "$@") || return 1
-    fi
-    printf "%s\n" "$generated"
-  }
-  for operation in path delete; do
-    core_fail=true; rm -f "$root/core-failed"; : > "$root/reloads"
-    if [[ "$operation" == path ]]; then
-      if update_trojan_route b2c3d4e5 "$caddy_file" node.example.com /updated 20001 ws_path /updated; then exit 1; fi
-    else
-      if del_node b2c3d4e5; then exit 1; fi
-    fi
-    cmp "$caddy_file" "$root/caddy.before" && cmp "$SINGBOX_NODES" "$root/nodes.before" && cmp "$SINGBOX_CONF" "$root/config.before" || exit 1
-    [[ $(wc -l < "$root/reloads") -eq 2 && ! -e $(<"$root/last-backup") ]] || exit 1
+  reset_node_password b2c3d4e5 || exit 1
+  jq -e ".nodes[1].password == \"new-default-password\"" "$SINGBOX_NODES" >/dev/null || exit 1
+  jq -e ".inbounds[1].users[0].password == \"new-default-password\"" "$SINGBOX_CONF" >/dev/null || exit 1
+  SINGBOX_ACME_DIR="$SINGBOX_DIR/acme"
+  mkdir "$SINGBOX_ACME_DIR"; printf "keep certificate\n" > "$SINGBOX_ACME_DIR/certificate"
+  for id in a1b2c3d4 b2c3d4e5; do
+    cp "$SINGBOX_NODES" "$SINGBOX_DIR/nodes.before"; cp "$SINGBOX_CONF" "$SINGBOX_DIR/config.before"
+    fail_restart=true; rm -f "$SINGBOX_DIR/failed"
+    if del_node "$id"; then exit 1; fi
+    cmp "$SINGBOX_NODES" "$SINGBOX_DIR/nodes.before" && cmp "$SINGBOX_CONF" "$SINGBOX_DIR/config.before" || exit 1
+    [[ ! -e "$SINGBOX_DIR/closed" ]] || exit 1
   done
-  core_fail=false
-  update_trojan_route b2c3d4e5 "$caddy_file" node.example.com /updated 20001 ws_path /updated || exit 1
-  jq -e ".nodes[1].ws_path == \"/updated\"" "$SINGBOX_NODES" >/dev/null || exit 1
-  jq -e ".inbounds[1].transport.path == \"/updated\"" "$SINGBOX_CONF" >/dev/null || exit 1
-  update_trojan_route b2c3d4e5 "$caddy_file" changed.example.com /updated 20001 domain changed.example.com || exit 1
-  jq -e ".nodes[1].domain == \"changed.example.com\"" "$SINGBOX_NODES" >/dev/null || exit 1
-  grep -q "changed.example.com /updated 20001" "$caddy_file" || exit 1
-  cp "$caddy_file" "$root/caddy.before"
-  cp "$SINGBOX_NODES" "$root/nodes.before"; cp "$SINGBOX_CONF" "$root/config.before"
-  for operation in path delete; do
-    core_fail=true; recovery_fail=true; rm -f "$root/core-failed"
-    if [[ "$operation" == path ]]; then
-      if update_trojan_route b2c3d4e5 "$caddy_file" changed.example.com /failure 20001 ws_path /failure; then exit 1; fi
-    else
-      if del_node b2c3d4e5; then exit 1; fi
-    fi
-    retained=$(<"$root/last-backup")
-    [[ -f "$retained" ]] && cmp "$retained" "$root/caddy.before" || exit 1
-    cmp "$SINGBOX_NODES" "$root/nodes.before" && cmp "$SINGBOX_CONF" "$root/config.before" || exit 1
-    rm "$retained"
-  done
-  core_fail=false; recovery_fail=false
+  fail_restart=false
   del_node b2c3d4e5 || exit 1
   jq -e "all(.nodes[]; .id != \"b2c3d4e5\")" "$SINGBOX_NODES" >/dev/null || exit 1
-  jq -e "all(.inbounds[]; .type != \"trojan\")" "$SINGBOX_CONF" >/dev/null || exit 1
-  [[ $(<"$caddy_file") == "other site" && ! -e $(<"$root/last-backup") ]]
-' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
-
-assert_true "Trojan route rebuild saves a rediscovered Caddyfile path" bash -c '
-  source "$1"
-  root="$2/caddy-rediscovery"; mkdir -p "$root"
-  SINGBOX_DIR="$root"; SINGBOX_BIN="$root/core"
-  SINGBOX_NODES="$root/nodes.json"; SINGBOX_CONF="$root/config.json"
-  discovered="$root/Caddyfile"
-  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
-  printf "other site\n" > "$discovered"
-  jq --arg cf "$root/missing" ".nodes[1].caddy_file = \$cf" "$3" > "$SINGBOX_NODES"
-  render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
-  pause() { :; }; secure_singbox_files() { :; }; systemctl() { return 0; }
-  find_caddyfile() { printf "%s\n" "$discovered"; }
-  caddy_remove_route() { printf "other site\n" > "$2"; }
-  caddy_reload() { return 0; }
-  caddy_add_route() { printf "%s %s %s\n" "$2" "$3" "$4" >> "$5"; caddy_reload "$5"; }
-  rebuild_trojan_route b2c3d4e5
-  jq -e --arg cf "$discovered" ".nodes[1].caddy_file == \$cf" "$SINGBOX_NODES" >/dev/null
+  jq -e "all(.inbounds[]; .type != \"hysteria2\") and (has(\"certificate_providers\")|not)" "$SINGBOX_CONF" >/dev/null || exit 1
+  [[ ! -e "$SINGBOX_DIR/closed" && $(<"$SINGBOX_DIR/acme/certificate") == "keep certificate" ]] || exit 1
+  del_node a1b2c3d4 || exit 1
+  [[ $(<"$SINGBOX_DIR/closed") == "443 tcp" ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
 
 # Core validation must invoke the real check interface, even on a fresh install.
@@ -893,6 +820,7 @@ assert_true "installation is atomic across download validation enable and restar
   printf "inactive\n" > "$state"; printf "false\n" > "$enabled_file"
   failure=none
   ensure_deps() { :; }; secure_singbox_files() { :; }
+  hysteria2_preflight() { :; }; verify_hysteria2_nodes() { :; }; open_port() { :; }
   installed_version() { printf "test-version\n"; }
   systemctl() {
     printf "%s\n" "$*" >> "$calls"
