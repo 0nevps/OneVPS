@@ -19,6 +19,20 @@ TEST_COUNT=0
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 
+# macOS lacks util-linux flock. Match its inherited-descriptor locking for tests.
+if ! command -v flock >/dev/null 2>&1; then
+  mkdir "$TEST_TMP/bin"
+  printf '%s\n' '#!/usr/bin/env python3' 'import fcntl, sys' \
+    'try: fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)' \
+    'except OSError: sys.exit(1)' > "$TEST_TMP/bin/flock"
+  chmod +x "$TEST_TMP/bin/flock"
+  export PATH="$TEST_TMP/bin:$PATH"
+fi
+
+# Tests not exercising readiness explicitly mock it; production always checks.
+mock_singbox_readiness() { wait_singbox_ready() { systemctl is-active --quiet onevps-sing-box; }; }
+export -f mock_singbox_readiness
+
 pass() {
   TEST_COUNT=$((TEST_COUNT + 1))
   printf 'ok %d - %s\n' "$TEST_COUNT" "$1"
@@ -79,6 +93,160 @@ assert_file_jq() {
     fail "$label" "jq assertion failed: $filter"
   fi
 }
+
+assert_true "port inspection filters local TCP and UDP sockets and fails closed" bash -c '
+  source "$1"
+  ss() {
+    [[ "$1" == -H && "$3" == "sport = :443" ]] || return 99
+    case "$2" in
+      -ltn) printf "LISTEN 0 128 [::]:443 [::]:*\n" ;;
+      -lun) printf "UNCONN 0 0 0.0.0.0:443 0.0.0.0:*\n" ;;
+      *) return 99 ;;
+    esac
+  }
+  port_in_use 443 tcp && port_in_use 443 udp || exit 1
+  ss() { :; }; if port_in_use 443; then exit 1; fi
+  ss() { return 1; }; port_in_use 443
+' _ "$ROOT_DIR/onevps.sh"
+
+assert_true "readiness rejects transient active and foreign listeners" bash -c '
+  source "$1"
+  counter="$2/ready-count"; printf "0\n" > "$counter"
+  mode=ok
+  sleep() { :; }
+  systemctl() {
+    if [[ "$1" == is-active ]]; then
+      count=$(<"$counter"); printf "%s\n" "$((count + 1))" > "$counter"
+      [[ "$mode" != crash || "$count" == 0 ]]
+    elif [[ "$mode" == churn ]]; then printf "%s\n" "$(<"$counter")"
+    else printf "42\n"; fi
+  }
+  ss() {
+    [[ "$mode" != missing ]] || return 0
+    if [[ "$mode" == foreign ]]; then printf "LISTEN users:((other,pid=43,fd=3))\n"
+    elif [[ "$mode" == churn ]]; then printf "LISTEN users:((sing-box,pid=%s,fd=3))\n" "$(<"$counter")"
+    else printf "LISTEN users:((sing-box,pid=42,fd=3))\n"; fi
+  }
+  wait_singbox_ready "$3" || exit 1
+  [[ $(<"$counter") == 3 ]] || exit 1
+  for mode in crash foreign missing churn; do
+    printf "0\n" > "$counter"
+    if wait_singbox_ready "$3"; then exit 1; fi
+  done
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "firewall failures propagate and cleanup never deletes shared rules" bash -c '
+  source "$1"
+  calls="$2/firewall-calls"; mode=ok
+  ufw() {
+    printf "%s\n" "$*" >> "$calls"
+    if [[ "$1" == status ]]; then printf "Status: active\n"; return 0; fi
+    [[ "$mode" != ufw-fail ]]
+  }
+  firewall-cmd() {
+    printf "%s\n" "$*" >> "$calls"
+    [[ "$1" != --reload || "$mode" != reload-fail ]]
+  }
+  open_port 443 tcp || exit 1
+  mode=ufw-fail; if open_port 443 tcp; then exit 1; fi
+  mode=reload-fail; if open_port 443 udp; then exit 1; fi
+  ufw() { return 1; }; if open_port 443 tcp; then exit 1; fi
+  : > "$calls"; close_port 443 tcp
+  [[ ! -s "$calls" ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP"
+
+assert_true "configuration install and uninstall share a nonblocking process lock" bash -c '
+  source "$1"
+  SINGBOX_DIR="$2/locking"; mkdir "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"
+  SINGBOX_BIN="$SINGBOX_DIR/core"
+  cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  systemctl() { :; }; mock_singbox_readiness
+  hysteria2_preflight() { :; }; verify_hysteria2_nodes() { :; }; open_port() { :; }; ensure_deps() { :; }
+  mkfifo "$SINGBOX_DIR/ready" "$SINGBOX_DIR/release"
+  first_prepare() {
+    printf "ready\n" > "$SINGBOX_DIR/ready"
+    read -r release < "$SINGBOX_DIR/release"
+    jq ".concurrent.first=true" "$1" > "$2"
+  }
+  apply_candidate_transaction first_prepare & first=$!
+  trap '\''kill "$first" 2>/dev/null || true'\'' EXIT
+  read -r ready < "$SINGBOX_DIR/ready"
+  if jq_update_nodes ".concurrent.second=true"; then exit 1; fi
+  if install_singbox; then exit 1; fi
+  if uninstall; then exit 1; fi
+  printf "release\n" > "$SINGBOX_DIR/release"
+  wait "$first" || exit 1; trap - EXIT
+  jq_update_nodes ".concurrent.second=true" || exit 1
+  jq -e ".concurrent.first and .concurrent.second" "$SINGBOX_NODES" >/dev/null
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "readiness failure restores old metadata and running service" bash -c '
+  source "$1"
+  SINGBOX_DIR="$2/ready-rollback"; mkdir "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_BIN="$SINGBOX_DIR/core"
+  cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  cp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes"; cp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  systemctl() { :; }; hysteria2_preflight() { :; }; open_port() { :; }
+  wait_singbox_ready() { if [[ ! -e "$SINGBOX_DIR/failed-once" ]]; then touch "$SINGBOX_DIR/failed-once"; return 1; fi; }
+  if jq_update_nodes ".nodes[0].port=8443"; then exit 1; fi
+  cmp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes" && cmp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "firewall failure leaves old port configuration untouched" bash -c '
+  source "$1"
+  SINGBOX_DIR="$2/firewall-transaction"; mkdir "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_BIN="$SINGBOX_DIR/core"
+  cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  cp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes"; cp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  hysteria2_preflight() { :; }; open_port() { return 1; }
+  systemctl() { [[ "$1" == is-active ]]; }
+  if jq_update_nodes ".nodes[0].port=8443"; then exit 1; fi
+  cmp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes" && cmp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "UUID retry emits only the corrected UUID on stdout" bash -c '
+  source "$1"; rand_uuid() { printf "123e4567-e89b-12d3-a456-426614174000\n"; }
+  result=$(ask_uuid <<<$'"'"'invalid\n123e4567-e89b-12d3-a456-426614174099'"'"')
+  [[ "$result" == 123e4567-e89b-12d3-a456-426614174099 ]]
+' _ "$ROOT_DIR/onevps.sh"
+
+assert_true "public address lookup validates responses and refuses broken links" bash -c '
+  source "$1"; PUBIP=""
+  curl() { if [[ "$*" == *api.ipify.org* ]]; then printf "not an IP\n"; else printf "203.0.113.10\n"; fi; }
+  [[ $(pub_ip) == 203.0.113.10 ]] || exit 1
+  for bad in "" 999.1.1.1 01.2.3.4 "203.0.113.10 garbage"; do
+    if is_valid_ipv4 "$bad"; then exit 1; fi
+  done
+  curl() { return 1; }
+  n=$(jq -c ".nodes[0]" "$2")
+  if node_link "$n" > "$3/missing-address"; then exit 1; fi
+  [[ ! -s "$3/missing-address" ]] || exit 1
+  SINGBOX_NODES="$2"; require_singbox() { :; }; pause() { :; }; clear() { :; }
+  pick_node() { printf "a1b2c3d4\n"; }; ask() { printf "0\n"; }
+  manage_nodes >/dev/null || exit 1
+  show_links >/dev/null || exit 1
+  PUBIP=203.0.113.10; [[ $(pub_ip) == "$PUBIP" ]]
+' _ "$ROOT_DIR/onevps.sh" "$FIXTURE" "$TEST_TMP"
+
+assert_true "CA dependency checks reject directories empty and invalid bundles" bash -c '
+  source "$1"
+  mkdir "$2/empty-certs"; : > "$2/empty-bundle"; printf "invalid\n" > "$2/invalid-bundle"
+  for path in "$2/empty-certs" "$2/empty-bundle" "$2/invalid-bundle"; do
+    if has_ca_bundle "$path"; then exit 1; fi
+  done
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=unit-test \
+    -keyout "$2/test-ca-key" -out "$2/test-bundle" >/dev/null 2>&1 || exit 1
+  has_ca_bundle "$2/test-bundle" || exit 1
+  has_ca_bundle() { return 1; }; PKG=apt
+  # Capture the dependency list without invoking a package manager.
+  pkg_install() { printf "%s\n" "$*" > "$packages"; }
+  packages="$2/packages"; ensure_deps >/dev/null
+  grep -q ca-certificates "$packages"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP"
 
 assert_true "accepts a canonical UUID" \
   is_valid_uuid "123e4567-e89b-12d3-a456-426614174000"
@@ -162,6 +330,7 @@ assert_true "ACME readiness failure rolls back both live files" bash -c '
   cp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes"; cp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
   printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
   systemctl() { return 0; }; hysteria2_preflight() { return 0; }; open_port() { :; }
+  mock_singbox_readiness
   verify_hysteria2_nodes() { return 1; }
   ! jq_update_nodes ".nodes[-1].name = \"Changed\"" &&
     cmp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes" && cmp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
@@ -202,6 +371,7 @@ render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
 secure_singbox_files() { :; }
 validate_singbox_config() { :; }
 systemctl() { :; }
+mock_singbox_readiness
 hysteria2_preflight() { :; }
 verify_hysteria2_nodes() { :; }
 open_port() { :; }
@@ -511,25 +681,25 @@ assert_file_jq "live node remains without outbound" "$SINGBOX_NODES" '.nodes[0] 
 cp "$node_candidate" "$SINGBOX_NODES"
 assert_true "prepare independent second node proxy" prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" b2c3d4e5 <<<"$second_proxy"
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "direct first and security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and .outbounds[0].type == "direct" and .route.rules[0].action == "sniff" and all(.route.rules[1:3][]; .action == "reject") and (.route.rules|length) == 5'
-assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 3 and .route.rules[3].outbound == "node-out-a1b2c3d4" and .route.rules[4].outbound == "node-out-b2c3d4e5" and .route.rules[3].inbound != .route.rules[4].inbound and all(.route.rules[]; has("auth_user")|not)'
+assert_file_jq "direct first and resolved security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and .outbounds[0].type == "direct" and .route.rules[0].action == "sniff" and .route.rules[1] == {action:"resolve",server:"local"} and all(.route.rules[2:4][]; .action == "reject") and (.route.rules|length) == 6'
+assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 3 and .route.rules[4].outbound == "node-out-a1b2c3d4" and .route.rules[5].outbound == "node-out-b2c3d4e5" and .route.rules[4].inbound != .route.rules[5].inbound and all(.route.rules[]; has("auth_user")|not)'
 cp "$node_candidate" "$SINGBOX_NODES"
 assert_true "explicit node direct replaces only selected proxy" prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" b2c3d4e5 <<<'{"mode":"direct"}'
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.route.rules[4].outbound == "direct" and .route.rules[3].outbound == "node-out-a1b2c3d4" and (.outbounds|length) == 2'
+assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.route.rules[5].outbound == "direct" and .route.rules[4].outbound == "node-out-a1b2c3d4" and (.outbounds|length) == 2'
 cp "$node_candidate" "$SINGBOX_NODES"
 prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" b2c3d4e5 <<<'"inherit"'
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
 assert_file_jq "reset removes saved node field" "$node_candidate" '.nodes[1]|has("outbound")|not'
-assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.route.rules|length) == 4 and .route.rules[3].outbound == "node-out-a1b2c3d4"'
+assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.route.rules|length) == 5 and .route.rules[4].outbound == "node-out-a1b2c3d4"'
 jq '.nodes[0].enabled=false' "$node_candidate" > "$TEST_TMP/disabled.json"
 render_config "$TEST_TMP/disabled.json" "$TEST_TMP/rendered.json"
-assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.route.rules|length) == 3 and (.outbounds|length) == 1'
+assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.route.rules|length) == 4 and (.outbounds|length) == 1'
 jq '.nodes[0].outbound=null' "$TEST_TMP/disabled.json" > "$TEST_TMP/invalid.json"
 assert_false "disabled node cannot hide corrupt outbound" render_config "$TEST_TMP/invalid.json" "$TEST_TMP/rendered.json"
 # No outbound settings produce one direct outbound and three security rules.
 render_config "$FIXTURE" "$TEST_TMP/default.json"
-assert_file_jq "fresh render has no extra routes or outbounds" "$TEST_TMP/default.json" '(.route.rules|length) == 3 and (.outbounds|length) == 1'
+assert_file_jq "fresh render has no extra routes or outbounds" "$TEST_TMP/default.json" '(.route.rules|length) == 4 and (.outbounds|length) == 1'
 # Shared transaction is exercised again with actual outbound candidates.
 SINGBOX_BIN="$TEST_TMP/mock-singbox"
 MOCK_SERVICE_MODE=ok
@@ -632,6 +802,37 @@ assert_true "outbound secrets never occur in external jq or openssl argv" bash -
   render_config "$output" "$output.config"
   ! command grep -q "SECRET_USERNAME\|SECRET_PASSWORD" "$capture"
 ' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$TEST_TMP/argv" "$TEST_TMP/secret-candidate"
+assert_true "creation rotation and encoded links keep credentials out of jq argv" bash -c '
+  source "$1"; root="$2/secret-menus"; mkdir "$root"
+  SINGBOX_NODES="$root/nodes.json"; cp "$3" "$SINGBOX_NODES"; capture="$root/argv"
+  jq() { printf "%s\n" "$@" >> "$capture"; command jq "$@"; }
+  openssl() { printf "%s\n" "$@" >> "$capture"; command openssl "$@"; }
+  require_singbox() { :; }; ensure_nodes_file() { :; }; pause() { :; }; confirm() { return 0; }
+  port_taken_by_node() { return 1; }; port_in_use() { return 1; }; check_hysteria2_dns() { :; }
+  pick_reality_target() { printf "www.example.com\n"; }
+  ask_uuid() { printf "123e4567-e89b-12d3-a456-426614174099\n"; }
+  gen_x25519() { printf "SECRET_PRIVATE_KEY PUBLIC_KEY\n"; }; rand_password() { printf "SECRET_PASSWORD\n"; }
+  ask() { case "$1" in
+    "Node name") printf "test\n" ;;
+    "Listen port"|"Hysteria 2 UDP port") printf "8443\n" ;;
+    "Certificate domain") printf "new.example.com\n" ;;
+    "ACME contact email") printf "ops@example.com\n" ;;
+  esac; }
+  apply_candidate_transaction() {
+    local prepare="$1"; shift
+    "$prepare" "$SINGBOX_NODES" "$root/candidate" "$@" || return 1
+    cp "$root/candidate" "$SINGBOX_NODES"
+  }
+  PUBIP=203.0.113.10
+  add_reality_node > "$root/reality-output" || exit 1
+  command jq -e '\''.nodes[-1].uuid == "123e4567-e89b-12d3-a456-426614174099" and .nodes[-1].reality_private_key == "SECRET_PRIVATE_KEY"'\'' "$SINGBOX_NODES" >/dev/null || exit 1
+  rotate_reality_secret a1b2c3d4 >/dev/null || exit 1
+  command jq -e '\''.nodes[0].reality_private_key == "SECRET_PRIVATE_KEY"'\'' "$SINGBOX_NODES" >/dev/null || exit 1
+  add_hysteria2_node > "$root/hy2-output" || exit 1
+  command jq -e '\''.nodes[-1].password == "SECRET_PASSWORD" and .nodes[-1].obfs_password == "SECRET_PASSWORD"'\'' "$SINGBOX_NODES" >/dev/null || exit 1
+  ! grep -q "SECRET_PRIVATE_KEY\|SECRET_PASSWORD\|123e4567-e89b-12d3-a456-426614174099" "$capture"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
 # Validation logs are deliberately withheld even when the core prints a secret.
 assert_true "rebuild does not echo core validation secrets" bash -c '
   source "$1"; SINGBOX_NODES="$2"; SINGBOX_DIR=$(dirname "$2"); SINGBOX_BIN="$3"; SINGBOX_CONF="$4"
@@ -670,7 +871,7 @@ assert_false "HY2 reset rejects local credential collision" apply_node_user_chan
 assert_true "set inherited node proxy for all identities" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
 assert_true "selected batch sets default and Alice only" apply_outbound_assignment a1b2c3d4 selected '["default","alice"]' <<<"$second_proxy"
 assert_file_jq "default override does not change node inheritance" "$SINGBOX_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
-assert_file_jq "security blocks precede scoped identity routes and fallback" "$SINGBOX_CONF" '.route.rules[0].action == "sniff" and all(.route.rules[1:3][]; .action == "reject") and .route.rules[3].auth_user == [.inbounds[0].users[0].name] and .route.rules[4].auth_user == [.inbounds[0].users[1].name] and all(.route.rules[3:5][]; .inbound == ["reality-a1b2c3d4"]) and (.route.rules[5]|has("auth_user")|not)'
+assert_file_jq "security blocks precede scoped identity routes and fallback" "$SINGBOX_CONF" '.route.rules[0].action == "sniff" and .route.rules[1].action == "resolve" and all(.route.rules[2:4][]; .action == "reject") and .route.rules[4].auth_user == [.inbounds[0].users[0].name] and .route.rules[5].auth_user == [.inbounds[0].users[1].name] and all(.route.rules[4:6][]; .inbound == ["reality-a1b2c3d4"]) and (.route.rules[6]|has("auth_user")|not)'
 for selected in '[]' '["missing"]' '["alice","missing"]' '["alice","alice"]' 'null'; do
   assert_false "invalid selection is rejected as a batch $selected" apply_outbound_assignment a1b2c3d4 selected "$selected" <<<'{"mode":"direct"}'
 done
@@ -727,6 +928,7 @@ assert_true "password reset and node deletion preserve shared state and rollback
   cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
   pause() { :; }; confirm() { return 0; }; ask() { printf "new-default-password\n"; }
   hysteria2_preflight() { :; }; verify_hysteria2_nodes() { :; }; open_port() { :; }
+  mock_singbox_readiness
   close_port() { printf "%s\n" "$*" >> "$SINGBOX_DIR/closed"; }
   fail_restart=false
   systemctl() {
@@ -821,7 +1023,12 @@ assert_true "installation is atomic across download validation enable and restar
   failure=none
   ensure_deps() { :; }; secure_singbox_files() { :; }
   hysteria2_preflight() { :; }; verify_hysteria2_nodes() { :; }; open_port() { :; }
+  mock_singbox_readiness
   installed_version() { printf "test-version\n"; }
+  wait_singbox_ready() {
+    if [[ "$failure" == readiness && ! -e "$root/failed-once" ]]; then touch "$root/failed-once"; return 1; fi
+    systemctl is-active --quiet onevps-sing-box
+  }
   systemctl() {
     printf "%s\n" "$*" >> "$calls"
     case "$1" in
@@ -847,7 +1054,7 @@ assert_true "installation is atomic across download validation enable and restar
     fi
     chmod +x "$1/sing-box"
   }
-  for failure in download validate enable restart; do
+  for failure in download validate enable restart readiness; do
     rm -f "$root/failed-once"
     if install_singbox; then exit 1; fi
     [[ ! -e "$SINGBOX_DIR" && ! -e "$SINGBOX_BIN" && ! -e "$SINGBOX_SERVICE" ]] || exit 1
@@ -862,7 +1069,7 @@ assert_true "installation is atomic across download validation enable and restar
   render_config "$SINGBOX_NODES" "$SINGBOX_CONF" || exit 1
   printf "#!/bin/sh\n# original core\nexit 0\n" > "$SINGBOX_BIN"
   for path in "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES"; do cp -p "$path" "$path.before"; done
-  for failure in download validate restart; do
+  for failure in download validate restart readiness; do
     rm -f "$root/failed-once"
     if install_singbox; then exit 1; fi
     for path in "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES"; do cmp "$path" "$path.before" || exit 1; done

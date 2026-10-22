@@ -102,10 +102,11 @@ def udp_request(proxy_port, destination_port):
             return response
 
 
-def request(proxy_port, destination_port):
-    # http.client uses explicit CONNECT, avoiding environment NO_PROXY bypasses.
+def request(proxy_port, destination_port, destination_host="127.0.0.1"):
+    # http.client sends the hostname in CONNECT without resolving it locally.
+    # Explicit CONNECT also avoids environment NO_PROXY bypasses.
     connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=4)
-    connection.set_tunnel("127.0.0.1", destination_port)
+    connection.set_tunnel(destination_host, destination_port)
     try:
         connection.request("GET", "/")
         return connection.getresponse().read()
@@ -201,9 +202,9 @@ try:
                      "outbounds": [outbound]}, port)
         return port
 
-    def cannot_forward(port, label):
+    def cannot_forward(port, label, destination_host="127.0.0.1"):
         try:
-            result = request(port, destination_port)
+            result = request(port, destination_port, destination_host)
         except (OSError, http.client.HTTPException):
             pass
         else:
@@ -256,8 +257,17 @@ try:
     print("ok - HY2 matching salamander forwards TCP")
     cannot_forward(hy2_client("hy2-obfs-mismatch", obfuscated, hy2_alice["password"], obfs="wrong-salamander"), "mismatched salamander")
     guarded = hy2_server("hy2-guarded-server", guard=True)
-    cannot_forward(hy2_client("hy2-guarded-client", guarded, hy2_alice["password"]), "private CIDR rejection before user direct")
-    cannot_forward(hy2_client("hy2-guarded-default", guarded, hy2_default["password"]), "private CIDR rejection before node proxy")
+    guarded_direct = hy2_client("hy2-guarded-client", guarded, hy2_alice["password"])
+    guarded_proxy = hy2_client("hy2-guarded-default", guarded, hy2_default["password"])
+    cannot_forward(guarded_direct, "private CIDR rejection before user direct")
+    cannot_forward(guarded_proxy, "private CIDR rejection before node proxy")
+    # The authority remains a domain through CONNECT and the HY2 client; the
+    # guarded server must resolve localhost before evaluating private CIDRs.
+    assert request(hy2_ports[1], destination_port, "localhost") == b"direct"
+    assert request(hy2_ports[0], destination_port, "localhost") == b"upstream"
+    print("ok - HY2 localhost controls reach user direct and node proxy without safety blocks")
+    cannot_forward(guarded_direct, "resolved localhost rejection before user direct", "localhost")
+    cannot_forward(guarded_proxy, "resolved localhost rejection before node proxy", "localhost")
     deleted = hy2_server("hy2-deleted-server", "runtime-hy2-deleted.json")
     survivor = hy2_client("hy2-surviving-client", deleted, hy2_bob["password"])
     assert request(survivor, destination_port) == b"upstream"

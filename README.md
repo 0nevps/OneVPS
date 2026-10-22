@@ -30,7 +30,8 @@ it does not automatically overwrite files, remove old installations, or stop ano
 Back up existing deployments and resolve conflicts explicitly before proceeding. Do not reuse old metadata.
 
 Requirements: Linux with systemd, root access, amd64/arm64/armv7, and apt/dnf/yum/zypper.
-Dependencies include Bash, `curl`, `jq`, OpenSSL, CA certificates, archive and SHA-256 tools.
+Dependencies include Bash, `curl`, `jq`, OpenSSL, a valid CA bundle, `ss` (iproute2/iproute),
+`flock` (util-linux), archive and SHA-256 tools.
 Distribution and architecture compatibility still needs runtime validation.
 
 ### Obtaining the script
@@ -78,8 +79,9 @@ and excluded from ordinary configuration rollback. Enabled nodes sharing a domai
 and must use the same ACME email. Renewal and certificate reload are managed by the running core.
 When no enabled node references a domain, its provider is omitted and renewal stops until it is enabled again.
 Stopping or uninstalling the core also stops renewal. Node deletion and uninstall retain ACME storage for manual
-backup/cleanup; no recursive deletion of private keys is performed. TCP/80 and HY2 UDP firewall allowances are
-retained after failure, port changes and deletion to avoid removing shared rules; review them manually.
+backup/cleanup; no recursive deletion of private keys is performed. All firewall allowances, including Reality TCP,
+TCP/80 and HY2 UDP, are retained after failure, port changes and deletion to avoid removing shared or pre-existing
+rules; review them manually. Firewall allowance failures abort activation rather than report a working node.
 
 Applying a configuration with enabled HY2 nodes starts a disposable loopback client and waits approximately
 90 seconds per node for a trusted TLS/QUIC connection and HTTPS request to `https://www.example.com/` through
@@ -100,6 +102,9 @@ Users belong to one node, not a global account pool. Each additional Reality use
 each Hysteria 2 user receives an independent password. Names and credentials must be unique within the node.
 The reserved default client is managed through the node's reset actions, not deleted through the user menu.
 Deleting an added user revokes its access and removes its outbound override after successful application.
+
+Domain destinations are resolved locally before private-address safety checks, including traffic routed through
+an upstream proxy. This prevents domain-form private targets from bypassing those checks.
 
 Outbound selection follows **safety blocks → user override → node outbound → direct**:
 
@@ -127,6 +132,12 @@ Share links contain client access credentials, never upstream proxy credentials.
 runtime configuration and backups. Changes require a successful real-core `check` before activation and may
 restart a stopped service. Activation failures require rollback of metadata/configuration and an attempt to
 restore the previous service state; this is not a power-loss-safe transaction guarantee.
+Install, configuration changes and uninstall share a nonblocking process lock; retry after another operation finishes.
+Activation checks a stable service PID and ownership of every enabled TCP/UDP listener before committing, then
+runs the HY2 client probe when applicable. Listener readiness waits up to approximately 10 seconds, or 90 seconds
+with enabled HY2 nodes to allow certificate initialization; it is not an end-to-end Reality handshake test.
+A failed public-IPv4 lookup does not produce a broken Reality link or prevent node management. Retry with
+`sudo env PUBIP=YOUR_SERVER_IPV4 bash onevps.sh` to supply the server address explicitly.
 
 ## Files and operations
 

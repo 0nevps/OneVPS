@@ -43,7 +43,7 @@ REALITY_DESTS=(
 
 PKG=""
 ARCH=""
-PUBIP=""
+PUBIP="${PUBIP:-}"
 
 # ----------------------------------------------------------------------------
 # Output
@@ -95,7 +95,7 @@ ask_uuid() {
   default=$(rand_uuid)
   input=$(ask "UUID (Enter for random)" "$default")
   while ! is_valid_uuid "$input"; do
-    warn "invalid UUID format (expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+    warn "invalid UUID format (expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)" >&2
     input=$(ask "UUID (Enter for random)" "$default")
   done
   echo "$input"
@@ -106,20 +106,35 @@ rand_short_id() { openssl rand -hex 8; }
 rand_password() { openssl rand -hex 16; }
 
 rand_port() {
-  local p
-  while :; do
+  local p attempt
+  for ((attempt=0; attempt<128; attempt++)); do
     p=$(( ( (RANDOM << 15) | RANDOM ) % 55535 + 10000 ))
     port_taken_by_node "$p" 2>/dev/null && continue
     port_in_use "$p" && continue
     echo "$p"; return
   done
+  err 'could not find an available TCP port'
+  return 1
+}
+
+is_valid_ipv4() {
+  local address="$1" octet
+  [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS=.
+  for octet in $address; do
+    [[ "$octet" == 0 || "$octet" != 0* ]] && (( 10#$octet <= 255 )) || return 1
+  done
 }
 
 pub_ip() {
-  [[ -n "$PUBIP" ]] && { echo "$PUBIP"; return; }
-  PUBIP=$(curl -fsSL4 --max-time 8 https://api.ipify.org 2>/dev/null \
-       || curl -fsSL4 --max-time 8 https://ifconfig.me 2>/dev/null || true)
-  echo "$PUBIP"
+  local address endpoint
+  if is_valid_ipv4 "$PUBIP"; then printf '%s\n' "$PUBIP"; return; fi
+  for endpoint in https://api.ipify.org https://ifconfig.me; do
+    address=$(curl -fsSL4 --max-time 8 "$endpoint" 2>/dev/null) || continue
+    if is_valid_ipv4 "$address"; then printf '%s\n' "$address"; return; fi
+  done
+  err 'could not determine a valid public IPv4 address'
+  return 1
 }
 
 require_singbox() {
@@ -131,7 +146,7 @@ installed_version() {
   "$SINGBOX_BIN" version 2>/dev/null | awk '/^sing-box version /{print $3; exit}'
 }
 
-urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
+urlenc() { printf '%s' "$1" | jq -sRr '@uri'; }
 
 normalize_domain() {
   local d="$1"
@@ -187,12 +202,29 @@ pkg_install() {
   esac
 }
 
+has_ca_bundle() {
+  local bundle
+  if (( $# == 0 )); then
+    set -- /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+      /etc/ssl/ca-bundle.pem /var/lib/ca-certificates/ca-bundle.pem
+  fi
+  for bundle in "$@"; do
+    [[ -f "$bundle" && -r "$bundle" && -s "$bundle" ]] &&
+      openssl x509 -in "$bundle" -noout >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
 ensure_deps() {
   local need=() bin
   for bin in curl jq openssl; do
     command -v "$bin" >/dev/null 2>&1 || need+=("$bin")
   done
-  if ! [[ -r /etc/ssl/certs/ca-certificates.crt || -d /etc/ssl/certs ]]; then
+  command -v flock >/dev/null 2>&1 || need+=(util-linux)
+  if ! command -v ss >/dev/null 2>&1; then
+    if [[ "$PKG" == apt ]]; then need+=(iproute2); else need+=(iproute); fi
+  fi
+  if ! has_ca_bundle; then
     need+=(ca-certificates)
   fi
   if ((${#need[@]})); then
@@ -301,6 +333,8 @@ download_singbox() {
 
 install_singbox() (
   ensure_deps
+  mkdir -p "$(dirname "$SINGBOX_DIR")" || return 1
+  acquire_singbox_lock || return 1
   check_singbox_conflicts || return 1
   local tx owned=false active=false enabled=false touched=false committed=false
   tx=$(mktemp -d) || return 1
@@ -325,7 +359,7 @@ install_singbox() (
       systemctl daemon-reload || failed=true
       if $owned; then
         if $enabled; then systemctl enable onevps-sing-box || failed=true; else systemctl disable onevps-sing-box || failed=true; fi
-        if $active; then systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || failed=true; fi
+        if $active; then systemctl restart onevps-sing-box && wait_singbox_ready "$SINGBOX_NODES" || failed=true; fi
       fi
       status=1
     fi
@@ -353,9 +387,9 @@ install_singbox() (
     install -m 644 "$tx/service" "$SINGBOX_SERVICE" &&
     cp "$tx/config.json" "$SINGBOX_CONF" && cp "$tx/nodes.json" "$SINGBOX_NODES" || return 1
   printf 'OneVPS sing-box schema 1\n' > "$SINGBOX_DIR/.onevps-managed" || return 1
-  secure_singbox_files && hysteria2_preflight "$SINGBOX_NODES" &&
+  secure_singbox_files && hysteria2_preflight "$SINGBOX_NODES" && open_node_ports "$SINGBOX_NODES" &&
     systemctl daemon-reload && systemctl enable onevps-sing-box &&
-    systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || return 1
+    systemctl restart onevps-sing-box && wait_singbox_ready "$SINGBOX_NODES" || return 1
   verify_hysteria2_nodes "$SINGBOX_NODES" "$tx" || return 1
   committed=true
   ok "sing-box $(installed_version) installed"
@@ -365,25 +399,36 @@ install_singbox() (
 # Firewall / ports
 # ----------------------------------------------------------------------------
 open_port() {
-  local p="$1" proto="$2"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "$p/$proto" >/dev/null 2>&1 || true
+  local p="$1" proto="$2" status
+  if command -v ufw >/dev/null 2>&1; then
+    status=$(ufw status 2>/dev/null) || { err 'could not inspect UFW'; return 1; }
+    if [[ "$status" == *'Status: active'* ]]; then
+      ufw allow "$p/$proto" >/dev/null 2>&1 || { err "UFW failed to allow $p/$proto"; return 1; }
+    fi
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$p/$proto" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port="$p/$proto" >/dev/null 2>&1 &&
+      firewall-cmd --reload >/dev/null 2>&1 || { err "firewalld failed to allow $p/$proto"; return 1; }
   fi
+  return 0
 }
 
 close_port() {
-  local p="$1" proto="$2"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw delete allow "$p/$proto" >/dev/null 2>&1 || true
+  # Rules may predate OneVPS or be shared with another service, even after a
+  # node is disabled. Without ownership evidence, deletion is never safe.
+  warn "$1/$2 firewall rule retained; review shared use before manual cleanup"
+}
+
+open_node_ports() {
+  local source="$1" port proto rows
+  rows=$(jq -r '.nodes[] | select(.enabled) | "\(.port) \(if .type == "hysteria2" then "udp" else "tcp" end)"' "$source") || return 1
+  if jq -e 'any(.nodes[]; .enabled and .type == "hysteria2")' "$source" >/dev/null; then
+    open_port 80 tcp || return 1
   fi
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --remove-port="$p/$proto" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
+  while read -r port proto; do
+    [[ -n "$port" ]] || continue
+    open_port "$port" "$proto" || return 1
+  done <<<"$rows"
 }
 
 node_network() {
@@ -391,13 +436,15 @@ node_network() {
 }
 
 port_in_use() {
-  local p="$1" proto="${2:-tcp}" flags
-  case "$proto" in tcp) flags=-tnl ;; udp) flags=-unl ;; *) return 2 ;; esac
-  if command -v ss >/dev/null 2>&1; then
-    ss "$flags" 2>/dev/null | awk '{print $5}' | grep -qE ":$p$"
-  else
-    return 1
+  local p="$1" proto="${2:-tcp}" flags listeners
+  case "$proto" in tcp) flags=-ltn ;; udp) flags=-lun ;; *) return 2 ;; esac
+  if ! command -v ss >/dev/null 2>&1; then
+    err 'ss is required to check listening ports'
+    return 0
   fi
+  # Fail closed if inspection fails; never parse version-dependent columns.
+  listeners=$(ss -H "$flags" "sport = :$p") || { err 'could not inspect listening ports'; return 0; }
+  [[ -n "$listeners" ]]
 }
 
 port_taken_by_node() {
@@ -422,6 +469,22 @@ prepare_jq_nodes() {
   jq "$@" "$source" > "$output"
 }
 
+prepare_add_node() {
+  local source="$1" output="$2"
+  jq -s --slurpfile source "$source" -e 'select(length == 1) | .[0] as $node |
+    $source[0] | .nodes += [$node]' > "$output" || return 1
+  validate_node_metadata "$output"
+}
+
+prepare_reality_rotation() {
+  local source="$1" output="$2" id="$3"
+  jq -Rse --slurpfile source "$source" --arg id "$id" '
+    split("\n") | select(length == 4) | . as $keys | $source[0] |
+    select(any(.nodes[]; .id == $id and .type == "vless-reality")) |
+    (.nodes[] | select(.id == $id)) |=
+      (.reality_private_key=$keys[0] | .reality_public_key=$keys[1] | .reality_short_id=$keys[2])' > "$output"
+}
+
 jq_update_nodes() {
   apply_candidate_transaction prepare_jq_nodes "$@"
 }
@@ -439,6 +502,47 @@ validate_singbox_config() {
   local conf="$1" err_file="$2"
   [[ -x "$SINGBOX_BIN" ]] || return 1
   "$SINGBOX_BIN" check -c "$conf" >"$err_file" 2>&1
+}
+
+# Type=simple can report active before startup fails. Require a stable process
+# and every configured listener to belong to it across multiple samples.
+wait_singbox_ready() {
+  local source="$1" pid previous='' stable=0 attempt rows port proto flags listeners line found owned rounds=10
+  if jq -e 'any(.nodes[]; .enabled and .type == "hysteria2")' "$source" >/dev/null; then rounds=90; fi
+  command -v ss >/dev/null 2>&1 || { err 'ss is required for service readiness'; return 1; }
+  rows=$(jq -r '.nodes[] | select(.enabled) | "\(.port) \(if .type == "hysteria2" then "udp" else "tcp" end)"' "$source") || return 1
+  for ((attempt=0; attempt<rounds; attempt++)); do
+    systemctl is-active --quiet onevps-sing-box || return 1
+    pid=$(systemctl show -p MainPID --value onevps-sing-box) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    found=true
+    while read -r port proto; do
+      [[ -n "$port" ]] || continue
+      if [[ "$proto" == udp ]]; then flags=-lunp; else flags=-ltnp; fi
+      listeners=$(ss -H "$flags" "sport = :$port") || return 1
+      owned=false
+      while IFS= read -r line; do
+        [[ "$line" != *"pid=$pid,"* ]] || owned=true
+      done <<<"$listeners"
+      $owned || found=false
+    done <<<"$rows"
+    if $found && [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=0; fi
+    (( stable >= 2 )) && return 0
+    previous="$pid"
+    sleep 1
+  done
+  err 'sing-box did not reach stable listener readiness'
+  return 1
+}
+
+# Keep the inode outside the configuration directory and never unlink it:
+# install, configuration changes and uninstall must contend on the same lock.
+acquire_singbox_lock() {
+  local lock="${SINGBOX_DIR}.lock"
+  command -v flock >/dev/null 2>&1 || { err 'flock (util-linux) is required'; return 1; }
+  [[ ! -L "$lock" ]] || { err "refusing symlink: $lock"; return 1; }
+  exec 9>>"$lock" || return 1
+  flock -n 9 || { exec 9>&-; err 'another OneVPS operation is running'; return 1; }
 }
 
 mktemp_json() {
@@ -693,7 +797,7 @@ render_config() {
       route: {
         default_domain_resolver: "local",
         final: "direct",
-        rules: ([{action:"sniff"}, private_ip_rule, bittorrent_rule] + $routes.rules)
+        rules: ([{action:"sniff"}, {action:"resolve",server:"local"}, private_ip_rule, bittorrent_rule] + $routes.rules)
       }
     } +
     ([$nodes[0].nodes[] | select(.enabled and .type == "hysteria2")] | unique_by(.domain) |
@@ -855,6 +959,7 @@ apply_candidate_transaction() (
   local prepare="$1"
   shift
   umask 077
+  acquire_singbox_lock || return 1
   local tx active=false touched=false committed=false preserve=false
   local path
   for path in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_NODES" "$SINGBOX_CONF" "$SINGBOX_SERVICE"; do
@@ -871,7 +976,7 @@ apply_candidate_transaction() (
       cp -p "$tx/nodes.backup" "$SINGBOX_NODES" || failed=true
       cp -p "$tx/config.backup" "$SINGBOX_CONF" || failed=true
       if $active; then
-        systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || failed=true
+        systemctl restart onevps-sing-box && wait_singbox_ready "$SINGBOX_NODES" || failed=true
       else
         systemctl stop onevps-sing-box || failed=true
         if systemctl is-active --quiet onevps-sing-box; then failed=true; fi
@@ -903,16 +1008,11 @@ apply_candidate_transaction() (
   cp -p "$SINGBOX_NODES" "$tx/nodes.next" && cp -p "$SINGBOX_CONF" "$tx/config.next" || return 1
   cat "$tx/nodes.json" > "$tx/nodes.next" && cat "$tx/config.json" > "$tx/config.next" || return 1
   if systemctl is-active --quiet onevps-sing-box; then active=true; fi
+  open_node_ports "$tx/nodes.json" || return 1
   touched=true
-  if jq -e 'any(.nodes[]; .enabled and .type == "hysteria2")' "$tx/nodes.json" >/dev/null; then
-    open_port 80 tcp
-    while IFS= read -r path; do open_port "$path" udp; done < <(
-      jq -r '.nodes[] | select(.enabled and .type == "hysteria2") | .port' "$tx/nodes.json")
-    warn 'ACME/UDP firewall allowances are retained on failure; review shared rules before removing them.'
-  fi
   mv -f "$tx/nodes.next" "$SINGBOX_NODES" || return 1
   mv -f "$tx/config.next" "$SINGBOX_CONF" || return 1
-  systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || return 1
+  systemctl restart onevps-sing-box && wait_singbox_ready "$SINGBOX_NODES" || return 1
   verify_hysteria2_nodes "$tx/nodes.json" "$tx" || return 1
   committed=true
 )
@@ -1038,7 +1138,7 @@ manage_node_users() {
         selected=$(pick_node_users "$n") || continue
         [[ $(jq length <<<"$selected") == 1 ]] || { warn 'select exactly one user'; continue; }
         uid=$(jq -r '.[0]' <<<"$selected")
-        if [[ "$action" == 3 ]]; then node_user_link "$n" "$uid"; pause; continue; fi
+        if [[ "$action" == 3 ]]; then node_user_link "$n" "$uid" || warn 'user share link unavailable'; pause; continue; fi
         [[ "$uid" != default ]] || { warn 'default client cannot be deleted'; continue; }
         name=$(jq -r --arg uid "$uid" '.users[] | select(.id == $uid) | .name' <<<"$n")
         confirm "Delete user $name from node $(jq -r '.name' <<<"$n")? Its credential will stop working." n || continue
@@ -1230,7 +1330,7 @@ add_reality_node() {
     (( port >= 1 && port <= 65535 )) || { warn "port out of range"; continue; }
     if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
     if port_in_use "$port"; then
-      confirm "Port $port appears to be in use. Use anyway?" n || continue
+      warn "TCP port $port is occupied or cannot be inspected; choose another port"; continue
     fi
     break
   done
@@ -1240,10 +1340,11 @@ add_reality_node() {
   read -r pk pubk < <(gen_x25519)
   sid=$(rand_short_id)
 
-  node=$(jq -n \
+  node=$(printf '%s\n' "$uuid" "$pk" "$pubk" "$sid" | jq -Rn \
     --arg id "$id" --arg name "$name" --arg tag "reality-$id" \
-    --argjson port "$port" --arg uuid "$uuid" \
-    --arg target "$target" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
+    --argjson port "$port" --arg target "$target" '
+    [inputs] as $secrets |
+    $secrets[0] as $uuid | $secrets[1] as $pk | $secrets[2] as $pubk | $secrets[3] as $sid |
     {
       id: $id,
       type: "vless-reality",
@@ -1262,10 +1363,9 @@ add_reality_node() {
       enabled: true
     }')
 
-  if jq_update_nodes --argjson node "$node" '.nodes += [$node]'; then
-    open_port "$port" tcp
+  if apply_candidate_transaction prepare_add_node <<<"$node"; then
     ok "Reality node added"
-    node_link "$(node_by_id "$id")"
+    node_link "$(node_by_id "$id")" || warn 'node is active; share link generation failed'
   else
     err "node not added; transaction rolled back"
   fi
@@ -1299,24 +1399,24 @@ add_hysteria2_node() {
   done
   if confirm 'Enable salamander obfuscation?' n; then obfs=$(rand_password) || return 1; fi
   id=$(openssl rand -hex 4) || return 1
-  node=$(printf '%s\n' "$password" | jq -Rc --arg id "$id" --arg name "$name" --arg domain "$domain" \
-    --arg email "$email" --argjson port "$port" --arg obfs "$obfs" '
+  node=$(printf '%s\n' "$password" "$obfs" | jq -Rn --arg id "$id" --arg name "$name" --arg domain "$domain" \
+    --arg email "$email" --argjson port "$port" '
+    [inputs] as $secrets |
     {id:$id,type:"hysteria2",name:$name,tag:("hy2-" + $id),domain:$domain,
-      acme_email:$email,port:$port,password:.,enabled:true} +
-    (if $obfs == "" then {} else {obfs_password:$obfs} end)') || return 1
+      acme_email:$email,port:$port,password:$secrets[0],enabled:true} +
+    (if $secrets[1] == "" then {} else {obfs_password:$secrets[1]} end)') || return 1
   local candidate
   candidate=$(mktemp_json) || return 1
-  if ! jq --argjson node "$node" '.nodes += [$node]' "$SINGBOX_NODES" > "$candidate" ||
-      ! validate_node_metadata "$candidate"; then
+  if ! prepare_add_node "$SINGBOX_NODES" "$candidate" <<<"$node"; then
     rm -f "$candidate"; err 'invalid domain, email or conflicting node settings'; return 1
   fi
   rm -f "$candidate"
   check_hysteria2_dns "$domain" || return 1
   warn "Allow TCP/80 and UDP/$port in your cloud security group; TCP/80 remains necessary for renewal."
   confirm 'Network prerequisites ready?' n || return
-  if jq_update_nodes --argjson node "$node" '.nodes += [$node]'; then
+  if apply_candidate_transaction prepare_add_node <<<"$node"; then
     ok 'Hysteria 2 node added and verified through a local client'
-    node_link "$(node_by_id "$id")"
+    node_link "$(node_by_id "$id")" || warn 'node is active; share link generation failed'
   else
     err 'Hysteria 2 activation failed; inspect DNS, TCP/80 reachability and journalctl -u onevps-sing-box'
   fi
@@ -1334,7 +1434,7 @@ node_link() {
   link=""
 
   if [[ "$type" == "vless-reality" ]]; then
-    addr="$(pub_ip)"
+    addr=$(pub_ip) || { err 'share link unavailable; set PUBIP to a valid server IPv4 and retry'; return 1; }
     uuid=$(jq -r '.uuid' <<<"$n")
     sni=$(jq -r '.reality_sni' <<<"$n")
     pubk=$(jq -r '.reality_public_key' <<<"$n")
@@ -1366,7 +1466,7 @@ show_links() {
   ensure_nodes_file
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes"; pause; return; }
   local n
-  while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$SINGBOX_NODES")
+  while IFS= read -r n; do node_link "$n" || warn 'share link unavailable for this node'; done < <(jq -c '.nodes[]' "$SINGBOX_NODES")
   pause
 }
 
@@ -1412,7 +1512,7 @@ manage_nodes() {
 
   while :; do
     clear
-    node_link "$n"
+    node_link "$n" || warn 'share link unavailable; node management remains available'
     if [[ "$type" == "hysteria2" ]]; then
       printf '\n1) Change UDP port\n2) Reset default password\n3) Enable/disable\n4) Delete node\n5) Manage node users\n6) Set node outbound\n0) Back\n'
       case "$(ask 'Select')" in
@@ -1480,7 +1580,6 @@ edit_port() {
     if [[ "$proto" == tcp ]]; then close_port "$oldp" tcp
     else warn "old UDP/$oldp firewall rule retained; remove it manually if no longer needed"; fi
   fi
-  open_port "$newp" "$proto"
   ok "port changed to $newp"
   pause
 }
@@ -1498,9 +1597,7 @@ rotate_reality_secret() {
   confirm "Rotate Reality keypair and shortId? Existing links for this node will stop working." n || return
   read -r pk pubk < <(gen_x25519)
   sid=$(rand_short_id)
-  jq_update_nodes --arg id "$id" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
-    (.nodes[]|select(.id==$id)) |=
-      (.reality_private_key=$pk | .reality_public_key=$pubk | .reality_short_id=$sid)' || { err 'apply failed'; return 1; }
+  printf '%s\n' "$pk" "$pubk" "$sid" | apply_candidate_transaction prepare_reality_rotation "$id" || { err 'apply failed'; return 1; }
   ok "Reality keypair rotated"
   pause
 }
@@ -1719,7 +1816,8 @@ restart_service() {
   pause
 }
 
-uninstall() {
+uninstall() (
+  acquire_singbox_lock || return 1
   singbox_owned || { err 'refusing to remove unmanaged sing-box resources'; return 1; }
   validate_node_metadata "$SINGBOX_NODES" || { err 'invalid metadata; inspect before uninstalling'; return 1; }
   warn "Remove only $SINGBOX_BIN, $SINGBOX_SERVICE, $SINGBOX_CONF and $SINGBOX_NODES"
@@ -1733,7 +1831,7 @@ uninstall() {
   systemctl daemon-reload || return 1
   ok 'uninstalled'
   pause
-}
+)
 
 # ----------------------------------------------------------------------------
 # Realm relay (independent of sing-box)
