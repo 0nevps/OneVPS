@@ -46,6 +46,9 @@ logs = []
 
 
 def start(name, config, port):
+    # Fail closed: no runtime process may initialize a public ACME provider.
+    assert not config.get("certificate_providers"), "ACME configs are check-only"
+    assert all("certificate_provider" not in item.get("tls", {}) for item in config.get("inbounds", []))
     path = WORK / (name + ".json")
     path.write_text(json.dumps(config))
     subprocess.run([CORE, "check", "-c", str(path)], check=True, capture_output=True)
@@ -97,6 +100,7 @@ def udp_request(proxy_port, destination_port):
             datagram.sendto(packet + payload, (host, port))
             response, _ = datagram.recvfrom(4096)
             assert response[:3] == bytes(3) and response.endswith(payload)
+            return response
 
 
 def request(proxy_port, destination_port):
@@ -179,7 +183,8 @@ try:
     # A local TLS 1.3 HTTP/2 target avoids relying on public Reality handshake sites.
     certificate, key = WORK / "target.crt", WORK / "target.key"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-subj", "/CN=localhost", "-keyout", str(key), "-out", str(certificate)],
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+                    "-keyout", str(key), "-out", str(certificate)],
                    check=True, capture_output=True)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -228,6 +233,104 @@ try:
     else:
         raise AssertionError("private-address guard forwarded data: " + repr(result))
     print("ok - generated private-address rejection precedes outbound routing")
+
+    def hy2_server(name, fixture="runtime-hy2.json", guard=False):
+        config = json.loads((WORK / fixture).read_text())
+        node = next(item for item in config["inbounds"] if item["type"] == "hysteria2")
+        assert node["tls"]["certificate_provider"] == "acme-hy2.example.com"
+        config.pop("certificate_providers")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            node["listen_port"] = reservation.getsockname()[1]
+        node["listen"] = "127.0.0.1"
+        node["tls"] = {"enabled": True, "server_name": "localhost",
+                       "certificate_path": str(certificate), "key_path": str(key)}
+        readiness = free_port()
+        # QUIC listens on UDP; never mistake it for a TCP readiness endpoint.
+        config["inbounds"] = [node, {"type": "mixed", "tag": "readiness",
+                                    "listen": "127.0.0.1", "listen_port": readiness}]
+        for outbound in config["outbounds"]:
+            if outbound["type"] == "socks":
+                outbound["server_port"] = relay_port
+        if not guard:
+            config["route"]["rules"] = [rule for rule in config["route"]["rules"]
+                                        if rule.get("action") not in ("sniff", "reject")]
+        else:
+            assert any("127.0.0.0/8" in rule.get("ip_cidr", []) for rule in config["route"]["rules"])
+        start(name, config, readiness)
+        return node
+
+    def hy2_client(name, node, password, tls_name="localhost", obfs=None):
+        port = free_port()
+        outbound = {"type": "hysteria2", "server": "127.0.0.1", "server_port": node["listen_port"],
+                    "password": password, "tls": {"enabled": True, "server_name": tls_name,
+                                                   "certificate_path": str(certificate)}}
+        if obfs is not None:
+            outbound["obfs"] = {"type": "salamander", "password": obfs}
+        start(name, {"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": port}],
+                     "outbounds": [outbound]}, port)
+        return port
+
+    def cannot_forward(port, label):
+        try:
+            result = request(port, destination_port)
+        except (OSError, http.client.HTTPException):
+            pass
+        else:
+            raise AssertionError(label + " forwarded data: " + repr(result))
+        print("ok - HY2 " + label + " cannot forward")
+
+    hy2 = hy2_server("hy2-server")
+    hy2_default, hy2_alice, hy2_bob = hy2["users"]
+    assert len({user["name"] for user in hy2["users"]}) == 3
+    hy2_ports = [hy2_client("hy2-" + label, hy2, user["password"])
+                 for label, user in zip(("default", "alice", "bob"), hy2["users"])]
+    for port, expected in zip(hy2_ports, (b"upstream", b"direct", b"upstream")):
+        assert request(port, destination_port) == expected, "HY2 auth_user route isolation failed"
+    print("ok - HY2 trusted TLS TCP: default and inherited user proxy, explicit user direct")
+
+    # UDP markers distinguish direct routing from the node's SOCKS relay as well.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as direct_udp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_udp:
+        direct_udp.bind(("127.0.0.1", 0))
+        upstream_udp.bind(("127.0.0.1", upstream.server_port))
+        stop_udp = threading.Event()
+
+        def udp_echo(endpoint, marker):
+            endpoint.settimeout(0.2)
+            while not stop_udp.is_set():
+                try:
+                    data, address = endpoint.recvfrom(4096)
+                    endpoint.sendto(marker + data, address)
+                except socket.timeout:
+                    continue
+
+        workers = [threading.Thread(target=udp_echo, args=(endpoint, marker), daemon=True)
+                   for endpoint, marker in ((direct_udp, b"direct:"), (upstream_udp, b"upstream:"))]
+        for worker in workers:
+            worker.start()
+        try:
+            for port, marker in zip(hy2_ports, (b"upstream:", b"direct:", b"upstream:")):
+                assert udp_request(port, direct_udp.getsockname()[1]).endswith(marker + b"onevps-udp-forwarding")
+        finally:
+            stop_udp.set()
+            for worker in workers:
+                worker.join(timeout=2)
+    print("ok - HY2 UDP preserves default, inherited and overridden auth_user routes")
+
+    cannot_forward(hy2_client("hy2-wrong-password", hy2, "invalid-disposable"), "wrong password")
+    cannot_forward(hy2_client("hy2-wrong-name", hy2, hy2_alice["password"], "wrong.localhost"), "wrong TLS name")
+    obfuscated = hy2_server("hy2-obfs-server", "runtime-hy2-obfs.json")
+    obfs_password = obfuscated["obfs"]["password"]
+    matching = hy2_client("hy2-obfs-matching", obfuscated, hy2_alice["password"], obfs=obfs_password)
+    assert request(matching, destination_port) == b"direct"
+    print("ok - HY2 matching salamander forwards TCP")
+    cannot_forward(hy2_client("hy2-obfs-mismatch", obfuscated, hy2_alice["password"], obfs="wrong-salamander"), "mismatched salamander")
+    guarded = hy2_server("hy2-guarded-server", guard=True)
+    cannot_forward(hy2_client("hy2-guarded-client", guarded, hy2_alice["password"]), "private CIDR rejection")
+    deleted = hy2_server("hy2-deleted-server", "runtime-hy2-deleted.json")
+    survivor = hy2_client("hy2-surviving-client", deleted, hy2_bob["password"])
+    assert request(survivor, destination_port) == b"upstream"
+    cannot_forward(hy2_client("hy2-deleted-client", deleted, hy2_alice["password"]), "deleted user on new connection")
 except Exception:
     for path in sorted(WORK.glob("*.log")):
         print(path.name + ":\n" + path.read_text(errors="replace")[-4000:], file=sys.stderr)

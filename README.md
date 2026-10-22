@@ -19,6 +19,7 @@ OneVPS is a Bash tool for deploying and operating **sing-box v1.14.3** nodes on 
   proxies a dedicated WebSocket path. Requires a subdomain pointing to the VPS and reachable ports `80`/`443`.
   Trojan inbound paths must match `^/[A-Za-z0-9/_-]*$`: no spaces, query strings or fragments.
   This restriction is separate from outbound WebSocket link paths.
+- **Hysteria 2 + native ACME**: standalone UDP, automatic HTTP-01 certificate management and optional salamander.
 - Node-local users, independent credentials and share links, node outbounds and per-user outbound overrides.
 - Candidate configuration validation, service management, independent Realm relays, BBR and optional TCP tuning.
 
@@ -59,6 +60,43 @@ check the release notes before downloading. Once a sing-box release is available
 that same version into a clean directory, run `sha256sum --check SHA256SUMS`, inspect the script, then execute it.
 Checksums detect corruption but do not independently establish the publisher's identity.
 See [release procedures](CONTRIBUTING.md#releases); [CHANGELOG.md](CHANGELOG.md) retains historical release notes.
+
+## Hysteria 2 and native ACME
+
+Menu **11** adds a Hysteria 2 node using the pinned core's `with_quic` and `with_acme` features.
+Use menu **1** first to update an existing OneVPS service unit with the writable ACME storage allowance.
+No Caddy or separate ACME client is required. The initial implementation requires a domain with an A record
+pointing directly to this VPS, `getent`, `ss`, and publicly reachable TCP/80 for HTTP-01 issuance and renewal.
+Verify any AAAA record also reaches the host; DNS preflight checks IPv4 and does not prove external reachability.
+Another service owning TCP/80 is a conflict; OneVPS never stops it automatically.
+
+Certificates use Let's Encrypt, with TLS-ALPN-01 disabled to avoid taking Reality's TCP/443.
+Public issuance discloses the domain to the CA and certificate transparency logs; the creation menu asks first.
+Hysteria 2 listens on IPv4 UDP, independently of TCP listeners. UDP/443 may already belong to an HTTP/3 service;
+choose another UDP port rather than stopping that service. Cloud security groups must allow the selected port.
+Optional salamander obfuscation is supported. Share links use `hysteria2://` with verified TLS, not `insecure=1`.
+Node-local users and layered outbounds work as with the existing protocols; HY2 outbound-link import is not included.
+
+ACME accounts, certificates and private keys persist in `/var/lib/onevps-acme`, writable by the service user
+and excluded from ordinary configuration rollback. Enabled nodes sharing a domain share a certificate provider
+and must use the same ACME email. Renewal and certificate reload are managed by the running core.
+When no enabled node references a domain, its provider is omitted and renewal stops until it is enabled again.
+Stopping or uninstalling the core also stops renewal. Node deletion and uninstall retain ACME storage for manual
+backup/cleanup; no recursive deletion of private keys is performed. TCP/80 and HY2 UDP firewall allowances are
+retained after failure, port changes and deletion to avoid removing shared rules; review them manually.
+
+Applying a configuration with enabled HY2 nodes starts a disposable loopback client and waits approximately
+90 seconds per node for a trusted TLS/QUIC connection and HTTPS request to `https://www.example.com/` through
+that node's default-user outbound. Failure rolls back configuration and service state, not CA issuance or firewall
+allowances. This probe requires working egress and does not prove public UDP reachability or every user's route.
+A newly issued certificate may remain in ACME storage after rollback. Configuration checks alone do not issue
+certificates. DNS-01, self-signed deployment, port hopping and domain-edit menus are outside this first release.
+
+Local v1.14.3 tests cover generated ACME configuration checks and HY2 TCP/UDP forwarding, identity routing,
+wrong credentials/TLS names, salamander, private-address rejection and deleted-user rejection. Runtime tests
+replace ACME with an explicitly trusted disposable localhost certificate and never contact a public CA.
+Real public issuance, renewal, Linux service permissions/firewall behavior and cross-client interoperability
+remain unverified; use an authorized disposable host and ACME staging before production acceptance.
 
 ## Users, outbounds and links
 

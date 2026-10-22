@@ -127,6 +127,64 @@ assert_jq "sets Trojan WebSocket transport without TLS" "$trojan_inbound" \
    and (.tls.enabled // false | not)
    and .transport.path == "/secret-path"'
 
+# Hysteria 2 uses native ACME, scoped passwords and protocol-aware ports.
+hy2_node='{"id":"hy2-test","type":"hysteria2","name":"HY2 / Test","tag":"hy2-test","domain":"hy2.example.com","acme_email":"ops@example.com","port":443,"password":"test+pass@hy2","enabled":true,"users":[{"id":"alice","name":"Alice","password":"alice-password"}]}'
+jq --argjson node "$hy2_node" '.nodes += [$node]' "$FIXTURE" > "$TEST_TMP/hy2.json"
+assert_true "HY2 UDP/443 coexists with Reality TCP/443" validate_node_metadata "$TEST_TMP/hy2.json"
+render_config "$TEST_TMP/hy2.json" "$TEST_TMP/hy2-config.json"
+assert_file_jq "native ACME uses HTTP-01 only and persistent storage" "$TEST_TMP/hy2-config.json" \
+  '.certificate_providers | length == 1 and .[0].type == "acme" and .[0].provider == "letsencrypt" and .[0].disable_tls_alpn_challenge and (.[0].disable_http_challenge|not) and .[0].data_directory == "/var/lib/onevps-acme"'
+assert_file_jq "HY2 TLS references shared provider and preserves identities" "$TEST_TMP/hy2-config.json" \
+  '[.inbounds[] | select(.type == "hysteria2")][0] | .tls.certificate_provider == "acme-hy2.example.com" and .tls.enabled and (.users|length)==2 and .users[0].name == "hy2-test@onevps"'
+assert_contains "HY2 link encodes password and name" "$(node_link "$hy2_node")" \
+  'hysteria2://test%2Bpass%40hy2@hy2.example.com:443/?sni=hy2.example.com#HY2%20%2F%20Test'
+assert_contains "HY2 user link selects independent password" "$(node_user_link "$hy2_node" alice)" \
+  'hysteria2://alice-password@'
+hy2_obfs=$(jq -c '.obfs_password="obfs+secret"' <<<"$hy2_node")
+assert_jq "HY2 salamander is optional" "$(build_hysteria2_inbound "$hy2_obfs")" '.obfs.type=="salamander" and .obfs.password=="obfs+secret"'
+assert_contains "HY2 link encodes obfuscation password" "$(node_link "$hy2_obfs")" 'obfs=salamander&obfs-password=obfs%2Bsecret'
+for mutation in '.nodes[-1].domain="../bad.example"' '.nodes[-1].domain="-bad.example"' '.nodes[-1].acme_email="invalid"' '.nodes[-1].obfs_password=""' '.nodes[-1].users[0].password=.nodes[-1].password' '.nodes[0].port=80'; do
+  jq "$mutation" "$TEST_TMP/hy2.json" > "$TEST_TMP/hy2-invalid.json"
+  assert_false "rejects HY2 metadata $mutation" validate_node_metadata "$TEST_TMP/hy2-invalid.json"
+done
+jq '.nodes += [(.nodes[-1] | .id="hy2-second" | .tag="hy2-second" | .port=8443)]' "$TEST_TMP/hy2.json" > "$TEST_TMP/hy2-shared.json"
+render_config "$TEST_TMP/hy2-shared.json" "$TEST_TMP/hy2-config.json"
+assert_file_jq "HY2 nodes share one provider per domain" "$TEST_TMP/hy2-config.json" '(.certificate_providers|length)==1'
+jq '.nodes[-1].acme_email="other@example.com"' "$TEST_TMP/hy2-shared.json" > "$TEST_TMP/hy2-invalid.json"
+assert_false "shared domain rejects inconsistent ACME accounts" validate_node_metadata "$TEST_TMP/hy2-invalid.json"
+jq '.nodes[-1].port=443' "$TEST_TMP/hy2-shared.json" > "$TEST_TMP/hy2-invalid.json"
+assert_false "same UDP port cannot belong to two nodes" validate_node_metadata "$TEST_TMP/hy2-invalid.json"
+jq '(.nodes[] | select(.type=="hysteria2")).enabled=false' "$TEST_TMP/hy2-shared.json" > "$TEST_TMP/hy2-disabled.json"
+render_config "$TEST_TMP/hy2-disabled.json" "$TEST_TMP/hy2-config.json"
+assert_file_jq "disabled HY2 emits neither inbound nor unused provider" "$TEST_TMP/hy2-config.json" '(has("certificate_providers")|not) and all(.inbounds[]; .type!="hysteria2")'
+assert_true "HY2 ports are scoped by transport" bash -c '
+  source "$1"; SINGBOX_NODES="$2"
+  port_taken_by_node 443 udp && port_taken_by_node 443 tcp &&
+    ! port_taken_by_node 20001 udp && ! port_taken_by_node 443 udp hy2-test
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/hy2.json"
+
+assert_true "ACME readiness failure rolls back both live files" bash -c '
+  source "$1"
+  SINGBOX_DIR="$2/rollback-hy2"; mkdir "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"
+  SINGBOX_BIN="$SINGBOX_DIR/core"; SINGBOX_SERVICE="$SINGBOX_DIR/service"
+  cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  cp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes"; cp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  systemctl() { return 0; }; hysteria2_preflight() { return 0; }; open_port() { :; }
+  verify_hysteria2_nodes() { return 1; }
+  ! jq_update_nodes ".nodes[-1].name = \"Changed\"" &&
+    cmp "$SINGBOX_NODES" "$SINGBOX_DIR/before-nodes" && cmp "$SINGBOX_CONF" "$SINGBOX_DIR/before-config"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$TEST_TMP/hy2.json"
+assert_true "HY2 preflight rejects HTTP listener owned by another process" bash -c '
+  source "$1"; SINGBOX_BIN="$2/preflight-core"; SINGBOX_SERVICE="$2/preflight-service"
+  printf "#!/bin/sh\nprintf '\''sing-box version 1.14.3\\nTags: with_acme,with_quic\\n'\''\n" > "$SINGBOX_BIN"
+  chmod +x "$SINGBOX_BIN"; write_service > "$SINGBOX_SERVICE"
+  ss() { printf "LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:((nginx,pid=55,fd=3))\n"; }
+  systemctl() { printf "42\n"; }
+  ! hysteria2_preflight "$3"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$TEST_TMP/hy2.json"
+
 # Consumed by pub_ip() in the sourced script.
 # shellcheck disable=SC2034
 PUBIP="203.0.113.10"
@@ -538,13 +596,14 @@ for node_id in a1b2c3d4 b2c3d4e5; do
   ' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
 printf '11\n0\n' > "$TEST_TMP/menu-input"
-assert_true "main menu removes and ignores connection-user option 11" bash -c '
+assert_true "main menu dispatches Hysteria 2 without restoring global users" bash -c '
   source "$1"; exec 3< "$2"
   clear() { :; }; status_line() { :; }
   ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
   manage_users() { printf "REMOVED_DISPATCH\n"; }
+  add_hysteria2_node() { printf "HY2_DISPATCH\n"; }
   output=$(main_menu)
-  [[ "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* ]]
+  [[ "$output" == *HY2_DISPATCH* && "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
 for removed in manage_users show_user_links prepare_user_assignment apply_user_assignment validate_user_metadata; do
   assert_false "removed function $removed is absent" declare -F "$removed"

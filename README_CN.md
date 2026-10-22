@@ -18,6 +18,7 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 - **Trojan + WebSocket（Caddy 后端）**：sing-box 仅监听 `127.0.0.1`，Caddy 终结 TLS 并反代独立 WS 路径。
   需要指向 VPS 的子域名，以及可达的 `80`/`443` 端口。
   Trojan 入站路径必须匹配 `^/[A-Za-z0-9/_-]*$`，不允许空格、query 或 fragment；此限制与出站 WS 链接路径分开。
+- **Hysteria 2 + 原生 ACME**：独立 UDP，自动 HTTP-01 证书管理，可选 salamander 混淆。
 - 节点内用户、独立凭据与分享链接、节点出口及用户独立出口覆盖。
 - 候选配置校验、服务管理、独立 Realm 中转、BBR 与可选 TCP 优化。
 
@@ -55,6 +56,37 @@ OneVPS 正式版本包含 `onevps.sh` 与 `SHA256SUMS`。**旧发行版可能仍
 待 sing-box 版本发布后，将同一版本的两项资产下载到干净目录，执行 `sha256sum --check SHA256SUMS`，
 审阅脚本后再运行。校验和可检测内容损坏，但不能独立证明发布者身份。
 发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md#releases)；[CHANGELOG.md](CHANGELOG.md) 保留历史发布记录。
+
+## Hysteria 2 与原生 ACME
+
+菜单 **11** 添加 Hysteria 2 节点，要求固定核心包含 `with_quic`、`with_acme`。
+已有 OneVPS 安装请先通过菜单 **1** 更新服务单元，允许 ACME 持久目录写入。
+不依赖 Caddy 或外部 ACME 客户端。首期要求域名 A 记录直接指向本 VPS，并具备 `getent`、`ss`，
+公网 TCP/80 必须在申请及续期时可达。若存在 AAAA 记录，也需指向可达的本机地址；
+DNS 预检仅核对 IPv4，不证明公网可达。其他服务占用 TCP/80 时停止操作，不自动接管。
+
+使用 Let’s Encrypt 签发，关闭 TLS-ALPN-01，避免占用 Reality 的 TCP/443。
+公开签发会向 CA 和证书透明度日志披露域名，创建菜单会先确认。
+Hysteria 2 独立监听 IPv4 UDP；UDP/443 可能已被 HTTP/3 占用，应选择其他端口，不停止原服务。
+云安全组需开放选定 UDP 端口。支持可选 salamander 混淆，分享链接使用 `hysteria2://`，
+严格验证 TLS，不添加 `insecure=1`。支持节点内多用户和分层出口；暂不支持 HY2 出站链接导入。
+
+ACME 账户、证书和私钥保存在 `/var/lib/onevps-acme`，仅服务用户可写，不随普通配置事务回滚。
+相同域名的启用节点复用 provider，必须配置相同 ACME 邮箱。续期和证书缓存更新由运行中的核心管理。
+当域名不再被任何启用节点引用时，配置不再包含其 provider，续期暂停；重新启用后恢复管理。
+停止或卸载核心同样停止续期。删除节点与卸载均保留 ACME 数据供人工备份及清理，不递归删除私钥。
+失败、改端口和删除后保留 TCP/80 与 HY2 UDP 防火墙规则，避免误删共享规则，需人工审查。
+
+应用含启用 HY2 节点的配置后，脚本启动短命 loopback 客户端，每个节点等待约 90 秒，
+验证可信 TLS/QUIC，并通过默认用户出口请求 `https://www.example.com/`。
+失败则恢复配置与原服务状态，但不撤销 CA 签发或防火墙放行。探测依赖出口正常，
+不证明公网 UDP 可达或所有用户路由正确。回滚后新签证书可能仍保留在 ACME 存储中。
+配置 `check` 本身不会申请证书。首期不提供 DNS-01、自签名部署、端口跳跃和修改域名菜单。
+
+本地 v1.14.3 已验证 ACME 配置检查，以及 HY2 TCP/UDP、多用户路由、错误密码/TLS 名称拒绝、
+salamander、私网阻断和删除用户拒绝。运行测试将 ACME 替换为显式信任的临时 localhost 证书，
+不访问公共 CA。真实公网签发、续期、Linux 服务权限与防火墙、跨客户端互通仍未验证，
+生产验收前应在授权临时主机上使用 ACME staging 验证。
 
 ## 用户、分层出口与分享链接
 

@@ -4,6 +4,7 @@
 # Protocols:
 #   - VLESS + TCP + REALITY + XTLS Vision + uTLS (standalone)
 #   - Trojan + WebSocket behind Caddy (coexists with Caddy-proxied sites)
+#   - Hysteria 2 + native ACME HTTP-01 (standalone UDP)
 #
 set -euo pipefail
 umask 077
@@ -17,6 +18,7 @@ SINGBOX_CONF=$SINGBOX_DIR/config.json
 SINGBOX_NODES=$SINGBOX_DIR/onevps-nodes.json
 SINGBOX_SERVICE=/etc/systemd/system/onevps-sing-box.service
 SINGBOX_VERSION=v1.14.3
+SINGBOX_ACME_DIR=/var/lib/onevps-acme
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 BBR_CONF=/etc/sysctl.d/99-bbr.conf
 REALITY_PROBE_ROUNDS=3
@@ -226,6 +228,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
+ReadWritePaths=-$SINGBOX_ACME_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -352,8 +355,10 @@ install_singbox() (
     install -m 644 "$tx/service" "$SINGBOX_SERVICE" &&
     cp "$tx/config.json" "$SINGBOX_CONF" && cp "$tx/nodes.json" "$SINGBOX_NODES" || return 1
   printf 'OneVPS sing-box schema 1\n' > "$SINGBOX_DIR/.onevps-managed" || return 1
-  secure_singbox_files && systemctl daemon-reload && systemctl enable onevps-sing-box &&
+  secure_singbox_files && hysteria2_preflight "$SINGBOX_NODES" &&
+    systemctl daemon-reload && systemctl enable onevps-sing-box &&
     systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || return 1
+  verify_hysteria2_nodes "$SINGBOX_NODES" "$tx" || return 1
   committed=true
   ok "sing-box $(installed_version) installed"
 )
@@ -383,10 +388,15 @@ close_port() {
   fi
 }
 
+node_network() {
+  if [[ "$1" == hysteria2 ]]; then printf 'udp\n'; else printf 'tcp\n'; fi
+}
+
 port_in_use() {
-  local p="$1"
+  local p="$1" proto="${2:-tcp}" flags
+  case "$proto" in tcp) flags=-tnl ;; udp) flags=-unl ;; *) return 2 ;; esac
   if command -v ss >/dev/null 2>&1; then
-    ss -tunl 2>/dev/null | awk '{print $5}' | grep -qE ":$p$"
+    ss "$flags" 2>/dev/null | awk '{print $5}' | grep -qE ":$p$"
   else
     return 1
   fi
@@ -394,7 +404,9 @@ port_in_use() {
 
 port_taken_by_node() {
   [[ -f "$SINGBOX_NODES" ]] || return 1
-  jq -e --argjson p "$1" '.nodes[]|select(.port==$p)' "$SINGBOX_NODES" >/dev/null 2>&1
+  jq -e --argjson p "$1" --arg proto "${2:-tcp}" --arg exclude "${3:-}" '
+    .nodes[] | select(.id != $exclude and .port == $p and
+      (if .type == "hysteria2" then "udp" else "tcp" end) == $proto)' "$SINGBOX_NODES" >/dev/null 2>&1
 }
 
 # ----------------------------------------------------------------------------
@@ -901,7 +913,7 @@ build_proxy_outbound() {
 build_outbound_routes() {
   local source="$1" rows row object tag proxy proxies='[]' rules assignments
   assignments=$(jq -c '
-    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws")) | . as $n |
+    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2")) | . as $n |
       (if has("default_outbound") then
         {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
        else empty end),
@@ -937,12 +949,13 @@ render_config() {
     case "$type" in
       vless-reality) ib=$(build_reality_inbound "$n") || return 1 ;;
       trojan-ws)     ib=$(build_trojan_inbound "$n") || return 1 ;;
+      hysteria2)     ib=$(build_hysteria2_inbound "$n") || return 1 ;;
       *) continue ;;
     esac
     inbounds=$(printf '%s\n%s\n' "$inbounds" "$ib" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
   routes=$(build_outbound_routes "$source") || return 1
-  printf '%s\n%s\n' "$inbounds" "$routes" | jq -s '
+  printf '%s\n%s\n' "$inbounds" "$routes" | jq -s --slurpfile nodes "$source" --arg acme_dir "$SINGBOX_ACME_DIR" '
     .[0] as $inbounds | .[1] as $routes |
     def private_ip_rule: {
       action: "reject",
@@ -965,7 +978,13 @@ render_config() {
         final: "direct",
         rules: ([{action:"sniff"}, private_ip_rule, bittorrent_rule] + $routes.rules)
       }
-    }' > "$output"
+    } +
+    ([$nodes[0].nodes[] | select(.enabled and .type == "hysteria2")] | unique_by(.domain) |
+      if length == 0 then {} else {certificate_providers: map({
+        type:"acme", tag:("acme-" + .domain), domain:[.domain], email:.acme_email,
+        provider:"letsencrypt", data_directory:$acme_dir,
+        disable_http_challenge:false, disable_tls_alpn_challenge:true
+      })} end)' > "$output"
 }
 
 rebuild_config() {
@@ -994,8 +1013,21 @@ validate_node_metadata() {
     .schema_version == 1 and (has("users") | not) and (has("clients") | not) and
     (.nodes | type == "array") and
     all(.nodes[]; (has("clients") | not) and (has("spider_x") | not) and
-      (.type == "vless-reality" or .type == "trojan-ws") and
-      (if .type == "trojan-ws" then (.ws_path | type == "string" and test("^/[A-Za-z0-9/_-]*$")) else true end)) and
+      (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2") and
+      (if .type == "trojan-ws" then (.ws_path | type == "string" and test("^/[A-Za-z0-9/_-]*$"))
+       elif .type == "hysteria2" then
+         (.domain | type == "string" and length <= 253 and
+           test("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$")) and
+         (.acme_email | type == "string" and test("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")) and
+         (if has("obfs_password") then (.obfs_password | nonempty) else true end)
+       else true end)) and
+    (if any(.nodes[]; .enabled and .type == "hysteria2") then
+      all(.nodes[]; (.enabled and .type != "hysteria2" and .port == 80) | not)
+     else true end) and
+    ([.nodes[] | select(.type == "hysteria2")] | group_by(.domain) |
+      all(.[]; ([.[].acme_email] | unique | length) == 1)) and
+    ([.nodes[] | [(if .type == "hysteria2" then "udp" else "tcp" end), .port]] |
+      length == (unique | length)) and
     ([.nodes[].id] | length == (unique | length)) and
     ([.nodes[].tag] | length == (unique | length)) and
     all(.nodes[];
@@ -1005,7 +1037,7 @@ validate_node_metadata() {
       (.enabled | type == "boolean") and
       (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
       (if .type == "vless-reality" then (.uuid | nonempty)
-       elif .type == "trojan-ws" then (.password | nonempty)
+       elif .type == "trojan-ws" or .type == "hysteria2" then (.password | nonempty)
        else true end) and
       (if has("users") then (.users | type == "array") else true end) and
       ((.users // []) as $users |
@@ -1016,12 +1048,90 @@ validate_node_metadata() {
           (.name | type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]") | not)) and
           (if $n.type == "vless-reality" then
              (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))
-           elif $n.type == "trojan-ws" then (.password | nonempty)
+           elif $n.type == "trojan-ws" or $n.type == "hysteria2" then (.password | nonempty)
            else false end)) and
         (if .type == "vless-reality" then ([.uuid, $users[].uuid] | map(ascii_downcase))
          else [.password, $users[].password] end | length == (unique | length))))
   ' "$1" >/dev/null 2>&1
 }
+
+hysteria2_preflight() {
+  local source="$1" version listeners pid line
+  jq -e 'any(.nodes[]; .enabled and .type == "hysteria2")' "$source" >/dev/null || return 0
+  version=$("$SINGBOX_BIN" version) || return 1
+  [[ "$(installed_version)" == "${SINGBOX_VERSION#v}" && "$version" == *with_acme* && "$version" == *with_quic* ]] || {
+    err "Hysteria 2 requires sing-box $SINGBOX_VERSION with_acme and with_quic"; return 1;
+  }
+  grep -qxF "ReadWritePaths=-$SINGBOX_ACME_DIR" "$SINGBOX_SERVICE" || {
+    err 'Update the OneVPS core from menu [1] to enable persistent ACME storage'; return 1;
+  }
+  command -v ss >/dev/null 2>&1 || { err 'ss is required to check HTTP-01 and UDP listeners'; return 1; }
+  listeners=$(ss -H -ltnp 'sport = :80') || return 1
+  if [[ -n "$listeners" ]]; then
+    pid=$(systemctl show -p MainPID --value onevps-sing-box) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { err 'TCP/80 is occupied'; return 1; }
+    while IFS= read -r line; do
+      [[ "$line" == *"pid=$pid,"* ]] || { err 'TCP/80 belongs to another service; HTTP-01 cannot proceed'; return 1; }
+    done <<<"$listeners"
+  fi
+  if [[ -e "$SINGBOX_ACME_DIR" || -L "$SINGBOX_ACME_DIR" ]]; then
+    [[ -d "$SINGBOX_ACME_DIR" && ! -L "$SINGBOX_ACME_DIR" && -f "$SINGBOX_ACME_DIR/.onevps-managed" && ! -L "$SINGBOX_ACME_DIR/.onevps-managed" ]] &&
+      grep -qx 'OneVPS ACME storage' "$SINGBOX_ACME_DIR/.onevps-managed" || {
+        err "refusing unmanaged ACME storage: $SINGBOX_ACME_DIR"; return 1;
+      }
+  else
+    mkdir -m 700 "$SINGBOX_ACME_DIR" || return 1
+    printf 'OneVPS ACME storage\n' > "$SINGBOX_ACME_DIR/.onevps-managed" || return 1
+  fi
+  chown nobody:"$(id -gn nobody)" "$SINGBOX_ACME_DIR" && chmod 700 "$SINGBOX_ACME_DIR" || return 1
+}
+
+check_hysteria2_dns() {
+  local domain="$1" resolved address expected
+  command -v getent >/dev/null 2>&1 || { err 'getent is required for DNS checks'; return 1; }
+  expected=$(pub_ip) || return 1
+  [[ -n "$expected" ]] || { err 'could not determine public IPv4 address'; return 1; }
+  resolved=$(getent ahostsv4 "$domain" | awk '{print $1}' | sort -u) || return 1
+  [[ -n "$resolved" ]] || { err 'domain has no IPv4 resolution'; return 1; }
+  while IFS= read -r address; do
+    [[ "$address" == "$expected" ]] || { err 'domain must resolve directly to this VPS public IPv4, without a CDN'; return 1; }
+  done <<<"$resolved"
+  warn 'Verify any AAAA record also reaches this VPS; incorrect IPv6 can break HTTP-01.'
+}
+
+# A disposable loopback client verifies QUIC, authentication and trusted TLS.
+# The HTTPS probe also needs the selected default user's outbound to work.
+verify_hysteria2_nodes() (
+  local source="$1" work="$2" n port pid='' deadline result=0
+  trap 'if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi' EXIT
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    port=$(rand_port) || return 1
+    printf '%s\n' "$n" | jq --argjson port "$port" '{
+      log:{level:"error"},
+      inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:$port}],
+      outbounds:[({type:"hysteria2",server:"127.0.0.1",server_port:.port,password:.password,
+        tls:{enabled:true,server_name:.domain}} +
+        (if .obfs_password then {obfs:{type:"salamander",password:.obfs_password}} else {} end))]
+    }' > "$work/probe.json" || return 1
+    "$SINGBOX_BIN" run -c "$work/probe.json" > "$work/probe.log" 2>&1 &
+    pid=$!
+    deadline=$((SECONDS + 90))
+    result=1
+    while (( SECONDS < deadline )); do
+      kill -0 "$pid" 2>/dev/null || break
+      if curl --silent --fail --noproxy '' --proxy "socks5h://127.0.0.1:$port" \
+          --connect-timeout 3 --max-time 5 https://www.example.com/ -o /dev/null; then
+        result=0; break
+      fi
+      sleep 2
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pid=''
+    (( result == 0 )) || { err 'Hysteria 2 certificate/QUIC/egress probe timed out; candidate will roll back'; return 1; }
+  done < <(jq -c '.nodes[] | select(.enabled and .type == "hysteria2")' "$source")
+)
 
 # A subshell scopes traps. Backups and candidates stay on the target filesystem.
 # Rollback covers detectable failures, not power-loss atomicity across two files.
@@ -1067,6 +1177,7 @@ apply_candidate_transaction() (
   trap 'exit 129' HUP
   "$prepare" "$SINGBOX_NODES" "$tx/nodes.json" "$@" || return 1
   render_config "$tx/nodes.json" "$tx/config.json" || return 1
+  hysteria2_preflight "$tx/nodes.json" || return 1
   if ! validate_singbox_config "$tx/config.json" "$tx/check.log"; then
     err "candidate sing-box validation failed"; return 1
   fi
@@ -1077,9 +1188,16 @@ apply_candidate_transaction() (
   cat "$tx/nodes.json" > "$tx/nodes.next" && cat "$tx/config.json" > "$tx/config.next" || return 1
   if systemctl is-active --quiet onevps-sing-box; then active=true; fi
   touched=true
+  if jq -e 'any(.nodes[]; .enabled and .type == "hysteria2")' "$tx/nodes.json" >/dev/null; then
+    open_port 80 tcp
+    while IFS= read -r path; do open_port "$path" udp; done < <(
+      jq -r '.nodes[] | select(.enabled and .type == "hysteria2") | .port' "$tx/nodes.json")
+    warn 'ACME/UDP firewall allowances are retained on failure; review shared rules before removing them.'
+  fi
   mv -f "$tx/nodes.next" "$SINGBOX_NODES" || return 1
   mv -f "$tx/config.next" "$SINGBOX_CONF" || return 1
   systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || return 1
+  verify_hysteria2_nodes "$tx/nodes.json" "$tx" || return 1
   committed=true
 )
 
@@ -1125,7 +1243,7 @@ validate_node_selection() {
 prepare_node_user_change() {
   local source="$1" output="$2" id="$3" action="$4" uid="${5:-}" payload
   validate_node_metadata "$source" || return 1
-  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "trojan-ws"))' "$source" >/dev/null || return 1
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2"))' "$source" >/dev/null || return 1
   case "$action" in
     add|reset) payload=$(jq -cse 'select(length == 1) | .[0]') || return 1 ;;
     delete)
@@ -1243,6 +1361,17 @@ manage_outbound() {
   confirm 'Apply outbound setting?' n || return 0
   if apply_outbound_assignment "$id" "$scope" "$selected" <<<"$outbound"; then ok 'outbound applied'
   else err 'outbound not applied'; return 1; fi
+}
+
+build_hysteria2_inbound() {
+  local n="$1" clients
+  clients=$(node_clients "$n") || return 1
+  printf '%s\n%s\n' "$n" "$clients" | jq -s '
+    .[0] as $n | {
+      type:"hysteria2", tag:$n.tag, listen:"0.0.0.0", listen_port:$n.port,
+      users:.[1], tls:{enabled:true, server_name:$n.domain,
+        certificate_provider:("acme-" + $n.domain)}
+    } + (if $n.obfs_password then {obfs:{type:"salamander",password:$n.obfs_password}} else {} end)'
 }
 
 build_reality_inbound() {
@@ -1443,6 +1572,54 @@ add_reality_node() {
 # ----------------------------------------------------------------------------
 # [4b] Add Trojan + WS node (behind Caddy)
 # ----------------------------------------------------------------------------
+add_hysteria2_node() {
+  require_singbox
+  ensure_nodes_file
+  local name domain email password port id node obfs=''
+  info "Add Hysteria 2 with native ACME HTTP-01 (Let's Encrypt)"
+  warn 'Requires a domain pointing directly to this VPS and public TCP/80 for issuance and renewal.'
+  warn 'The domain will be sent to the CA and published in public certificate transparency logs.'
+  confirm 'Proceed with public certificate issuance?' n || return
+  name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
+  domain=$(normalize_domain "$(ask 'Certificate domain')")
+  email=$(ask 'ACME contact email')
+  password=$(rand_password) || return 1
+  while :; do
+    port=$(ask 'Hysteria 2 UDP port' 443)
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || { warn 'invalid port'; continue; }
+    port=$((10#$port))
+    (( port >= 1 && port <= 65535 )) || { warn 'port out of range'; continue; }
+    if port_taken_by_node "$port" udp || port_in_use "$port" udp; then
+      warn 'UDP port is occupied; choose another port'; continue
+    fi
+    break
+  done
+  if confirm 'Enable salamander obfuscation?' n; then obfs=$(rand_password) || return 1; fi
+  id=$(openssl rand -hex 4) || return 1
+  node=$(printf '%s\n' "$password" | jq -Rc --arg id "$id" --arg name "$name" --arg domain "$domain" \
+    --arg email "$email" --argjson port "$port" --arg obfs "$obfs" '
+    {id:$id,type:"hysteria2",name:$name,tag:("hy2-" + $id),domain:$domain,
+      acme_email:$email,port:$port,password:.,enabled:true} +
+    (if $obfs == "" then {} else {obfs_password:$obfs} end)') || return 1
+  local candidate
+  candidate=$(mktemp_json) || return 1
+  if ! jq --argjson node "$node" '.nodes += [$node]' "$SINGBOX_NODES" > "$candidate" ||
+      ! validate_node_metadata "$candidate"; then
+    rm -f "$candidate"; err 'invalid domain, email or conflicting node settings'; return 1
+  fi
+  rm -f "$candidate"
+  check_hysteria2_dns "$domain" || return 1
+  warn "Allow TCP/80 and UDP/$port in your cloud security group; TCP/80 remains necessary for renewal."
+  confirm 'Network prerequisites ready?' n || return
+  if jq_update_nodes --argjson node "$node" '.nodes += [$node]'; then
+    ok 'Hysteria 2 node added and verified through a local client'
+    node_link "$(node_by_id "$id")"
+  else
+    err 'Hysteria 2 activation failed; inspect DNS, TCP/80 reachability and journalctl -u onevps-sing-box'
+  fi
+  pause
+}
+
 add_trojan_node() {
   require_singbox
   ensure_nodes_file
@@ -1536,6 +1713,16 @@ node_link() {
       "$(jq -r '.reality_target' <<<"$n")" "$(jq -r '.reality_target_port // 443' <<<"$n")" \
       "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
 
+  elif [[ "$type" == "hysteria2" ]]; then
+    pw=$(jq -r '.password' <<<"$n")
+    domain=$(jq -r '.domain' <<<"$n")
+    link="hysteria2://$(urlenc "$pw")@${domain}:${port}/?sni=$(urlenc "$domain")"
+    if jq -e 'has("obfs_password")' <<<"$n" >/dev/null; then
+      link+="&obfs=salamander&obfs-password=$(urlenc "$(jq -r '.obfs_password' <<<"$n")")"
+    fi
+    printf '\n%s-- %s (Hysteria 2 / ACME) --%s\n' "$c_grn" "$name" "$c_rst"
+    printf '%s#%s\n' "$link" "$(urlenc "$name")"
+    info "UDP/$port; native HTTP-01 renewal requires TCP/80 while the node is enabled"
   elif [[ "$type" == "trojan-ws" ]]; then
     pw=$(jq -r '.password' <<<"$n")
     domain=$(jq -r '.domain' <<<"$n")
@@ -1568,6 +1755,7 @@ list_nodes() {
     en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
     case "$(jq -r '.type' <<<"$n")" in
       trojan-ws) kind="trojan"; dest=$(jq -r '.domain' <<<"$n") ;;
+      hysteria2) kind="hy2/udp"; dest=$(jq -r '.domain' <<<"$n") ;;
       *)         kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
     esac
     printf '  %d) %-18s %-8s port:%-6s %-26s %s\n' \
@@ -1601,7 +1789,19 @@ manage_nodes() {
   while :; do
     clear
     node_link "$n"
-    if [[ "$type" == "trojan-ws" ]]; then
+    if [[ "$type" == "hysteria2" ]]; then
+      printf '\n1) Change UDP port\n2) Reset default password\n3) Enable/disable\n4) Delete node\n5) Manage node users\n6) Set node outbound\n0) Back\n'
+      case "$(ask 'Select')" in
+        1) edit_port "$id" ;;
+        2) reset_trojan_password "$id" ;;
+        3) toggle_enabled "$id" ;;
+        4) del_node "$id"; return ;;
+        5) manage_node_users "$id" || true ;;
+        6) manage_outbound "$id" || true ;;
+        0|"") return ;;
+        *) continue ;;
+      esac
+    elif [[ "$type" == "trojan-ws" ]]; then
       cat <<EOF
 
   Node actions:
@@ -1660,26 +1860,29 @@ EOF
 }
 
 edit_port() {
-  local id="$1" n newp oldp
+  local id="$1" n newp oldp proto
   n=$(node_by_id "$id")
+  proto=$(node_network "$(jq -r '.type' <<<"$n")")
   while :; do
     newp=$(ask "New port" "$(jq -r '.port' <<<"$n")")
     [[ "$newp" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
     newp=$((10#$newp))
     (( newp >= 1 && newp <= 65535 )) || { warn "port out of range"; continue; }
-    if jq -e --argjson p "$newp" --arg id "$id" \
-        '.nodes[]|select(.port==$p and .id!=$id)' "$SINGBOX_NODES" >/dev/null 2>&1; then
-      warn "port used by another node"; continue
+    if port_taken_by_node "$newp" "$proto" "$id"; then
+      warn "$proto port used by another node"; continue
     fi
-    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp"; then
-      confirm "Port $newp appears to be in use. Use anyway?" n || continue
+    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp" "$proto"; then
+      warn "$proto port is already in use"; continue
     fi
     break
   done
   oldp=$(jq -r '.port' <<<"$n")
   jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p' || { err 'apply failed'; return 1; }
-  if [[ "$newp" != "$oldp" ]]; then close_port "$oldp" tcp; fi
-  open_port "$newp" tcp
+  if [[ "$newp" != "$oldp" ]]; then
+    if [[ "$proto" == tcp ]]; then close_port "$oldp" tcp
+    else warn "old UDP/$oldp firewall rule retained; remove it manually if no longer needed"; fi
+  fi
+  open_port "$newp" "$proto"
   ok "port changed to $newp"
   pause
 }
@@ -1845,7 +2048,9 @@ del_node() (
   fi
   jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))' || { err 'delete failed'; return 1; }
   committed=true
-  [[ "$type" == "trojan-ws" ]] || close_port "$port" tcp
+  if [[ "$type" == hysteria2 ]]; then
+    warn "ACME data and TCP/80, UDP/$port firewall rules retained; review shared use before cleanup"
+  elif [[ "$type" != trojan-ws ]]; then close_port "$port" tcp; fi
   ok 'deleted'
   pause
 )
@@ -2031,6 +2236,7 @@ uninstall() {
   validate_node_metadata "$SINGBOX_NODES" || { err 'invalid metadata; inspect before uninstalling'; return 1; }
   warn "Remove only $SINGBOX_BIN, $SINGBOX_SERVICE, $SINGBOX_CONF and $SINGBOX_NODES"
   warn 'Realm, BBR/TCP tuning, Caddy and custom site content are kept'
+  warn "ACME accounts, certificates and private keys in $SINGBOX_ACME_DIR are kept; renewal stops with the service"
   confirm 'Confirm uninstall?' n || return
   local n id cf backup
   # Remove only our marked routes; failed Caddy reload aborts core removal.
@@ -2364,6 +2570,7 @@ EOF
   8) TCP optimization
   9) Uninstall
   10) Realm relay
+  11) Add node - Hysteria 2 + native ACME
   0) Exit
 EOF
     case "$(ask 'Select')" in
@@ -2377,6 +2584,7 @@ EOF
       8) optimize_system ;;
       9) uninstall ;;
       10) realm_menu ;;
+      11) add_hysteria2_node || { err 'Hysteria 2 node not added'; pause; } ;;
       0|"") exit 0 ;;
       *) ;;
     esac

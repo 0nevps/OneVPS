@@ -85,4 +85,30 @@ printf '%s\n' '{"mode":"proxy","protocol":"socks","server":"127.0.0.1","port":10
 printf '%s\n' '{"mode":"direct"}' |
   prepare_outbound_assignment "$TEST_TMP/runtime-nodes.json" "$TEST_TMP/runtime-users.json" b2c3d4e5 selected '["alice"]'
 render_config "$TEST_TMP/runtime-users.json" "$TEST_TMP/runtime-base.json"
+# Append a third enabled node without moving any existing fixture index.
+# ACME is checked, never run: runtime_singbox.py replaces it with a local certificate.
+jq '.nodes += [{id:"c3d4e5f6",type:"hysteria2",name:"HY2 Test",tag:"hy2-c3d4e5f6",
+  enabled:true,port:20002,domain:"hy2.example.com",acme_email:"test@example.com",
+  password:"hy2-default-disposable",users:[
+    {id:"alice",name:"Alice",password:"hy2-alice-disposable"},
+    {id:"bob",name:"Bob",password:"hy2-bob-disposable"}]}]' \
+  "$TEST_TMP/runtime-users.json" > "$TEST_TMP/hy2-nodes.json"
+printf '%s\n' '{"mode":"proxy","protocol":"socks","server":"127.0.0.1","port":1080}' |
+  prepare_outbound_assignment "$TEST_TMP/hy2-nodes.json" "$TEST_TMP/hy2-proxy.json" c3d4e5f6
+printf '%s\n' '{"mode":"direct"}' |
+  prepare_outbound_assignment "$TEST_TMP/hy2-proxy.json" "$TEST_TMP/hy2-users.json" c3d4e5f6 selected '["alice"]'
+render_config "$TEST_TMP/hy2-users.json" "$TEST_TMP/runtime-hy2.json"
+jq -e '.certificate_providers | length == 1 and .[0].type == "acme" and
+  .[0].provider == "letsencrypt" and .[0].domain == ["hy2.example.com"] and
+  .[0].email == "test@example.com"' "$TEST_TMP/runtime-hy2.json" >/dev/null
+"$CORE" check -c "$TEST_TMP/runtime-hy2.json"
+jq '(.nodes[] | select(.id == "c3d4e5f6")).obfs_password = "local-salamander-disposable"' \
+  "$TEST_TMP/hy2-users.json" > "$TEST_TMP/hy2-obfs-nodes.json"
+render_config "$TEST_TMP/hy2-obfs-nodes.json" "$TEST_TMP/runtime-hy2-obfs.json"
+"$CORE" check -c "$TEST_TMP/runtime-hy2-obfs.json"
+jq '(.nodes[] | select(.id == "c3d4e5f6")).users |= map(select(.id != "alice"))' \
+  "$TEST_TMP/hy2-users.json" > "$TEST_TMP/hy2-deleted-nodes.json"
+render_config "$TEST_TMP/hy2-deleted-nodes.json" "$TEST_TMP/runtime-hy2-deleted.json"
+"$CORE" check -c "$TEST_TMP/runtime-hy2-deleted.json"
+printf 'ok - real sing-box accepts generated HY2 ACME, salamander and deleted-user configs (check only)\n'
 python3 -I "$ROOT_DIR/tests/runtime_singbox.py" "$CORE" "$TEST_TMP/runtime-base.json" "$TEST_TMP"
