@@ -10,6 +10,8 @@ body:
         Thanks for reporting a problem. Remove node URLs, UUIDs, passwords,
         private keys, WebSocket paths, tokens, and identifying server data.
         Security vulnerabilities belong in Private Vulnerability Reporting.
+        main is an in-progress sing-box v1.14.3 fresh-install rewrite, not a
+        migration or dual-core mode. Older releases may still use Xray.
 
   - type: input
     id: revision
@@ -45,8 +47,17 @@ body:
     id: component_versions
     attributes:
       label: Component versions
-      description: Include Xray and Caddy versions when relevant.
-      placeholder: Xray 25.x; Caddy 2.x
+      description: Include sing-box, systemd, Caddy and Realm versions when relevant.
+      placeholder: sing-box 1.14.3; systemd 257; Caddy 2.x
+
+  - type: textarea
+    id: installation_state
+    attributes:
+      label: Installation and conflict state
+      description: Describe fresh installation or existing services/configuration; redact secrets.
+      placeholder: Fresh host; or operation stopped because an old service/configuration was detected.
+    validations:
+      required: true
 
   - type: textarea
     id: steps
@@ -78,7 +89,10 @@ body:
     id: logs
     attributes:
       label: Sanitized logs
-      description: Paste only the output needed to diagnose the problem.
+      description: |
+        Paste only sanitized output needed to diagnose the problem, such as
+        onevps-sing-box version, check output, or journalctl -u onevps-sing-box.service.
+        State whether real client traffic was tested; check success alone is not connectivity proof.
       render: shell
 
   - type: checkboxes

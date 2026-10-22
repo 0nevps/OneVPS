@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# OneVPS - Xray node setup script
+# OneVPS - sing-box node setup script
 # Protocols:
 #   - VLESS + TCP + REALITY + XTLS Vision + uTLS (standalone)
 #   - Trojan + WebSocket behind Caddy (coexists with Caddy-proxied sites)
@@ -11,12 +11,12 @@ umask 077
 # ----------------------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------------------
-XRAY_DIR=/usr/local/etc/xray
-XRAY_BIN=/usr/local/bin/xray
-XRAY_CONF=$XRAY_DIR/config.json
-XRAY_NODES=$XRAY_DIR/onevps-nodes.json
-XRAY_SERVICE=/etc/systemd/system/xray.service
-XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+SINGBOX_DIR=/usr/local/etc/onevps
+SINGBOX_BIN=/usr/local/bin/onevps-sing-box
+SINGBOX_CONF=$SINGBOX_DIR/config.json
+SINGBOX_NODES=$SINGBOX_DIR/onevps-nodes.json
+SINGBOX_SERVICE=/etc/systemd/system/onevps-sing-box.service
+SINGBOX_VERSION=v1.14.3
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 BBR_CONF=/etc/sysctl.d/99-bbr.conf
 REALITY_PROBE_ROUNDS=3
@@ -84,7 +84,7 @@ is_valid_uuid() {
 }
 
 rand_uuid() {
-  if [[ -x "$XRAY_BIN" ]]; then "$XRAY_BIN" uuid | tr 'A-Z' 'a-z'; return; fi
+  if [[ -x "$SINGBOX_BIN" ]]; then "$SINGBOX_BIN" generate uuid | tr 'A-Z' 'a-z'; return; fi
   if [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid; return; fi
   if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'; return; fi
   python3 -c 'import uuid;print(uuid.uuid4())'
@@ -122,13 +122,13 @@ pub_ip() {
   echo "$PUBIP"
 }
 
-require_xray() {
-  command -v "$XRAY_BIN" >/dev/null 2>&1 || die "run menu option [1] to install Xray first"
+require_singbox() {
+  singbox_owned && [[ -x "$SINGBOX_BIN" ]] || die "run menu option [1] to install OneVPS sing-box first"
 }
 
 installed_version() {
-  [[ -x "$XRAY_BIN" ]] || { echo ""; return; }
-  "$XRAY_BIN" version 2>/dev/null | awk '/^Xray /{print $2; exit}'
+  [[ -x "$SINGBOX_BIN" ]] || { echo ""; return; }
+  "$SINGBOX_BIN" version 2>/dev/null | awk '/^sing-box version /{print $3; exit}'
 }
 
 urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
@@ -145,12 +145,12 @@ is_valid_domain() {
 }
 
 gen_x25519() {
-  require_xray
+  require_singbox
   local kp pk pubk
-  kp=$("$XRAY_BIN" x25519)
+  kp=$("$SINGBOX_BIN" generate reality-keypair) || return 1
   pk=$(awk -F': ' 'tolower($1) ~ /private/ {print $2; exit}' <<<"$kp")
   pubk=$(awk -F': ' 'tolower($1) ~ /public/ {print $2; exit}' <<<"$kp")
-  [[ -n "$pk" && -n "$pubk" ]] || die "failed to parse Xray x25519 keypair"
+  [[ -n "$pk" && -n "$pubk" ]] || die "failed to parse sing-box x25519 keypair"
   printf '%s %s\n' "$pk" "$pubk"
 }
 
@@ -159,7 +159,7 @@ gen_x25519() {
 # ----------------------------------------------------------------------------
 check_env() {
   [[ $EUID -eq 0 ]] || die "must run as root (sudo bash $0)"
-  command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script relies on systemd to manage Xray"
+  command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script relies on systemd to manage sing-box"
   id nobody >/dev/null 2>&1 || die "system user 'nobody' not found"
 
   case "$(uname -m)" in
@@ -202,21 +202,21 @@ ensure_deps() {
 }
 
 # ----------------------------------------------------------------------------
-# [2] Install / update Xray
+# [2] Install / update sing-box
 # ----------------------------------------------------------------------------
 write_service() {
-  mkdir -p "$XRAY_DIR" /var/log/xray
-  cat > "$XRAY_SERVICE" <<EOF
+  cat <<EOF
+# Managed by OneVPS sing-box
 [Unit]
-Description=Xray Service (OneVPS)
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
+Description=OneVPS sing-box
+Documentation=https://sing-box.sagernet.org/
+After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
 User=nobody
-WorkingDirectory=$XRAY_DIR
-ExecStart=$XRAY_BIN run -config $XRAY_CONF
+WorkingDirectory=$SINGBOX_DIR
+ExecStart=$SINGBOX_BIN run -c $SINGBOX_CONF
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -225,46 +225,138 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=full
-ReadWritePaths=/var/log/xray
+ProtectSystem=strict
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable xray >/dev/null 2>&1 || true
 }
 
-secure_xray_files() {
+secure_singbox_files() {
   local ng
-  mkdir -p "$XRAY_DIR" /var/log/xray
-  ng=$(id -gn nobody 2>/dev/null || true)
-  if [[ -n "$ng" ]]; then
-    chown root:"$ng" "$XRAY_DIR" 2>/dev/null || true
-    chmod 750 "$XRAY_DIR" 2>/dev/null || true
-    [[ -f "$XRAY_CONF" ]] && chown root:"$ng" "$XRAY_CONF" && chmod 640 "$XRAY_CONF"
-    [[ -f "$XRAY_NODES" ]] && chown root:"$ng" "$XRAY_NODES" && chmod 640 "$XRAY_NODES"
-    chown nobody:"$ng" /var/log/xray 2>/dev/null || true
-    chmod 750 /var/log/xray 2>/dev/null || true
+  ng=$(id -gn nobody) || return 1
+  chown root:"$ng" "$SINGBOX_DIR" "$SINGBOX_CONF" "$SINGBOX_NODES" || return 1
+  chmod 750 "$SINGBOX_DIR" && chmod 640 "$SINGBOX_CONF" "$SINGBOX_NODES"
+}
+
+singbox_owned() {
+  local p
+  for p in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_CONF" "$SINGBOX_NODES" "$SINGBOX_SERVICE" "$SINGBOX_DIR/.onevps-managed"; do
+    [[ ! -L "$p" ]] || return 1
+  done
+  [[ -f "$SINGBOX_DIR/.onevps-managed" && -f "$SINGBOX_SERVICE" ]] &&
+    grep -qx 'OneVPS sing-box schema 1' "$SINGBOX_DIR/.onevps-managed" &&
+    grep -qx '# Managed by OneVPS sing-box' "$SINGBOX_SERVICE"
+}
+
+check_singbox_conflicts() {
+  local p unit loaded
+  # No migration and no dual-core installation, even if the old unit is stopped.
+  for p in /usr/local/etc/xray /etc/xray /etc/sing-box /usr/local/etc/sing-box /etc/singbox /usr/local/etc/singbox; do
+    if [[ -e "$p" || -L "$p" ]]; then err "conflicting configuration: $p"; return 1; fi
+  done
+  for unit in xray.service xray@.service sing-box.service singbox.service; do
+    loaded=$(systemctl show -p LoadState --value "$unit") || return 1
+    if [[ "$loaded" != not-found ]]; then err "conflicting service: $unit"; return 1; fi
+  done
+  if singbox_owned; then
+    [[ -x "$SINGBOX_BIN" && -f "$SINGBOX_CONF" && -f "$SINGBOX_NODES" ]] || return 1
+    validate_node_metadata "$SINGBOX_NODES" || return 1
+  else
+    for p in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_SERVICE"; do
+      if [[ -e "$p" || -L "$p" ]]; then err "refusing unmanaged path: $p"; return 1; fi
+    done
+    loaded=$(systemctl show -p LoadState --value onevps-sing-box.service) || return 1
+    [[ "$loaded" == not-found ]] || { err 'unmanaged onevps-sing-box service'; return 1; }
   fi
+  for p in /etc/systemd/system/onevps-sing-box.service.d /run/systemd/system/onevps-sing-box.service.d; do
+    [[ ! -e "$p" && ! -L "$p" ]] || { err "unmanaged service override: $p"; return 1; }
+  done
 }
 
-install_xray() {
+# Download only the pinned official asset. Missing/invalid API digest fails closed.
+# Extract one regular member to stdout: never unpack archive paths or links.
+download_singbox() {
+  local dest="$1" asset url digest actual member listing
+  case "$ARCH" in amd64|arm64|armv7) ;; *) return 1 ;; esac
+  asset="sing-box-${SINGBOX_VERSION#v}-linux-$ARCH.tar.gz"
+  member="${asset%.tar.gz}/sing-box"
+  mkdir "$dest/download" || return 1
+  curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 \
+    "https://api.github.com/repos/SagerNet/sing-box/releases/tags/$SINGBOX_VERSION" > "$dest/download/release.json" || return 1
+  url=$(jq -er --arg name "$asset" --arg version "$SINGBOX_VERSION" \
+    'select(.tag_name == $version) | [.assets[] | select(.name == $name)] | select(length == 1) | .[0].browser_download_url' "$dest/download/release.json") || return 1
+  digest=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest' "$dest/download/release.json") || return 1
+  [[ "$url" == "https://github.com/SagerNet/sing-box/releases/download/$SINGBOX_VERSION/$asset" && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  curl -fsSL --proto '=https' --connect-timeout 15 --max-time 180 "$url" -o "$dest/download/archive.tar.gz" || return 1
+  actual=$(openssl dgst -sha256 "$dest/download/archive.tar.gz") || return 1
+  [[ "${actual##* }" == "${digest#sha256:}" ]] || { err 'sing-box SHA-256 mismatch'; return 1; }
+  listing=$(tar -tvzf "$dest/download/archive.tar.gz" "$member") || return 1
+  [[ "$listing" == -* && "$listing" != *$'\n'* ]] || return 1
+  tar -xOzf "$dest/download/archive.tar.gz" "$member" > "$dest/sing-box" || return 1
+  chmod 755 "$dest/sing-box" || return 1
+  [[ $("$dest/sing-box" version | awk '/^sing-box version /{print $3; exit}') == "${SINGBOX_VERSION#v}" ]]
+}
+
+install_singbox() (
   ensure_deps
-  local tmp
-  tmp=$(mktemp)
-  info "downloading official Xray installer..."
-  curl -fsSL "$XRAY_INSTALL_URL" -o "$tmp" || { rm -f "$tmp"; die "download failed"; }
-  info "installing/updating Xray-core and geodata..."
-  bash "$tmp" install || { rm -f "$tmp"; die "Xray install failed"; }
-  rm -f "$tmp"
-
-  mkdir -p "$XRAY_DIR"
-  [[ -f "$XRAY_NODES" ]] || echo '{"nodes":[]}' > "$XRAY_NODES"
-  write_service
-  rebuild_config
-  ok "Xray $(installed_version) installed"
-}
+  check_singbox_conflicts || return 1
+  local tx owned=false active=false enabled=false touched=false committed=false
+  tx=$(mktemp -d) || return 1
+  singbox_owned && owned=true
+  systemctl is-active --quiet onevps-sing-box && active=true
+  systemctl is-enabled --quiet onevps-sing-box && enabled=true
+  install_cleanup() {
+    local status=$? failed=false
+    trap - EXIT INT TERM HUP
+    if $touched && ! $committed; then
+      systemctl stop onevps-sing-box || failed=true
+      if $owned; then
+        cp -p "$tx/binary.backup" "$SINGBOX_BIN" || failed=true
+        cp -p "$tx/service.backup" "$SINGBOX_SERVICE" || failed=true
+        cp -p "$tx/config.backup" "$SINGBOX_CONF" || failed=true
+        cp -p "$tx/nodes.backup" "$SINGBOX_NODES" || failed=true
+      else
+        systemctl disable onevps-sing-box || failed=true
+        rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES" "$SINGBOX_DIR/.onevps-managed" || failed=true
+        rmdir "$SINGBOX_DIR" || failed=true
+      fi
+      systemctl daemon-reload || failed=true
+      if $owned; then
+        if $enabled; then systemctl enable onevps-sing-box || failed=true; else systemctl disable onevps-sing-box || failed=true; fi
+        if $active; then systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || failed=true; fi
+      fi
+      status=1
+    fi
+    if $failed; then err "ROLLBACK FAILED; recovery files retained at $tx"; else rm -rf "$tx"; fi
+    exit "$status"
+  }
+  trap install_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  download_singbox "$tx" || { err 'verified sing-box download failed'; return 1; }
+  if $owned; then
+    cp -p "$SINGBOX_BIN" "$tx/binary.backup" && cp -p "$SINGBOX_SERVICE" "$tx/service.backup" &&
+      cp -p "$SINGBOX_CONF" "$tx/config.backup" && cp -p "$SINGBOX_NODES" "$tx/nodes.backup" || return 1
+    cp "$SINGBOX_NODES" "$tx/nodes.json" || return 1
+  else
+    printf '{"schema_version":1,"nodes":[]}\n' > "$tx/nodes.json" || return 1
+  fi
+  render_config "$tx/nodes.json" "$tx/config.json" || return 1
+  "$tx/sing-box" check -c "$tx/config.json" > "$tx/check.log" 2>&1 || { err 'candidate validation failed'; return 1; }
+  write_service > "$tx/service" || return 1
+  touched=true
+  mkdir -p "$SINGBOX_DIR" || return 1
+  install -m 755 "$tx/sing-box" "$SINGBOX_BIN" &&
+    install -m 644 "$tx/service" "$SINGBOX_SERVICE" &&
+    cp "$tx/config.json" "$SINGBOX_CONF" && cp "$tx/nodes.json" "$SINGBOX_NODES" || return 1
+  printf 'OneVPS sing-box schema 1\n' > "$SINGBOX_DIR/.onevps-managed" || return 1
+  secure_singbox_files && systemctl daemon-reload && systemctl enable onevps-sing-box &&
+    systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || return 1
+  committed=true
+  ok "sing-box $(installed_version) installed"
+)
 
 # ----------------------------------------------------------------------------
 # Firewall / ports
@@ -301,8 +393,8 @@ port_in_use() {
 }
 
 port_taken_by_node() {
-  [[ -f "$XRAY_NODES" ]] || return 1
-  jq -e --argjson p "$1" '.nodes[]|select(.port==$p)' "$XRAY_NODES" >/dev/null 2>&1
+  [[ -f "$SINGBOX_NODES" ]] || return 1
+  jq -e --argjson p "$1" '.nodes[]|select(.port==$p)' "$SINGBOX_NODES" >/dev/null 2>&1
 }
 
 # ----------------------------------------------------------------------------
@@ -540,8 +632,8 @@ HTML
   chmod -R a+rX /var/lib/onevps 2>/dev/null || true
 }
 
-# Append a marked site block routing a secret WS path to a local Xray inbound.
-# Requests to the secret path are proxied to Xray (reverse_proxy handles the
+# Append a marked site block routing a secret WS path to a local sing-box inbound.
+# Requests to the secret path are proxied to sing-box (reverse_proxy handles the
 # WebSocket upgrade); every other path returns HTTP 403 with the styled 403
 # page, so the rest of the subdomain looks like a locked-down site.
 # Reverts the append if Caddy reload fails. Returns non-zero on failure.
@@ -567,7 +659,7 @@ caddy_add_route() {
     printf '\t}\n'
     printf '}\n'
     printf '# OneVPS-trojan:%s END\n' "$id"
-  } >> "$file"
+  } >> "$file" || return 1
   if ! caddy_reload "$file"; then
     err "reverting Caddyfile change"
     caddy_remove_route "$id" "$file"
@@ -589,31 +681,34 @@ caddy_remove_route() {
 # [3] Node storage + config generation
 # ----------------------------------------------------------------------------
 ensure_nodes_file() {
-  mkdir -p "$XRAY_DIR"
-  [[ -f "$XRAY_NODES" ]] || echo '{"nodes":[]}' > "$XRAY_NODES"
+  [[ -f "$SINGBOX_NODES" ]] && validate_node_metadata "$SINGBOX_NODES" || {
+    err 'valid schema_version 1 installation required; install sing-box first'; return 1;
+  }
+}
+
+prepare_jq_nodes() {
+  local source="$1" output="$2"
+  shift 2
+  jq "$@" "$source" > "$output"
 }
 
 jq_update_nodes() {
-  ensure_nodes_file
-  local t
-  t=$(mktemp)
-  jq "$@" "$XRAY_NODES" > "$t" && mv "$t" "$XRAY_NODES"
-  secure_xray_files
+  apply_candidate_transaction prepare_jq_nodes "$@"
 }
 
 node_count() {
-  [[ -f "$XRAY_NODES" ]] || { echo 0; return; }
-  jq '.nodes|length' "$XRAY_NODES"
+  [[ -f "$SINGBOX_NODES" ]] || { echo 0; return; }
+  jq '.nodes|length' "$SINGBOX_NODES"
 }
 
 node_by_id() {
-  jq -c --arg id "$1" '.nodes[]|select(.id==$id)' "$XRAY_NODES"
+  jq -c --arg id "$1" '.nodes[]|select(.id==$id)' "$SINGBOX_NODES"
 }
 
-validate_xray_config() {
+validate_singbox_config() {
   local conf="$1" err_file="$2"
-  [[ -x "$XRAY_BIN" ]] || return 0
-  "$XRAY_BIN" run -test -config "$conf" >"$err_file" 2>&1
+  [[ -x "$SINGBOX_BIN" ]] || return 1
+  "$SINGBOX_BIN" check -c "$conf" >"$err_file" 2>&1
 }
 
 mktemp_json() {
@@ -660,7 +755,7 @@ outbound_base64() {
 }
 
 # Strict, limited persistent schema. Revalidated on every render, including
-# disabled nodes. No arbitrary Xray JSON accepted.
+# disabled nodes. No arbitrary sing-box JSON accepted.
 validate_outbound() {
   local data host
   data=$(jq -cs -e '
@@ -681,7 +776,7 @@ validate_outbound() {
       elif .protocol == "vless" then
         keys_only(["mode","protocol","server","port","uuid","params"]) and (.uuid | uuid) and
         (.params | type == "object" and
-          keys_only(["encryption","type","security","flow","sni","fp","pbk","sid","spx","host","path","serviceName","mode","alpn"]) and
+          keys_only(["encryption","type","security","flow","sni","fp","pbk","sid","host","path","serviceName","mode","alpn"]) and
           all(.[]; text) and .encryption == "none" and
           (.type == "tcp" or .type == "ws" or .type == "grpc") and
           (.flow == "" or (.flow == "xtls-rprx-vision" and .type == "tcp")) and
@@ -693,7 +788,7 @@ validate_outbound() {
              (.pbk | type == "string" and test("^[A-Za-z0-9_-]{43}$")) and
              (.sid | type == "string" and test("^([0-9a-fA-F]{2}){0,8}$")) and
              (has("alpn") | not) and
-             (if has("spx") then (.spx | startswith("/")) else true end)
+             (has("spx") | not)
            elif .security == "tls" then (has("pbk") or has("sid") or has("spx") | not)
            else false end) and
           (if .type == "ws" then
@@ -702,7 +797,7 @@ validate_outbound() {
              (if has("host") then (.host | nonempty and test("^[A-Za-z0-9.:-]+$")) else true end)
            elif .type == "grpc" then
              (has("host") or has("path") | not) and
-             (if has("mode") then (.mode == "gun" or .mode == "multi") else true end) and
+             (if has("mode") then (.mode == "gun") else true end) and
              (if has("serviceName") then (.serviceName | nonempty) else true end)
            else (has("host") or has("path") or has("serviceName") or has("mode") | not) end))
       else false end
@@ -784,21 +879,21 @@ build_proxy_outbound() {
   data=$(jq -c '.') || return 1
   validate_outbound <<<"$data" || return 1
   jq -c --arg tag "$tag" '
-    {tag:$tag,protocol:.protocol} +
-    if .protocol == "shadowsocks" then {settings:{servers:[{address:.server,port:.port,method:.method,password:.password}]}}
-    elif .protocol == "socks" then {settings:{servers:[({address:.server,port:.port} +
-      if has("username") then {users:[{user:.username,pass:.password}]} else {} end)]}}
+    {tag:$tag,type:.protocol,server:.server,server_port:.port} +
+    if .protocol == "shadowsocks" then {method:.method,password:.password}
+    elif .protocol == "socks" then {version:"5"} +
+      (if has("username") then {username:.username,password:.password} else {} end)
     elif .protocol == "vless" then
-      .params as $p | {settings:{vnext:[{address:.server,port:.port,users:[{id:.uuid,encryption:"none",flow:$p.flow}]}]},
-      streamSettings:({network:$p.type,security:$p.security} +
-        (if $p.security == "reality" then {realitySettings:({serverName:$p.sni,fingerprint:$p.fp,publicKey:$p.pbk,shortId:$p.sid} + if $p|has("spx") then {spiderX:$p.spx} else {} end)}
-         else {tlsSettings:({allowInsecure:false} +
-           (if $p|has("sni") then {serverName:$p.sni} else {} end) +
-           (if $p|has("fp") then {fingerprint:$p.fp} else {} end) +
-           (if $p|has("alpn") then {alpn:($p.alpn|split(","))} else {} end))} end) +
-        (if $p.type == "ws" then {wsSettings:({path:($p.path // "/")} + if $p|has("host") then {host:$p.host} else {} end)}
-         elif $p.type == "grpc" then {grpcSettings:{serviceName:($p.serviceName // ""),multiMode:($p.mode == "multi")}}
-         else {} end))}
+      .params as $p | {uuid:.uuid,flow:$p.flow,
+        tls:({enabled:true,insecure:false} +
+          (if $p|has("sni") then {server_name:$p.sni} else {} end) +
+          (if $p|has("fp") then {utls:{enabled:true,fingerprint:$p.fp}} else {} end) +
+          (if $p|has("alpn") then {alpn:($p.alpn|split(","))} else {} end) +
+          (if $p.security == "reality" then {reality:{enabled:true,public_key:$p.pbk,short_id:$p.sid}} else {} end))} +
+        (if $p.type == "ws" then {transport:({type:"ws",path:($p.path // "/")} +
+          if $p|has("host") then {headers:{Host:$p.host}} else {} end)}
+         elif $p.type == "grpc" then {transport:{type:"grpc",service_name:($p.serviceName // "")}}
+         else {} end)
     else error("proxy required") end' <<<"$data"
 }
 
@@ -822,9 +917,9 @@ build_outbound_routes() {
     proxy=$(build_proxy_outbound "$tag" <<<"$object") || return 1
     proxies=$(printf '%s\n%s\n' "$proxies" "$proxy" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
-  rules=$(jq -c '[.[] | {type:"field",inboundTag:[.inbound],
-    outboundTag:(if .outbound.mode == "direct" then "direct" else .tag end)} +
-    (if has("user") then {user:[.user]} else {} end)]' <<<"$assignments") || return 1
+  rules=$(jq -c '[.[] | {action:"route",inbound:[.inbound],
+    outbound:(if .outbound.mode == "direct" then "direct" else .tag end)} +
+    (if has("user") then {auth_user:[.user]} else {} end)]' <<<"$assignments") || return 1
   printf '%s\n%s\n' "$proxies" "$rules" | jq -sc '{outbounds:.[0],rules:.[1]}'
 }
 
@@ -850,64 +945,41 @@ render_config() {
   printf '%s\n%s\n' "$inbounds" "$routes" | jq -s '
     .[0] as $inbounds | .[1] as $routes |
     def private_ip_rule: {
-      type: "field",
-      ip: [
+      action: "reject",
+      ip_cidr: [
         "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10",
         "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
         "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
         "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
         "::1/128", "fc00::/7", "fe80::/10"
-      ],
-      outboundTag: "block"
+      ]
     };
-    def bittorrent_rule: {type: "field", protocol: ["bittorrent"], outboundTag: "block"};
+    def bittorrent_rule: {protocol: ["bittorrent"], action: "reject"};
     {
-      log: {loglevel: "warning"},
+      log: {level: "warn"},
+      dns: {servers:[{type:"local",tag:"local"}],final:"local"},
       inbounds: $inbounds,
-      outbounds: ([
-        {tag: "direct", protocol: "freedom", settings: {domainStrategy: "UseIP"}},
-        {tag: "block", protocol: "blackhole", settings: {}}
-      ] + $routes.outbounds),
-      routing: {
-        domainStrategy: "AsIs",
-        rules: ([private_ip_rule, bittorrent_rule] + $routes.rules)
-      },
-      policy: {
-        levels: {
-          "0": {handshake: 4, connIdle: 300, uplinkOnly: 2, downlinkOnly: 5}
-        }
+      outbounds: ([{tag: "direct", type: "direct"}] + $routes.outbounds),
+      route: {
+        default_domain_resolver: "local",
+        final: "direct",
+        rules: ([{action:"sniff"}, private_ip_rule, bittorrent_rule] + $routes.rules)
       }
     }' > "$output"
 }
 
 rebuild_config() {
-  ensure_nodes_file
-  local tmp_conf chk_err
-  tmp_conf=$(mktemp_json)
-  render_config "$XRAY_NODES" "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
-  chk_err=$(mktemp)
-  if ! validate_xray_config "$tmp_conf" "$chk_err"; then
-    err "generated config failed validation (details withheld to protect credentials)"
-    rm -f "$tmp_conf" "$chk_err"
-    return 1
-  fi
-  rm -f "$chk_err"
-
-  mv "$tmp_conf" "$XRAY_CONF"
-  secure_xray_files
-  if [[ -x "$XRAY_BIN" ]]; then
-    systemctl restart xray 2>/dev/null || true
-  fi
+  apply_candidate_transaction prepare_jq_nodes '.'
 }
 
-# Legacy top-level users and node.clients remain ignored.
+# Stable identity labels are unchanged; no legacy metadata is accepted.
 node_clients() {
   jq -c '
     . as $n |
     [{uuid:.uuid,password:.password,email:(.tag + "@onevps")}] +
       [(.users // [])[] | . + {email:(([ $n.id, .id ] | tojson | @base64) + "@onevps-user")}] |
-    map(if $n.type == "vless-reality" then {id:.uuid,flow:"xtls-rprx-vision",email}
-        else {password,email} end)' <<<"$1"
+    map(if $n.type == "vless-reality" then {uuid:.uuid,flow:"xtls-rprx-vision",name:.email}
+        else {password,name:.email} end)' <<<"$1"
 }
 
 validate_node_metadata() {
@@ -919,11 +991,19 @@ validate_node_metadata() {
   done <<<"$outbounds"
   jq -e '
     def nonempty: type == "string" and length > 0;
+    .schema_version == 1 and (has("users") | not) and (has("clients") | not) and
     (.nodes | type == "array") and
+    all(.nodes[]; (has("clients") | not) and (has("spider_x") | not) and
+      (.type == "vless-reality" or .type == "trojan-ws") and
+      (if .type == "trojan-ws" then (.ws_path | type == "string" and test("^/[A-Za-z0-9/_-]*$")) else true end)) and
     ([.nodes[].id] | length == (unique | length)) and
+    ([.nodes[].tag] | length == (unique | length)) and
     all(.nodes[];
       . as $n |
-      (.id | nonempty) and
+      (.id | type == "string" and test("^[A-Za-z0-9_-]+$")) and
+      (.tag | nonempty) and
+      (.enabled | type == "boolean") and
+      (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
       (if .type == "vless-reality" then (.uuid | nonempty)
        elif .type == "trojan-ws" then (.password | nonempty)
        else true end) and
@@ -950,21 +1030,25 @@ apply_candidate_transaction() (
   shift
   umask 077
   local tx active=false touched=false committed=false preserve=false
-  [[ -x "$XRAY_BIN" && -f "$XRAY_NODES" && -f "$XRAY_CONF" ]] || {
-    err "installed Xray and existing configuration required"; return 1;
+  local path
+  for path in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_NODES" "$SINGBOX_CONF" "$SINGBOX_SERVICE"; do
+    [[ ! -L "$path" ]] || { err "refusing symlink: $path"; return 1; }
+  done
+  [[ -x "$SINGBOX_BIN" && -f "$SINGBOX_NODES" && -f "$SINGBOX_CONF" ]] || {
+    err "installed sing-box and existing configuration required"; return 1;
   }
-  tx=$(mktemp -d "$XRAY_DIR/.transaction.XXXXXXXX") || return 1
+  tx=$(mktemp -d "$SINGBOX_DIR/.transaction.XXXXXXXX") || return 1
   transaction_cleanup() {
     local status=$? failed=false
     trap - EXIT INT TERM HUP
     if $touched && ! $committed; then
-      cp -p "$tx/nodes.backup" "$XRAY_NODES" || failed=true
-      cp -p "$tx/config.backup" "$XRAY_CONF" || failed=true
+      cp -p "$tx/nodes.backup" "$SINGBOX_NODES" || failed=true
+      cp -p "$tx/config.backup" "$SINGBOX_CONF" || failed=true
       if $active; then
-        systemctl restart xray && systemctl is-active --quiet xray || failed=true
+        systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || failed=true
       else
-        systemctl stop xray || failed=true
-        if systemctl is-active --quiet xray; then failed=true; fi
+        systemctl stop onevps-sing-box || failed=true
+        if systemctl is-active --quiet onevps-sing-box; then failed=true; fi
       fi
       if $failed; then
         preserve=true
@@ -981,21 +1065,21 @@ apply_candidate_transaction() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
-  "$prepare" "$XRAY_NODES" "$tx/nodes.json" "$@" || return 1
+  "$prepare" "$SINGBOX_NODES" "$tx/nodes.json" "$@" || return 1
   render_config "$tx/nodes.json" "$tx/config.json" || return 1
-  if ! validate_xray_config "$tx/config.json" "$tx/check.log"; then
-    err "candidate Xray validation failed"; return 1
+  if ! validate_singbox_config "$tx/config.json" "$tx/check.log"; then
+    err "candidate sing-box validation failed"; return 1
   fi
-  cp -p "$XRAY_NODES" "$tx/nodes.backup" || return 1
-  cp -p "$XRAY_CONF" "$tx/config.backup" || return 1
+  cp -p "$SINGBOX_NODES" "$tx/nodes.backup" || return 1
+  cp -p "$SINGBOX_CONF" "$tx/config.backup" || return 1
   # Copy attributes from each original before filling replacement contents.
-  cp -p "$XRAY_NODES" "$tx/nodes.next" && cp -p "$XRAY_CONF" "$tx/config.next" || return 1
+  cp -p "$SINGBOX_NODES" "$tx/nodes.next" && cp -p "$SINGBOX_CONF" "$tx/config.next" || return 1
   cat "$tx/nodes.json" > "$tx/nodes.next" && cat "$tx/config.json" > "$tx/config.next" || return 1
-  if systemctl is-active --quiet xray; then active=true; fi
+  if systemctl is-active --quiet onevps-sing-box; then active=true; fi
   touched=true
-  mv -f "$tx/nodes.next" "$XRAY_NODES" || return 1
-  mv -f "$tx/config.next" "$XRAY_CONF" || return 1
-  systemctl restart xray && systemctl is-active --quiet xray || return 1
+  mv -f "$tx/nodes.next" "$SINGBOX_NODES" || return 1
+  mv -f "$tx/config.next" "$SINGBOX_CONF" || return 1
+  systemctl restart onevps-sing-box && systemctl is-active --quiet onevps-sing-box || return 1
   committed=true
 )
 
@@ -1166,64 +1250,30 @@ build_reality_inbound() {
   clients=$(node_clients "$n") || return 1
   printf '%s\n%s\n' "$n" "$clients" | jq -s '
     .[0] as $n | .[1] as $clients |
-    $n.tag as $tag | $n.port as $port | $n.reality_sni as $sni |
-    ($n.reality_target + ":" + (($n.reality_target_port // 443)|tostring)) as $target |
-    $n.reality_private_key as $pk | $n.reality_short_id as $sid |
     {
-      tag: $tag,
-      listen: "0.0.0.0",
-      port: $port,
-      protocol: "vless",
-      settings: {
-        clients: $clients,
-        decryption: "none"
-      },
-      streamSettings: {
-        network: "tcp",
-        security: "reality",
-        realitySettings: {
-          show: false,
-          target: $target,
-          xver: 0,
-          serverNames: [$sni, ""],
-          privateKey: $pk,
-          shortIds: [$sid]
+      type: "vless", tag: $n.tag, listen: "0.0.0.0", listen_port: $n.port,
+      users: $clients,
+      tls: {
+        enabled: true, server_name: $n.reality_sni,
+        reality: {
+          enabled: true,
+          handshake: {server:$n.reality_target,server_port:($n.reality_target_port // 443)},
+          private_key: $n.reality_private_key, short_id: [$n.reality_short_id]
         }
-      },
-      sniffing: {
-        enabled: true,
-        destOverride: ["http", "tls"],
-        routeOnly: true
       }
     }'
 }
 
 # Trojan inbound: listens on loopback only; Caddy terminates TLS on :443 and
-# reverse-proxies the WS path here. No TLS at the Xray layer.
+# reverse-proxies the WS path here. No TLS at the sing-box layer.
 build_trojan_inbound() {
   local n="$1" clients
   clients=$(node_clients "$n") || return 1
   printf '%s\n%s\n' "$n" "$clients" | jq -s '
     .[0] as $n | .[1] as $clients |
-    $n.tag as $tag | $n.port as $port | $n.ws_path as $path |
     {
-      tag: $tag,
-      listen: "127.0.0.1",
-      port: $port,
-      protocol: "trojan",
-      settings: {
-        clients: $clients
-      },
-      streamSettings: {
-        network: "ws",
-        security: "none",
-        wsSettings: { path: $path }
-      },
-      sniffing: {
-        enabled: true,
-        destOverride: ["http", "tls"],
-        routeOnly: true
-      }
+      type: "trojan", tag: $n.tag, listen: "127.0.0.1", listen_port: $n.port,
+      users: $clients, transport: {type:"ws",path:$n.ws_path}
     }'
 }
 
@@ -1232,25 +1282,24 @@ build_trojan_inbound() {
 # ----------------------------------------------------------------------------
 probe_reality_target() {
   local domain="$1"
-  [[ -x "$XRAY_BIN" ]] || return 0
-  command -v timeout >/dev/null 2>&1 || return 0
-  info "probing target with: xray tls ping $domain"
-  if timeout 12 "$XRAY_BIN" tls ping "$domain" >/dev/null 2>&1 \
-     || timeout 12 "$XRAY_BIN" tls ping "$domain:443" >/dev/null 2>&1; then
-    ok "target probe OK"
+  info "probing TLS 1.3, certificate and H2 with OpenSSL: $domain"
+  if probe_reality_once "$domain"; then
+    ok 'TLS target probe OK (not an end-to-end Reality test)'
   else
-    warn "target probe failed or timed out; continue only if this domain supports TLS 1.3/H2 and has stable SNI"
+    warn 'target probe failed or timed out; verify TLS 1.3/H2 and SNI before use'
   fi
 }
 
 probe_reality_once() {
-  local domain="$1"
-  timeout 10 "$XRAY_BIN" tls ping "$domain" >/dev/null 2>&1 \
-    || timeout 10 "$XRAY_BIN" tls ping "$domain:443" >/dev/null 2>&1
+  local domain="$1" result
+  command -v timeout >/dev/null 2>&1 || return 1
+  result=$(timeout 10 openssl s_client -connect "$domain:443" -servername "$domain" \
+    -tls1_3 -alpn h2 -verify_return_error -verify_hostname "$domain" </dev/null 2>&1) || return 1
+  grep -q 'ALPN protocol: h2' <<<"$result"
 }
 
 auto_pick_reality_target() {
-  [[ -x "$XRAY_BIN" ]] || { echo "${REALITY_DESTS[0]}"; return; }
+  [[ -x "$SINGBOX_BIN" ]] || { echo "${REALITY_DESTS[0]}"; return; }
   if ! command -v timeout >/dev/null 2>&1; then
     warn "timeout command not found; using ${REALITY_DESTS[0]}" >&2
     echo "${REALITY_DESTS[0]}"
@@ -1328,7 +1377,7 @@ pick_reality_target() {
 # [4] Add VLESS Reality node
 # ----------------------------------------------------------------------------
 add_reality_node() {
-  require_xray
+  require_singbox
   ensure_nodes_file
   echo; info "Add node - VLESS + TCP + REALITY + Vision + uTLS"
 
@@ -1378,21 +1427,15 @@ add_reality_node() {
       reality_private_key: $pk,
       reality_public_key: $pubk,
       reality_short_id: $sid,
-      spider_x: "/",
       enabled: true
     }')
 
-  jq_update_nodes --argjson node "$node" '.nodes += [$node]'
-  open_port "$port" tcp
-
-  if rebuild_config; then
+  if jq_update_nodes --argjson node "$node" '.nodes += [$node]'; then
+    open_port "$port" tcp
     ok "Reality node added"
     node_link "$(node_by_id "$id")"
   else
-    err "config generation failed, rolled back"
-    jq_update_nodes --arg id "$id" 'del(.nodes[] | select(.id==$id))'
-    close_port "$port" tcp
-    rebuild_config || true
+    err "node not added; transaction rolled back"
   fi
   pause
 }
@@ -1401,7 +1444,7 @@ add_reality_node() {
 # [4b] Add Trojan + WS node (behind Caddy)
 # ----------------------------------------------------------------------------
 add_trojan_node() {
-  require_xray
+  require_singbox
   ensure_nodes_file
   echo; info "Add node - Trojan + WebSocket (behind Caddy)"
 
@@ -1452,23 +1495,18 @@ add_trojan_node() {
       enabled: true
     }')
 
-  jq_update_nodes --argjson node "$node" '.nodes += [$node]'
-
   if ! caddy_add_route "$id" "$domain" "$path" "$port" "$cfile"; then
     err "Caddy update failed, rolled back"
-    jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
     pause; return
   fi
 
-  if rebuild_config; then
+  if jq_update_nodes --argjson node "$node" '.nodes += [$node]'; then
     ok "Trojan node added"
     info "ensure DNS A/AAAA for $domain points here so Caddy can issue its cert"
     node_link "$(node_by_id "$id")"
   else
-    err "Xray config generation failed, rolled back"
+    err "sing-box config generation failed, rolled back"
     caddy_remove_route "$id" "$cfile"; caddy_reload "$cfile" || true
-    jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
-    rebuild_config || true
   fi
   pause
 }
@@ -1477,7 +1515,7 @@ add_trojan_node() {
 # Share links
 # ----------------------------------------------------------------------------
 node_link() {
-  local n="$1" type name port link addr uuid sni pubk sid spx fp pw domain path
+  local n="$1" type name port link addr uuid sni pubk sid fp pw domain path
   type=$(jq -r '.type' <<<"$n")
   name=$(jq -r '.name' <<<"$n")
   port=$(jq -r '.port' <<<"$n")
@@ -1490,8 +1528,7 @@ node_link() {
     pubk=$(jq -r '.reality_public_key' <<<"$n")
     sid=$(jq -r '.reality_short_id' <<<"$n")
     fp=$(jq -r '.fingerprint // "chrome"' <<<"$n")
-    spx=$(jq -r '.spider_x // "/"' <<<"$n")
-    link="vless://${uuid}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pubk}&sid=${sid}&spx=$(urlenc "$spx")&type=tcp#$(urlenc "$name")"
+    link="vless://${uuid}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pubk}&sid=${sid}&type=tcp#$(urlenc "$name")"
     echo
     printf '%s-- %s (VLESS Reality + Vision + uTLS) --%s\n' "$c_grn" "$name" "$c_rst"
     echo "$link"
@@ -1513,11 +1550,11 @@ node_link() {
 }
 
 show_links() {
-  require_xray
+  require_singbox
   ensure_nodes_file
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes"; pause; return; }
   local n
-  while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$XRAY_NODES")
+  while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$SINGBOX_NODES")
   pause
 }
 
@@ -1537,7 +1574,7 @@ list_nodes() {
       "$i" "$(jq -r '.name' <<<"$n")" "$kind" "$(jq -r '.port' <<<"$n")" \
       "$dest" \
       "$([[ "$en" == true ]] && echo "$st" || echo "${c_ylw}$st${c_rst}")"
-  done < <(jq -c '.nodes[]' "$XRAY_NODES")
+  done < <(jq -c '.nodes[]' "$SINGBOX_NODES")
 }
 
 pick_node() {
@@ -1548,11 +1585,11 @@ pick_node() {
   sel=$(ask $'Select node number (Enter to go back)' "")
   [[ "$sel" =~ ^[0-9]+$ ]] || { echo ""; return; }
   (( sel>=1 && sel<=cnt )) || { echo ""; return; }
-  jq -r --argjson i "$((sel-1))" '.nodes[$i].id' "$XRAY_NODES"
+  jq -r --argjson i "$((sel-1))" '.nodes[$i].id' "$SINGBOX_NODES"
 }
 
 manage_nodes() {
-  require_xray
+  require_singbox
   ensure_nodes_file
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes, add one first"; pause; return; }
   local id n type
@@ -1631,7 +1668,7 @@ edit_port() {
     newp=$((10#$newp))
     (( newp >= 1 && newp <= 65535 )) || { warn "port out of range"; continue; }
     if jq -e --argjson p "$newp" --arg id "$id" \
-        '.nodes[]|select(.port==$p and .id!=$id)' "$XRAY_NODES" >/dev/null 2>&1; then
+        '.nodes[]|select(.port==$p and .id!=$id)' "$SINGBOX_NODES" >/dev/null 2>&1; then
       warn "port used by another node"; continue
     fi
     if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp"; then
@@ -1640,10 +1677,10 @@ edit_port() {
     break
   done
   oldp=$(jq -r '.port' <<<"$n")
-  jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p'
+  jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p' || { err 'apply failed'; return 1; }
   if [[ "$newp" != "$oldp" ]]; then close_port "$oldp" tcp; fi
   open_port "$newp" tcp
-  rebuild_config && ok "port changed to $newp" || err "apply failed"
+  ok "port changed to $newp"
   pause
 }
 
@@ -1662,8 +1699,8 @@ rotate_reality_secret() {
   sid=$(rand_short_id)
   jq_update_nodes --arg id "$id" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
     (.nodes[]|select(.id==$id)) |=
-      (.reality_private_key=$pk | .reality_public_key=$pubk | .reality_short_id=$sid)'
-  rebuild_config && ok "Reality keypair rotated" || err "apply failed"
+      (.reality_private_key=$pk | .reality_public_key=$pubk | .reality_short_id=$sid)' || { err 'apply failed'; return 1; }
+  ok "Reality keypair rotated"
   pause
 }
 
@@ -1671,8 +1708,8 @@ edit_reality_target() {
   local id="$1" target
   target=$(pick_reality_target)
   jq_update_nodes --arg id "$id" --arg target "$target" '
-    (.nodes[]|select(.id==$id)) |= (.reality_sni=$target | .reality_target=$target | .reality_target_port=443)'
-  rebuild_config && ok "target changed to $target" || err "apply failed"
+    (.nodes[]|select(.id==$id)) |= (.reality_sni=$target | .reality_target=$target | .reality_target_port=443)' || { err 'apply failed'; return 1; }
+  ok "target changed to $target"
   pause
 }
 
@@ -1698,24 +1735,42 @@ edit_trojan_domain() {
   done
   if [[ "$newdom" == "$olddom" ]]; then warn "unchanged"; pause; return; fi
 
-  # Drop our old block first so the collision check ignores it.
-  caddy_remove_route "$id" "$cf"
-  if grep -qiF "$newdom" "$cf" 2>/dev/null; then
-    err "$newdom already appears in $cf; restoring old route"
-    caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
-    pause; return
-  fi
-  if ! caddy_add_route "$id" "$newdom" "$path" "$port" "$cf"; then
-    err "Caddy update failed; restoring old route"
-    caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
-    pause; return
-  fi
-  jq_update_nodes --arg id "$id" --arg d "$newdom" \
-    '(.nodes[]|select(.id==$id)).domain = $d'
-  rebuild_config && ok "domain changed to $newdom" || err "apply failed"
+  update_trojan_route "$id" "$cf" "$newdom" "$path" "$port" domain "$newdom" || return 1
+  ok "domain changed to $newdom"
   info "ensure DNS for $newdom points here so Caddy can issue its cert"
   pause
 }
+
+# Caddy edit is rolled back byte-for-byte when metadata/core activation fails.
+update_trojan_route() (
+  local id="$1" cf="$2" domain="$3" path="$4" port="$5" field="$6" value="$7" backup committed=false
+  [[ "$path" =~ ^/[A-Za-z0-9/_-]*$ ]] || { err 'WS path must contain only letters, digits, /, _ and -'; return 1; }
+  backup=$(mktemp) || return 1
+  cp -p "$cf" "$backup" || { rm -f "$backup"; return 1; }
+  route_cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    if ! $committed; then
+      if ! cp -p "$backup" "$cf" || ! caddy_reload "$cf"; then
+        err "Caddy rollback failed; backup retained at $backup"; exit 1
+      fi
+    fi
+    rm -f "$backup"
+    exit "$status"
+  }
+  trap route_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  caddy_remove_route "$id" "$cf" || return 1
+  if grep -qiF "$domain" "$cf"; then err 'domain already in Caddyfile'; return 1; fi
+  caddy_add_route "$id" "$domain" "$path" "$port" "$cf" || return 1
+  if [[ -n "$field" ]]; then
+    jq_update_nodes --arg id "$id" --arg field "$field" --arg value "$value" \
+      '(.nodes[]|select(.id==$id))[$field] = $value' || return 1
+  fi
+  committed=true
+)
 
 edit_trojan_path() {
   local id="$1" n cf port domain newpath
@@ -1725,13 +1780,8 @@ edit_trojan_path() {
   domain=$(jq -r '.domain' <<<"$n")
   newpath=$(ask "New WS path" "$(jq -r '.ws_path' <<<"$n")")
   [[ "$newpath" == /* ]] || newpath="/$newpath"
-  caddy_remove_route "$id" "$cf"
-  if ! caddy_add_route "$id" "$domain" "$newpath" "$port" "$cf"; then
-    err "Caddy update failed"; pause; return
-  fi
-  jq_update_nodes --arg id "$id" --arg p "$newpath" \
-    '(.nodes[]|select(.id==$id)).ws_path = $p'
-  rebuild_config && ok "WS path changed to $newpath" || err "apply failed"
+  update_trojan_route "$id" "$cf" "$domain" "$newpath" "$port" ws_path "$newpath" || return 1
+  ok "WS path changed to $newpath"
   pause
 }
 
@@ -1749,8 +1799,7 @@ rebuild_trojan_route() {
     cf=$(find_caddyfile)
     [[ -n "$cf" ]] || { err "Caddyfile not found"; pause; return; }
   fi
-  caddy_remove_route "$id" "$cf"
-  if caddy_add_route "$id" "$domain" "$path" "$port" "$cf"; then
+  if update_trojan_route "$id" "$cf" "$domain" "$path" "$port" caddy_file "$cf"; then
     ok "Caddy route rebuilt for $domain"
   else
     err "rebuild failed"
@@ -1760,27 +1809,46 @@ rebuild_trojan_route() {
 
 toggle_enabled() {
   local id="$1"
-  jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)'
-  rebuild_config && ok "enabled state toggled" || err "apply failed"
+  jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)' &&
+    ok "enabled state toggled" || { err 'apply failed'; return 1; }
   pause
 }
 
-del_node() {
-  local id="$1" n port type cf
+del_node() (
+  local id="$1" n port type cf='' backup='' committed=false
   confirm "Delete this node?" n || return
-  n=$(node_by_id "$id")
+  n=$(node_by_id "$id") || return 1
   port=$(jq -r '.port' <<<"$n")
   type=$(jq -r '.type' <<<"$n")
-  jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
+  delete_cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    if [[ -n "$backup" ]] && ! $committed; then
+      if ! cp -p "$backup" "$cf" || ! caddy_reload "$cf"; then
+        err "Caddy rollback failed; backup retained at $backup"; exit 1
+      fi
+    fi
+    [[ -z "$backup" ]] || rm -f "$backup"
+    exit "$status"
+  }
+  trap delete_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   if [[ "$type" == "trojan-ws" ]]; then
     cf=$(jq -r '.caddy_file' <<<"$n")
-    caddy_remove_route "$id" "$cf"; caddy_reload "$cf" || true
-  else
-    close_port "$port" tcp
+    if [[ -f "$cf" ]]; then
+      backup=$(mktemp) || return 1
+      cp -p "$cf" "$backup" || { rm -f "$backup"; backup=''; return 1; }
+      caddy_remove_route "$id" "$cf" && caddy_reload "$cf" || return 1
+    fi
   fi
-  rebuild_config && ok "deleted" || err "apply failed"
+  jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))' || { err 'delete failed'; return 1; }
+  committed=true
+  [[ "$type" == "trojan-ws" ]] || close_port "$port" tcp
+  ok 'deleted'
   pause
-}
+)
 
 # ----------------------------------------------------------------------------
 # BBR acceleration
@@ -1951,30 +2019,43 @@ optimize_system() {
 # Service / uninstall
 # ----------------------------------------------------------------------------
 restart_service() {
-  require_xray
-  rebuild_config
-  systemctl restart xray && ok "restarted" || err "restart failed"
-  systemctl --no-pager -l status xray 2>/dev/null | head -n 8 || true
+  require_singbox
+  rebuild_config || { err 'restart failed; transaction rolled back'; return 1; }
+  ok 'restarted'
+  systemctl --no-pager -l status onevps-sing-box 2>/dev/null | head -n 8 || true
   pause
 }
 
 uninstall() {
-  warn "Uninstall removes Xray binary, config, onevps nodes and logs"
-  warn "(BBR/system tuning configs and the swap file are kept)"
-  confirm "Confirm uninstall?" n || return
-  systemctl stop xray 2>/dev/null || true
-  systemctl disable xray 2>/dev/null || true
-  rm -f "$XRAY_SERVICE" /etc/systemd/system/xray@.service
-  rm -rf /etc/systemd/system/xray.service.d
-  systemctl daemon-reload
-  rm -f "$XRAY_BIN"
-  rm -rf "$XRAY_DIR" /usr/local/share/xray /var/log/xray
-  ok "uninstalled"
+  singbox_owned || { err 'refusing to remove unmanaged sing-box resources'; return 1; }
+  validate_node_metadata "$SINGBOX_NODES" || { err 'invalid metadata; inspect before uninstalling'; return 1; }
+  warn "Remove only $SINGBOX_BIN, $SINGBOX_SERVICE, $SINGBOX_CONF and $SINGBOX_NODES"
+  warn 'Realm, BBR/TCP tuning, Caddy and custom site content are kept'
+  confirm 'Confirm uninstall?' n || return
+  local n id cf backup
+  # Remove only our marked routes; failed Caddy reload aborts core removal.
+  while IFS= read -r n; do
+    id=$(jq -r '.id' <<<"$n"); cf=$(jq -r '.caddy_file' <<<"$n")
+    [[ -f "$cf" ]] || continue
+    backup=$(mktemp) || return 1
+    cp -p "$cf" "$backup" || { rm -f "$backup"; return 1; }
+    if ! caddy_remove_route "$id" "$cf" || ! caddy_reload "$cf"; then
+      cp -p "$backup" "$cf" && caddy_reload "$cf" || err "Caddy recovery failed; backup: $backup"
+      err 'Caddy cleanup failed; core retained'; return 1
+    fi
+    rm -f "$backup"
+  done < <(jq -c '.nodes[] | select(.type == "trojan-ws")' "$SINGBOX_NODES")
+  systemctl stop onevps-sing-box && systemctl disable onevps-sing-box || return 1
+  rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES" "$SINGBOX_DIR/.onevps-managed" || return 1
+  # Never recursively remove a directory that may contain user files.
+  rmdir "$SINGBOX_DIR" 2>/dev/null || warn "custom files retained in $SINGBOX_DIR"
+  systemctl daemon-reload || return 1
+  ok 'uninstalled'
   pause
 }
 
 # ----------------------------------------------------------------------------
-# Realm relay (independent of Xray)
+# Realm relay (independent of sing-box)
 # ----------------------------------------------------------------------------
 realm_valid_port() {
   [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 ))
@@ -2250,15 +2331,15 @@ realm_menu() {
 # Main menu
 # ----------------------------------------------------------------------------
 status_line() {
-  if [[ -x "$XRAY_BIN" ]]; then
+  if [[ -x "$SINGBOX_BIN" ]]; then
     local v st bbr_cc
     v=$(installed_version)
-    st=$(systemctl is-active xray 2>/dev/null || echo unknown)
+    st=$(systemctl is-active onevps-sing-box 2>/dev/null || echo unknown)
     bbr_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
-    printf '%sXray %s - service:%s - nodes:%s - TCP:%s%s\n' \
+    printf '%ssing-box %s - service:%s - nodes:%s - TCP:%s%s\n' \
       "$c_blu" "$v" "$st" "$(node_count 2>/dev/null || echo 0)" "$bbr_cc" "$c_rst"
   else
-    printf '%sXray not installed%s\n' "$c_ylw" "$c_rst"
+    printf '%ssing-box not installed%s\n' "$c_ylw" "$c_rst"
   fi
 }
 
@@ -2267,13 +2348,13 @@ main_menu() {
     clear
     cat <<'EOF'
  ╔════════════════════════════════════════════════╗
- ║   OneVPS - Xray Reality / Vision / uTLS       ║
+ ║   OneVPS - sing-box Reality / Vision / uTLS     ║
  ╚════════════════════════════════════════════════╝
 EOF
     status_line
     cat <<EOF
 
-  1) Install / update Xray-core
+  1) Install / update sing-box-core
   2) Add node - VLESS + Reality + Vision + uTLS
   3) Add node - Trojan + WS (behind Caddy)
   4) Manage nodes
@@ -2286,7 +2367,7 @@ EOF
   0) Exit
 EOF
     case "$(ask 'Select')" in
-      1) install_xray; pause ;;
+      1) install_singbox; pause ;;
       2) add_reality_node ;;
       3) add_trojan_node ;;
       4) manage_nodes ;;

@@ -108,25 +108,24 @@ trojan_node=$(jq -c '.nodes[] | select(.id == "b2c3d4e5")' "$FIXTURE")
 
 reality_inbound=$(build_reality_inbound "$reality_node")
 assert_jq "builds a public VLESS Reality inbound" "$reality_inbound" \
-  '.listen == "0.0.0.0" and .port == 443 and .protocol == "vless"'
+  '.listen == "0.0.0.0" and .listen_port == 443 and .type == "vless"'
 assert_jq "sets Reality target and secret fields" "$reality_inbound" \
-  '.streamSettings.security == "reality"
-   and .streamSettings.realitySettings.target == "www.example.com:443"
-   and .streamSettings.realitySettings.privateKey == "PRIVATE_KEY_FIXTURE"
-   and .streamSettings.realitySettings.shortIds == ["0123456789abcdef"]'
-assert_jq "enables Vision and route-only sniffing" "$reality_inbound" \
-  '.settings.clients[0].flow == "xtls-rprx-vision"
-   and .sniffing.enabled == true
-   and .sniffing.routeOnly == true'
+  '.tls.enabled and .tls.reality.enabled
+   and .tls.reality.handshake.server == "www.example.com"
+   and .tls.reality.handshake.server_port == 443
+   and .tls.reality.private_key == "PRIVATE_KEY_FIXTURE"
+   and .tls.reality.short_id == ["0123456789abcdef"]'
+assert_jq "enables Vision on native TCP" "$reality_inbound" \
+  '.users[0].flow == "xtls-rprx-vision" and (has("transport") | not)'
 
 trojan_inbound=$(build_trojan_inbound "$trojan_node")
 assert_jq "builds a loopback-only Trojan inbound" "$trojan_inbound" \
-  '.listen == "127.0.0.1" and .port == 20001 and .protocol == "trojan"'
+  '.listen == "127.0.0.1" and .listen_port == 20001 and .type == "trojan"'
 assert_jq "sets Trojan WebSocket transport without TLS" "$trojan_inbound" \
-  '.settings.clients[0].password == "test+pass@example"
-   and .streamSettings.network == "ws"
-   and .streamSettings.security == "none"
-   and .streamSettings.wsSettings.path == "/secret path"'
+  '.users[0].password == "test+pass@example"
+   and .transport.type == "ws"
+   and (.tls.enabled // false | not)
+   and .transport.path == "/secret-path"'
 
 # Consumed by pub_ip() in the sourced script.
 # shellcheck disable=SC2034
@@ -134,43 +133,51 @@ PUBIP="203.0.113.10"
 reality_link_output=$(node_link "$reality_node")
 assert_contains "builds a complete VLESS share link" "$reality_link_output" \
   "vless://123e4567-e89b-12d3-a456-426614174000@203.0.113.10:443?"
-assert_contains "encodes VLESS path and display name" "$reality_link_output" \
-  "spx=%2F&type=tcp#Reality%20Test%20%2F%20HK"
+assert_contains "encodes VLESS display name" "$reality_link_output" \
+  "type=tcp#Reality%20Test%20%2F%20HK"
+assert_false "share link omits unsupported spider path" \
+  bash -c '[[ "$1" == *spx=* ]]' _ "$reality_link_output"
 
-trojan_link_output=$(node_link "$trojan_node")
+# URI escaping is tested independently from the runtime path validator.
+trojan_link_output=$(node_link "$(jq -c '.ws_path = "/secret path"' <<<"$trojan_node")")
 assert_contains "encodes the Trojan password" "$trojan_link_output" \
   "trojan://test%2Bpass%40example@node.example.com:443?"
 assert_contains "encodes the Trojan WebSocket path" "$trojan_link_output" \
   "path=%2Fsecret%20path#Trojan%20Test"
 
-XRAY_DIR="$TEST_TMP/xray"
-XRAY_CONF="$XRAY_DIR/config.json"
-XRAY_NODES="$XRAY_DIR/onevps-nodes.json"
+SINGBOX_DIR="$TEST_TMP/singbox"
+SINGBOX_CONF="$SINGBOX_DIR/config.json"
+SINGBOX_NODES="$SINGBOX_DIR/onevps-nodes.json"
 # Consumed by validation and restart guards in the sourced script.
 # shellcheck disable=SC2034
-XRAY_BIN="$TEST_TMP/missing-xray"
-mkdir -p "$XRAY_DIR"
-cp "$FIXTURE" "$XRAY_NODES"
+SINGBOX_BIN="$TEST_TMP/initial-mock-singbox"
+mkdir -p "$SINGBOX_DIR"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SINGBOX_BIN"
+chmod +x "$SINGBOX_BIN"
+cp "$FIXTURE" "$SINGBOX_NODES"
+render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
 
 # File ownership is covered by runtime integration; unit tests remain unprivileged.
-secure_xray_files() { :; }
+secure_singbox_files() { :; }
+validate_singbox_config() { :; }
+systemctl() { :; }
 
 rebuild_config
-assert_file_jq "includes only enabled nodes" "$XRAY_CONF" \
+assert_file_jq "includes only enabled nodes" "$SINGBOX_CONF" \
   '.inbounds | length == 2'
-assert_file_jq "keeps private-network blocking" "$XRAY_CONF" \
-  'any(.routing.rules[]; .ip? and (.ip | index("10.0.0.0/8")))'
-assert_file_jq "keeps BitTorrent blocking" "$XRAY_CONF" \
-  'any(.routing.rules[]; .protocol? == ["bittorrent"])'
-assert_file_jq "does not block UDP/443 by default" "$XRAY_CONF" \
-  'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
+assert_file_jq "keeps private-network blocking" "$SINGBOX_CONF" \
+  'any(.route.rules[]; .action == "reject" and (.ip_cidr // [] | index("10.0.0.0/8")))'
+assert_file_jq "keeps BitTorrent blocking" "$SINGBOX_CONF" \
+  'any(.route.rules[]; .protocol? == ["bittorrent"])'
+assert_file_jq "does not block UDP/443 by default" "$SINGBOX_CONF" \
+  'all(.route.rules[]; (.network? == "udp" and .port? == "443") | not)'
 
 for legacy_udp443 in true false; do
-  jq --argjson legacy "$legacy_udp443" '.settings.block_udp443 = $legacy' "$FIXTURE" > "$XRAY_NODES"
+  jq --argjson legacy "$legacy_udp443" '.settings.block_udp443 = $legacy' "$FIXTURE" > "$SINGBOX_NODES"
   rebuild_config
-  assert_file_jq "ignores legacy UDP/443 setting $legacy_udp443" "$XRAY_CONF" \
-    'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
-  assert_file_jq "preserves legacy metadata $legacy_udp443" "$XRAY_NODES" \
+  assert_file_jq "ignores legacy UDP/443 setting $legacy_udp443" "$SINGBOX_CONF" \
+    'all(.route.rules[]; (.network? == "udp" and .port? == "443") | not)'
+  assert_file_jq "preserves legacy metadata $legacy_udp443" "$SINGBOX_NODES" \
     ".settings.block_udp443 == $legacy_udp443"
 done
 
@@ -283,47 +290,35 @@ printf 'invalid json\n' > "$candidate"
 assert_false "realm rejects malformed candidate" realm_apply "$candidate"
 assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
 
-# Legacy connection-user fields are preserved, but never validated or rendered.
-cp "$FIXTURE" "$XRAY_NODES"
+# Fresh installations use schema 1 and reject legacy credentials explicitly.
 node_candidate="$TEST_TMP/node-candidate.json"
-jq '.users = [{id:"old",outbound:{mode:"proxy",protocol:"invalid"}}] |
-    .nodes[0].clients = [{user_id:"old",uuid:.nodes[0].uuid}] |
-    .nodes[1].clients = [{user_id:"old",password:.nodes[1].password}] |
-    .extra = {retained:true} | .settings.block_udp443 = false' "$FIXTURE" > "$XRAY_NODES"
-assert_true "legacy fields do not require migration" validate_node_metadata "$XRAY_NODES"
-assert_true "legacy members do not affect rendering" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
-assert_file_jq "each enabled node keeps only its default client" "$TEST_TMP/rendered.json" \
-  'all(.inbounds[]; .settings.clients | length == 1) and .inbounds[0].settings.clients[0].id == "123e4567-e89b-12d3-a456-426614174000" and .inbounds[1].settings.clients[0].password == "test+pass@example"'
-assert_file_jq "legacy users emit no proxies or user routes" "$TEST_TMP/rendered.json" \
-  '(.outbounds|length) == 2 and all(.routing.rules[]; has("user")|not)'
-assert_eq "Reality transport unchanged" "$(jq -c '.streamSettings' <<<"$reality_inbound")" \
-  "$(jq -c '.inbounds[0].streamSettings' "$TEST_TMP/rendered.json")"
-for mutation in '.users = false' '.users = null' '.users = "obsolete"' '.nodes[0].clients = false' '.nodes[0].clients = null' '.nodes[1].clients = {invalid:true}'; do
-  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
-  assert_true "ignores obsolete metadata: $mutation" render_config "$node_candidate" "$TEST_TMP/rendered.json"
+jq '.extra = {retained:true} | .settings.block_udp443 = false' "$FIXTURE" > "$SINGBOX_NODES"
+assert_true "accepts schema 1 metadata" validate_node_metadata "$SINGBOX_NODES"
+assert_true "renders schema 1 default identities" render_config "$SINGBOX_NODES" "$TEST_TMP/rendered.json"
+assert_file_jq "each enabled node keeps only its default identity" "$TEST_TMP/rendered.json" \
+  'all(.inbounds[]; .users | length == 1) and .inbounds[0].users[0].uuid == "123e4567-e89b-12d3-a456-426614174000" and .inbounds[1].users[0].password == "test+pass@example"'
+assert_file_jq "defaults emit one direct outbound without user routes" "$TEST_TMP/rendered.json" \
+  '(.outbounds|length) == 1 and .outbounds[0].type == "direct" and all(.route.rules[]; has("auth_user")|not)'
+assert_eq "Reality TLS unchanged" "$(jq -c '.tls' <<<"$reality_inbound")" \
+  "$(jq -c '.inbounds[0].tls' "$TEST_TMP/rendered.json")"
+for mutation in 'del(.schema_version)' '.schema_version = 0' '.schema_version = 2' '.schema_version = "1"' \
+  '.users = []' '.users = false' '.users = null' '.users = "obsolete"' '.clients = []' \
+  '.nodes[0].spider_x = "/"' '.nodes[2].clients = []' '.nodes[0].clients = []' '.nodes[0].clients = false' '.nodes[0].clients = null' '.nodes[1].clients = {invalid:true}'; do
+  jq "$mutation" "$SINGBOX_NODES" > "$node_candidate"
+  assert_false "rejects old or incompatible metadata: $mutation" validate_node_metadata "$node_candidate"
+  assert_false "refuses to render incompatible metadata: $mutation" render_config "$node_candidate" "$TEST_TMP/rendered.json"
 done
 for mutation in '.nodes = null' '.nodes[0].id = ""' '.nodes[1].id = .nodes[0].id' '.nodes[0].uuid = null' '.nodes[1].password = ""'; do
-  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
+  jq "$mutation" "$SINGBOX_NODES" > "$node_candidate"
   assert_false "rejects invalid node metadata: $mutation" validate_node_metadata "$node_candidate"
 done
-# Default resets no longer consult legacy members and preserve their metadata.
-assert_true "default credential resets ignore old member collisions" bash -c '
-  source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
-  secure_xray_files() { :; }; rebuild_config() { :; }; pause() { :; }
-  apply_node_user_change() { jq . >/dev/null; }
-  ask_uuid() { jq -r ".nodes[0].clients[0].uuid" "$XRAY_NODES"; }
-  ask() { jq -r ".nodes[1].clients[0].password" "$XRAY_NODES"; }
-  before=$(jq -c "{users,clients:[.nodes[].clients]}" "$2")
-  reset_uuid a1b2c3d4 && reset_trojan_password b2c3d4e5 &&
-  [[ "$before" == "$(jq -c "{users,clients:[.nodes[].clients]}" "$2")" ]]
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
 # Mock executable and service operations; never access host services.
-XRAY_BIN="$TEST_TMP/mock-xray"
-printf '#!/usr/bin/env bash\nif [[ "$1" == uuid ]]; then h=$(openssl rand -hex 16); printf "%%s-%%s-%%s-%%s-%%s\\n" "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"; else exit 0; fi\n' > "$XRAY_BIN"
-chmod +x "$XRAY_BIN"
+SINGBOX_BIN="$TEST_TMP/mock-singbox"
+printf '#!/usr/bin/env bash\nif [[ "$1 $2" == "generate uuid" ]]; then h=$(openssl rand -hex 16); printf "%%s-%%s-%%s-%%s-%%s\\n" "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"; else exit 0; fi\n' > "$SINGBOX_BIN"
+chmod +x "$SINGBOX_BIN"
 MOCK_VALIDATE_FAIL=false
-validate_xray_config() { ! $MOCK_VALIDATE_FAIL; }
+validate_singbox_config() { ! $MOCK_VALIDATE_FAIL; }
 SERVICE_STATE="$TEST_TMP/service-state"
 printf 'active\n' > "$SERVICE_STATE"
 MOCK_SERVICE_MODE=ok
@@ -341,28 +336,28 @@ systemctl() {
     *) return 1 ;;
   esac
 }
-render_config "$XRAY_NODES" "$XRAY_CONF"
-chmod 640 "$XRAY_NODES"
-chmod 600 "$XRAY_CONF"
-cp -p "$XRAY_NODES" "$TEST_TMP/before-nodes"
-cp -p "$XRAY_CONF" "$TEST_TMP/before-config"
+render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+chmod 640 "$SINGBOX_NODES"
+chmod 600 "$SINGBOX_CONF"
+cp -p "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+cp -p "$SINGBOX_CONF" "$TEST_TMP/before-config"
 assert_true "transaction applies a node outbound" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 assert_true "transaction preserves original permission modes" bash -c '
   mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
   [[ $(mode "$1") == 640 && $(mode "$2") == 600 ]]
-' _ "$XRAY_NODES" "$XRAY_CONF"
-assert_file_jq "transaction preserves root unknown fields and settings" "$XRAY_NODES" '.extra.retained and (.settings.block_udp443 | not)'
-assert_file_jq "transaction preserves legacy metadata" "$XRAY_NODES" '.users[0].id == "old" and all(.nodes[0:2][]; .clients | length == 1) and .nodes[0].outbound.mode == "direct"'
-cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-cp "$XRAY_CONF" "$TEST_TMP/before-config"
+' _ "$SINGBOX_NODES" "$SINGBOX_CONF"
+assert_file_jq "transaction preserves root unknown fields and settings" "$SINGBOX_NODES" '.extra.retained and (.settings.block_udp443 | not)'
+assert_file_jq "transaction preserves fresh schema" "$SINGBOX_NODES" '.schema_version == 1 and (has("users")|not) and all(.nodes[]; has("clients")|not) and .nodes[0].outbound.mode == "direct"'
+cp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+cp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 MOCK_VALIDATE_FAIL=true
 assert_false "validation failure leaves live files untouched" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 MOCK_VALIDATE_FAIL=false
-assert_true "validation failure preserves metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "validation failure preserves metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
 MOCK_SERVICE_MODE=once
 assert_false "restart failure rolls back whole assignment" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
-assert_true "restart failure restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "restart failure restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "restart failure restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "restart failure restores runtime config" cmp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 assert_eq "rollback restores active service" active "$(cat "$SERVICE_STATE")"
 MOCK_SERVICE_MODE=inactive
 printf 'inactive\n' > "$SERVICE_STATE"
@@ -375,30 +370,30 @@ mv() {
 }
 assert_false "second file replacement failure rolls back both files" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 unset -f mv
-assert_true "replacement failure restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "replacement failure restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "replacement failure restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "replacement failure restores config" cmp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 mv() {
   command mv "$@" || return 1
   if [[ "$*" == *nodes.next* ]]; then bash -c 'kill -TERM "$PPID"'; fi
 }
 assert_false "ordinary interruption rolls back replaced metadata" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 unset -f mv
-assert_true "interruption restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "interruption restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
-assert_true "transaction cleanup removes secret staging directories" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
+assert_true "interruption restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "interruption restores runtime config" cmp "$SINGBOX_CONF" "$TEST_TMP/before-config"
+assert_true "transaction cleanup removes secret staging directories" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$SINGBOX_DIR"
 printf 'active\n' > "$SERVICE_STATE"
 MOCK_SERVICE_MODE=fail
 assert_false "rollback restart failure is not reported as success" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
-recovery=$(printf '%s\n' "$XRAY_DIR"/.transaction.*)
+recovery=$(printf '%s\n' "$SINGBOX_DIR"/.transaction.*)
 assert_true "failed rollback retains recovery files" test -f "$recovery/nodes.backup"
 rm -rf "$recovery"
 # Candidate snapshot owns rendered settings, never live metadata.
-jq '.nodes[0].uuid = "123e4567-e89b-12d3-a456-426614174099"' "$XRAY_NODES" > "$node_candidate"
+jq '.nodes[0].uuid = "123e4567-e89b-12d3-a456-426614174099"' "$SINGBOX_NODES" > "$node_candidate"
 assert_true "renders isolated candidate snapshot" render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "candidate default never mixes old disk credentials" "$TEST_TMP/rendered.json" '.inbounds[0].settings.clients[0].id == "123e4567-e89b-12d3-a456-426614174099"'
+assert_file_jq "candidate default never mixes old disk credentials" "$TEST_TMP/rendered.json" '.inbounds[0].users[0].uuid == "123e4567-e89b-12d3-a456-426614174099"'
 assert_false "malformed candidate renderer fails" render_config "$SERVICE_STATE" "$TEST_TMP/rendered.json"
-XRAY_BIN="$TEST_TMP/missing-xray"
-assert_false "node transaction requires Xray binary" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
+SINGBOX_BIN="$TEST_TMP/missing-singbox"
+assert_false "node transaction requires sing-box binary" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 
 # Outbound links: exercise the public stdin interface, never pass secrets to jq argv.
 parse_test_link() { printf '%s\n' "$1" | parse_outbound_link; }
@@ -407,21 +402,29 @@ for method in aes-128-gcm aes-256-gcm chacha20-ietf-poly1305; do
   encoded=$(printf '%s' "$method:secret+:%password" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
   parsed=$(parse_test_link "ss://$encoded@[2001:db8::1]:443/#remark")
   assert_jq "SIP002 $method preserves encoded credentials and IPv6" "$parsed" '.password == "secret+:%password" and .server == "2001:db8::1"'
-  assert_jq "SS builds upstream server" "$(build_proxy_outbound test <<<"$parsed")" '.protocol == "shadowsocks" and .settings.servers[0].port == 443'
+  outbound=$(build_proxy_outbound test <<<"$parsed")
+  assert_jq "SS builds upstream server and password" "$outbound" '.type == "shadowsocks" and .server_port == 443 and .server == "2001:db8::1" and .password == "secret+:%password"'
+  assert_eq "SS retains $method cipher" "$method" "$(jq -r '.method' <<<"$outbound")"
 done
 parsed=$(parse_test_link 'ss://aes-128-gcm:secret%40%3A%25+@proxy.example:443')
 assert_jq "plain SIP002 decodes once and preserves plus" "$parsed" '.password == "secret@:%+"'
 parsed=$(parse_test_link 'socks5://user%3Aname:p%40ss%3A%25+@[::1]:1080#test')
-assert_jq "SOCKS percent auth round trip" "$(build_proxy_outbound socks-test <<<"$parsed")" '.settings.servers[0].users == [{user:"user:name",pass:"p@ss:%+"}]'
-assert_jq "SOCKS anonymous has no users" "$(parse_test_link 'socks5://localhost:1080' | build_proxy_outbound test)" '.settings.servers[0] | has("users") | not'
+assert_jq "SOCKS percent auth round trip" "$(build_proxy_outbound socks-test <<<"$parsed")" '.type == "socks" and .version == "5" and .username == "user:name" and .password == "p@ss:%+"'
+assert_jq "SOCKS anonymous has no users" "$(parse_test_link 'socks5://localhost:1080' | build_proxy_outbound test)" 'has("username") | not'
 for network in tcp ws grpc; do
   extra=''
-  case "$network" in ws) extra='&host=cdn.example&path=%2Fws%3Fed%3D2048' ;; grpc) extra='&serviceName=service&mode=multi' ;; esac
+  case "$network" in ws) extra='&host=cdn.example&path=%2Fws%3Fed%3D2048' ;; grpc) extra='&serviceName=service&mode=gun' ;; esac
   parsed=$(parse_test_link "vless://$uuid@proxy.example:443?security=tls&type=$network&sni=proxy.example&fp=chrome&alpn=h2,http%2F1.1$extra")
-  assert_jq "VLESS TLS $network builds transport" "$(build_proxy_outbound test <<<"$parsed")" ".streamSettings.network == \"$network\" and .streamSettings.tlsSettings.allowInsecure == false"
+  outbound=$(build_proxy_outbound test <<<"$parsed")
+  assert_jq "VLESS TLS $network enables verified TLS" "$outbound" '.type == "vless" and .tls.enabled and (.tls.insecure // false | not) and .tls.server_name == "proxy.example" and .tls.alpn == ["h2","http/1.1"]'
+  case "$network" in
+    tcp) assert_jq "VLESS TCP omits transport" "$outbound" 'has("transport")|not' ;;
+    ws) assert_jq "VLESS WS preserves path and Host" "$outbound" '.transport.type == "ws" and .transport.path == "/ws?ed=2048" and .transport.headers.Host == "cdn.example"' ;;
+    grpc) assert_jq "VLESS gRPC preserves service name" "$outbound" '.transport.type == "grpc" and .transport.service_name == "service"' ;;
+  esac
 done
-parsed=$(parse_test_link "vless://$uuid@proxy.example:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef&spx=%2F&type=tcp")
-assert_jq "imports current Vision Reality link shape" "$(build_proxy_outbound test <<<"$parsed")" '.streamSettings.realitySettings.spiderX == "/" and .settings.vnext[0].users[0].flow == "xtls-rprx-vision"'
+parsed=$(parse_test_link "vless://$uuid@proxy.example:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef&type=tcp")
+assert_jq "imports current Vision Reality link shape" "$(build_proxy_outbound test <<<"$parsed")" '.tls.reality.enabled and .tls.reality.public_key == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" and .tls.reality.short_id == "0123456789abcdef" and .flow == "xtls-rprx-vision" and .uuid == "123e4567-e89b-12d3-a456-426614174000" and (has("transport")|not)'
 for bad in \
   'ss://aes-128-gcm:pw@example.com:443?plugin=obfs' \
   'ss://2022-blake3-aes-128-gcm:pw@example.com:443' \
@@ -443,6 +446,8 @@ for bad in \
   "vless://$uuid@example.com:443?security=tls&type=tcp&path=%2F" \
   "vless://$uuid@example.com:443?security=reality" \
   "vless://$uuid@example.com:443?security=tls&type=grpc&mode=unknown" \
+  "vless://$uuid@example.com:443?security=tls&type=grpc&mode=multi" \
+  "vless://$uuid@example.com:443?security=reality&sni=www.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef&spx=%2F" \
   "vless://$uuid@example.com:443?security=tls&pbk=unused" \
   "vless://$uuid@example.com:443?security=tls&"; do
   assert_false "rejects unsupported or malformed link" parse_test_link "$bad"
@@ -454,83 +459,83 @@ for invalid in 'null' '[]' '{"mode":"inherit"}' '{"mode":"direct","extra":1}' \
   '{"mode":"proxy","protocol":"socks","server":"example.com","port":1080,"username":"a\n","password":"b"}'; do
   assert_false "rejects invalid normalized outbound" validate_outbound <<<"$invalid"
 done
-cp "$FIXTURE" "$XRAY_NODES"
+cp "$FIXTURE" "$SINGBOX_NODES"
 node_proxy=$(parse_test_link 'socks5://node.example:1080')
 second_proxy=$(parse_test_link 'ss://aes-256-gcm:secret@second.example:443')
-assert_true "prepare node outbound does not alter live source" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" a1b2c3d4 <<<"$node_proxy"
-assert_file_jq "live node remains without outbound" "$XRAY_NODES" '.nodes[0] | has("outbound") | not'
-cp "$node_candidate" "$XRAY_NODES"
-assert_true "prepare independent second node proxy" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<"$second_proxy"
+assert_true "prepare node outbound does not alter live source" prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" a1b2c3d4 <<<"$node_proxy"
+assert_file_jq "live node remains without outbound" "$SINGBOX_NODES" '.nodes[0] | has("outbound") | not'
+cp "$node_candidate" "$SINGBOX_NODES"
+assert_true "prepare independent second node proxy" prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" b2c3d4e5 <<<"$second_proxy"
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "direct first and security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and all(.routing.rules[0:2][]; .outboundTag == "block") and (.routing.rules|length) == 4'
-assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 4 and .routing.rules[2].outboundTag == "node-out-a1b2c3d4" and .routing.rules[3].outboundTag == "node-out-b2c3d4e5" and .routing.rules[2].inboundTag != .routing.rules[3].inboundTag and all(.routing.rules[]; has("user")|not)'
-cp "$node_candidate" "$XRAY_NODES"
-assert_true "explicit node direct replaces only selected proxy" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<'{"mode":"direct"}'
+assert_file_jq "direct first and security blocks precede node routes" "$TEST_TMP/rendered.json" '.outbounds[0].tag == "direct" and .outbounds[0].type == "direct" and .route.rules[0].action == "sniff" and all(.route.rules[1:3][]; .action == "reject") and (.route.rules|length) == 5'
+assert_file_jq "two node proxies have isolated inbound routes" "$TEST_TMP/rendered.json" '(.outbounds|length) == 3 and .route.rules[3].outbound == "node-out-a1b2c3d4" and .route.rules[4].outbound == "node-out-b2c3d4e5" and .route.rules[3].inbound != .route.rules[4].inbound and all(.route.rules[]; has("auth_user")|not)'
+cp "$node_candidate" "$SINGBOX_NODES"
+assert_true "explicit node direct replaces only selected proxy" prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" b2c3d4e5 <<<'{"mode":"direct"}'
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.routing.rules[3].outboundTag == "direct" and .routing.rules[2].outboundTag == "node-out-a1b2c3d4" and (.outbounds|length) == 3'
-cp "$node_candidate" "$XRAY_NODES"
-prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" b2c3d4e5 <<<'"inherit"'
+assert_file_jq "node direct leaves other proxy intact" "$TEST_TMP/rendered.json" '.route.rules[4].outbound == "direct" and .route.rules[3].outbound == "node-out-a1b2c3d4" and (.outbounds|length) == 2'
+cp "$node_candidate" "$SINGBOX_NODES"
+prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" b2c3d4e5 <<<'"inherit"'
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
 assert_file_jq "reset removes saved node field" "$node_candidate" '.nodes[1]|has("outbound")|not'
-assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 3 and .routing.rules[2].outboundTag == "node-out-a1b2c3d4"'
+assert_file_jq "reset returns node to default direct" "$TEST_TMP/rendered.json" '(.route.rules|length) == 4 and .route.rules[3].outbound == "node-out-a1b2c3d4"'
 jq '.nodes[0].enabled=false' "$node_candidate" > "$TEST_TMP/disabled.json"
 render_config "$TEST_TMP/disabled.json" "$TEST_TMP/rendered.json"
-assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
+assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.route.rules|length) == 3 and (.outbounds|length) == 1'
 jq '.nodes[0].outbound=null' "$TEST_TMP/disabled.json" > "$TEST_TMP/invalid.json"
 assert_false "disabled node cannot hide corrupt outbound" render_config "$TEST_TMP/invalid.json" "$TEST_TMP/rendered.json"
-# No outbound settings produce exactly the legacy two outbounds / three blocks.
-render_config "$FIXTURE" "$TEST_TMP/legacy.json"
-assert_file_jq "legacy render has no extra routes or outbounds" "$TEST_TMP/legacy.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
+# No outbound settings produce one direct outbound and three security rules.
+render_config "$FIXTURE" "$TEST_TMP/default.json"
+assert_file_jq "fresh render has no extra routes or outbounds" "$TEST_TMP/default.json" '(.route.rules|length) == 3 and (.outbounds|length) == 1'
 # Shared transaction is exercised again with actual outbound candidates.
-XRAY_BIN="$TEST_TMP/mock-xray"
+SINGBOX_BIN="$TEST_TMP/mock-singbox"
 MOCK_SERVICE_MODE=ok
 MOCK_VALIDATE_FAIL=false
-render_config "$XRAY_NODES" "$XRAY_CONF"
+render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
 assert_true "outbound transaction commits proxy to both files" apply_outbound_assignment b2c3d4e5 <<<"$second_proxy"
-assert_file_jq "committed config contains node proxy" "$XRAY_CONF" 'any(.outbounds[]; .protocol == "shadowsocks")'
-cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-cp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_file_jq "committed config contains node proxy" "$SINGBOX_CONF" 'any(.outbounds[]; .type == "shadowsocks")'
+cp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+cp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 MOCK_VALIDATE_FAIL=true
 assert_false "outbound core validation failure leaves live data unchanged" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 MOCK_VALIDATE_FAIL=false
-assert_true "outbound failed validation preserves metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound failed validation preserves metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
 rm -f "$TEST_TMP/restart-failed"
 MOCK_SERVICE_MODE=once
 assert_false "outbound failed restart rolls back" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
-assert_true "outbound rollback restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "outbound rollback restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "outbound rollback restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound rollback restores config" cmp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 MOCK_SERVICE_MODE=ok
 mv() { if [[ "$*" == *config.next* ]]; then return 1; fi; command mv "$@"; }
 assert_false "outbound replacement failure rolls back" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 unset -f mv
-assert_true "outbound replacement restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "outbound staging directories cleaned" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
-assert_false "unknown target cannot silently succeed" prepare_outbound_assignment "$XRAY_NODES" "$node_candidate" missing <<<'{"mode":"direct"}'
+assert_true "outbound replacement restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound staging directories cleaned" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$SINGBOX_DIR"
+assert_false "unknown target cannot silently succeed" prepare_outbound_assignment "$SINGBOX_NODES" "$node_candidate" missing <<<'{"mode":"direct"}'
 # Proxy input stays visible; cancellation must not log credentials or write anything.
 assert_true "cancelled outbound menu uses visible input and preserves files" bash -c '
-  source "$1"; XRAY_NODES="$2"
+  source "$1"; SINGBOX_NODES="$2"
   read() { local arg; for arg in "$@"; do [[ "$arg" != -s ]] || return 1; done; builtin read "$@"; }
   ask() { if [[ "$1" == Scope ]]; then printf "1\n"; else printf "3\n"; fi; }; confirm() { return 1; }
   before=$(cksum "$2")
   output=$(manage_outbound a1b2c3d4 <<<"socks5://secret-user:secret-password@proxy.example:1080" 2>&1)
   [[ "$output" != *secret-user* && "$output" != *secret-password* && "$before" == "$(cksum "$2")" ]]
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
+' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES"
 
 # Both node menus expose local user management and outbound settings.
 for node_id in a1b2c3d4 b2c3d4e5; do
   printf '8\n1\n2\n0\n' > "$TEST_TMP/menu-input"
   assert_true "node menu $node_id keeps outbound 8 and local users 7" bash -c '
-    source "$1"; XRAY_NODES="$2"; selected="$3"; capture="$5"
+    source "$1"; SINGBOX_NODES="$2"; selected="$3"; capture="$5"
     exec 3< "$4"
     ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
-    require_xray() { :; }; ensure_nodes_file() { :; }; clear() { :; }; node_link() { :; }
+    require_singbox() { :; }; ensure_nodes_file() { :; }; clear() { :; }; node_link() { :; }
     pick_node() { printf "%s\n" "$selected"; }; confirm() { return 0; }
     apply_outbound_assignment() { printf "%s\n" "$*" > "$capture"; command cat >> "$capture"; }
     before=$(cksum "$2")
     output=$(manage_nodes)
     [[ "$output" == *"8) Set node outbound"* && "$output" != *"Connection users"* &&
        "$(command cat "$capture")" == "$selected all []"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
-  ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
+  ' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
 printf '11\n0\n' > "$TEST_TMP/menu-input"
 assert_true "main menu removes and ignores connection-user option 11" bash -c '
@@ -556,12 +561,12 @@ mv() {
 }
 assert_false "outbound signal after replacement rolls back" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
 unset -f mv
-assert_true "outbound signal restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "outbound signal restores config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "outbound signal restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "outbound signal restores config" cmp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 printf 'active\n' > "$SERVICE_STATE"
 MOCK_SERVICE_MODE=fail
 assert_false "outbound failed recovery preserves backups" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'
-recovery=$(printf '%s\n' "$XRAY_DIR"/.transaction.*)
+recovery=$(printf '%s\n' "$SINGBOX_DIR"/.transaction.*)
 assert_true "outbound failed rollback keeps recovery metadata" test -f "$recovery/nodes.backup"
 assert_true "outbound recovery is private" bash -c '
   mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
@@ -573,35 +578,41 @@ assert_false "multiple JSON objects cannot bypass normalized validator" validate
 # Capture jq/openssl argv around real parsing, rendering and assignment.
 # Only IDs, paths and filters may travel in external arguments.
 assert_true "outbound secrets never occur in external jq or openssl argv" bash -c '
-  source "$1"; XRAY_NODES="$2"; capture="$3"; output="$4"
+  source "$1"; SINGBOX_NODES="$2"; capture="$3"; output="$4"
   jq() { printf "%s\n" "$@" >> "$capture"; command jq "$@"; }
   openssl() { printf "%s\n" "$@" >> "$capture"; command openssl "$@"; }
   proxy=$(printf "%s\n" "socks5://SECRET_USERNAME:SECRET_PASSWORD@proxy.example:1080" | parse_outbound_link)
-  prepare_outbound_assignment "$XRAY_NODES" "$output" a1b2c3d4 <<<"$proxy"
+  prepare_outbound_assignment "$SINGBOX_NODES" "$output" a1b2c3d4 <<<"$proxy"
   render_config "$output" "$output.config"
   ! command grep -q "SECRET_USERNAME\|SECRET_PASSWORD" "$capture"
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$TEST_TMP/argv" "$TEST_TMP/secret-candidate"
+' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$TEST_TMP/argv" "$TEST_TMP/secret-candidate"
 # Validation logs are deliberately withheld even when the core prints a secret.
 assert_true "rebuild does not echo core validation secrets" bash -c '
-  source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
-  validate_xray_config() { printf "SECRET_CORE_OUTPUT\n" > "$2"; return 1; }
+  source "$1"; SINGBOX_NODES="$2"; SINGBOX_DIR=$(dirname "$2"); SINGBOX_BIN="$3"; SINGBOX_CONF="$4"
+  validate_singbox_config() { touch "$SINGBOX_DIR/validator-called"; printf "SECRET_CORE_OUTPUT\n" > "$2"; return 1; }
   output=$(rebuild_config 2>&1) && exit 1
-  [[ "$output" != *SECRET_CORE_OUTPUT* ]]
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
+  [[ -f "$SINGBOX_DIR/validator-called" && "$output" != *SECRET_CORE_OUTPUT* ]]
+' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$SINGBOX_BIN" "$SINGBOX_CONF"
 
 # Node-local identities, scoped routing, batch selection, and transactions.
-cp "$FIXTURE" "$XRAY_NODES"
-render_config "$XRAY_NODES" "$XRAY_CONF"
+cp "$FIXTURE" "$SINGBOX_NODES"
+render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
 user_a='{"id":"alice","name":"Alice","uuid":"123e4567-e89b-12d3-a456-426614174011"}'
 user_b='{"id":"bob","name":"Bob","uuid":"123e4567-e89b-12d3-a456-426614174012"}'
 assert_true "add Reality user transaction" apply_node_user_change a1b2c3d4 add <<<"$user_a"
 assert_true "add second Reality user transaction" apply_node_user_change a1b2c3d4 add <<<"$user_b"
 assert_true "same user ID and name are independent across nodes" apply_node_user_change b2c3d4e5 add <<<'{"id":"alice","name":"Alice","password":"user+secret"}'
-assert_file_jq "both protocols retain default and add clients" "$XRAY_CONF" '.inbounds[0].settings.clients|length == 3'
+assert_file_jq "both protocols retain default and add users" "$SINGBOX_CONF" '(.inbounds[0].users|length) == 3 and (.inbounds[1].users|length) == 2'
+assert_file_jq "runtime names retain stable node-scoped authentication identities" "$SINGBOX_CONF" \
+  '.inbounds[0].users[0].name == "reality-a1b2c3d4@onevps" and
+   .inbounds[1].users[0].name == "trojan-b2c3d4e5@onevps" and
+   .inbounds[0].users[1].name == ((["a1b2c3d4","alice"]|tojson|@base64) + "@onevps-user") and
+   .inbounds[0].users[1].name != .inbounds[1].users[1].name and
+   all(.inbounds[].users[]; (has("email")|not) and (has("id")|not))'
 assert_contains "Reality user link uses independent credential" "$(node_user_link "$(node_by_id a1b2c3d4)" alice)" 'vless://123e4567-e89b-12d3-a456-426614174011@'
 assert_contains "Trojan user link encodes independent password" "$(node_user_link "$(node_by_id b2c3d4e5)" alice)" 'trojan://user%2Bsecret@'
 for mutation in '.nodes[0].users=null' '.nodes[0].users[0].id="default"' '.nodes[0].users[0].id="bad id"' '.nodes[0].users[0].name=" "' '.nodes[0].users[1].id="alice"' '.nodes[0].users[1].name="Alice"' '.nodes[0].users[0].uuid=.nodes[0].uuid' '.nodes[0].users[0].uuid="bad"' '.nodes[1].users[0].password=.nodes[1].password' '.nodes[0].default_outbound=null' '.nodes[0].users[0].outbound=null'; do
-  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
+  jq "$mutation" "$SINGBOX_NODES" > "$node_candidate"
   assert_false "reject invalid local user metadata $mutation" validate_node_metadata "$node_candidate"
 done
 assert_false "duplicate user addition rejected" apply_node_user_change a1b2c3d4 add <<<"$user_a"
@@ -611,35 +622,35 @@ assert_false "default reset rejects local credential collision" apply_node_user_
 assert_false "Trojan reset rejects local credential collision" apply_node_user_change b2c3d4e5 reset <<<'"user+secret"'
 assert_true "set inherited node proxy for all identities" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
 assert_true "selected batch sets default and Alice only" apply_outbound_assignment a1b2c3d4 selected '["default","alice"]' <<<"$second_proxy"
-assert_file_jq "default override does not change node inheritance" "$XRAY_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
-assert_file_jq "security blocks precede scoped identity routes and fallback" "$XRAY_CONF" 'all(.routing.rules[0:2][]; .outboundTag == "block") and .routing.rules[2].user == [.inbounds[0].settings.clients[0].email] and .routing.rules[3].user == [.inbounds[0].settings.clients[1].email] and all(.routing.rules[2:4][]; .inboundTag == ["reality-a1b2c3d4"]) and (.routing.rules[4]|has("user")|not)'
+assert_file_jq "default override does not change node inheritance" "$SINGBOX_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
+assert_file_jq "security blocks precede scoped identity routes and fallback" "$SINGBOX_CONF" '.route.rules[0].action == "sniff" and all(.route.rules[1:3][]; .action == "reject") and .route.rules[3].auth_user == [.inbounds[0].users[0].name] and .route.rules[4].auth_user == [.inbounds[0].users[1].name] and all(.route.rules[3:5][]; .inbound == ["reality-a1b2c3d4"]) and (.route.rules[5]|has("auth_user")|not)'
 for selected in '[]' '["missing"]' '["alice","missing"]' '["alice","alice"]' 'null'; do
   assert_false "invalid selection is rejected as a batch $selected" apply_outbound_assignment a1b2c3d4 selected "$selected" <<<'{"mode":"direct"}'
 done
 assert_true "explicit direct overrides inherited proxy" apply_outbound_assignment a1b2c3d4 selected '["alice"]' <<<'{"mode":"direct"}'
 assert_true "restore selected inheritance" apply_outbound_assignment a1b2c3d4 selected '["alice"]' <<<'"inherit"'
-assert_file_jq "restore selected preserves default override" "$XRAY_NODES" '(.nodes[0].users[0]|has("outbound")|not) and .nodes[0].default_outbound.mode == "proxy"'
-other=$(jq -c '.nodes[1]' "$XRAY_NODES")
+assert_file_jq "restore selected preserves default override" "$SINGBOX_NODES" '(.nodes[0].users[0]|has("outbound")|not) and .nodes[0].default_outbound.mode == "proxy"'
+other=$(jq -c '.nodes[1]' "$SINGBOX_NODES")
 assert_true "all users clears every override" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
-assert_file_jq "all clears default and individual overrides" "$XRAY_NODES" '(.nodes[0]|has("default_outbound")|not) and all(.nodes[0].users[]; has("outbound")|not)'
-assert_eq "other node unchanged by all users" "$other" "$(jq -c '.nodes[1]' "$XRAY_NODES")"
+assert_file_jq "all clears default and individual overrides" "$SINGBOX_NODES" '(.nodes[0]|has("default_outbound")|not) and all(.nodes[0].users[]; has("outbound")|not)'
+assert_eq "other node unchanged by all users" "$other" "$(jq -c '.nodes[1]' "$SINGBOX_NODES")"
 assert_true "future user inherits node outbound" apply_node_user_change a1b2c3d4 add <<<'{"id":"future","name":"Future","uuid":"123e4567-e89b-12d3-a456-426614174013"}'
 assert_true "new user can receive dedicated outbound" apply_outbound_assignment a1b2c3d4 selected '["future"]' <<<"$second_proxy"
 assert_true "deleting user removes credential and proxy" apply_node_user_change a1b2c3d4 delete future
-assert_file_jq "deleted user leaves no runtime proxy or client" "$XRAY_CONF" '(.inbounds[0].settings.clients|length)==3 and (.outbounds|length)==3'
-jq '.nodes[0].enabled=false' "$XRAY_NODES" > "$node_candidate"
+assert_file_jq "deleted user leaves no runtime proxy or client" "$SINGBOX_CONF" '(.inbounds[0].users|length)==3 and (.outbounds|length)==2'
+jq '.nodes[0].enabled=false' "$SINGBOX_NODES" > "$node_candidate"
 render_config "$node_candidate" "$TEST_TMP/rendered.json"
-assert_file_jq "disabled node emits no local identities or outbounds" "$TEST_TMP/rendered.json" '(.inbounds|length)==1 and (.outbounds|length)==2'
-cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-cp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_file_jq "disabled node emits no local identities or outbounds" "$TEST_TMP/rendered.json" '(.inbounds|length)==1 and (.outbounds|length)==1'
+cp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+cp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 MOCK_VALIDATE_FAIL=true
 assert_false "user deletion validation failure is atomic" apply_node_user_change a1b2c3d4 delete alice
 MOCK_VALIDATE_FAIL=false
 rm -f "$TEST_TMP/restart-failed"
 MOCK_SERVICE_MODE=once
 assert_false "user deletion restart failure rolls back" apply_node_user_change a1b2c3d4 delete alice
-assert_true "user rollback restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before-nodes"
-assert_true "user rollback restores runtime" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
+assert_true "user rollback restores metadata" cmp "$SINGBOX_NODES" "$TEST_TMP/before-nodes"
+assert_true "user rollback restores runtime" cmp "$SINGBOX_CONF" "$TEST_TMP/before-config"
 MOCK_SERVICE_MODE=ok
 # Drive the actual menus with only service/core operations stubbed above.
 (
@@ -647,17 +658,234 @@ MOCK_SERVICE_MODE=ok
   confirm() { return 0; }; pause() { :; }
   for id in a1b2c3d4 b2c3d4e5; do
     manage_node_users "$id" <<<$'1\nMenu user\n0' >/dev/null
-    count=$(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|(.users|length)+1' "$XRAY_NODES")
+    count=$(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|(.users|length)+1' "$SINGBOX_NODES")
     manage_node_users "$id" <<<"$(printf '3\n%s\n0\n' "$count")" > "$TEST_TMP/menu-link"
     command grep -q 'Menu%20user' "$TEST_TMP/menu-link" || exit 1
     manage_outbound "$id" <<<$'2\n1 2\n2' >/dev/null
-    jq -e --arg id "$id" '.nodes[]|select(.id==$id)|.default_outbound.mode=="direct" and .users[0].outbound.mode=="direct"' "$XRAY_NODES" >/dev/null || exit 1
+    jq -e --arg id "$id" '.nodes[]|select(.id==$id)|.default_outbound.mode=="direct" and .users[0].outbound.mode=="direct"' "$SINGBOX_NODES" >/dev/null || exit 1
     manage_outbound "$id" <<<$'1\n1' >/dev/null
     manage_node_users "$id" <<<"$(printf '2\n%s\n0\n' "$count")" >/dev/null
   done
 ) || fail 'real node user and outbound menus'
 pass 'real menus add/link/select multiple/all/delete on both protocols'
-assert_file_jq "menu deletion preserves other users and removes all overrides" "$XRAY_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
+assert_file_jq "menu deletion preserves other users and removes all overrides" "$SINGBOX_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
+
+# Caddy changes and core transactions share rollback without touching host services.
+assert_true "Trojan route edits and deletion restore Caddy and core state on failure" bash -c '
+  source "$1"
+  root="$2/caddy-transaction"; mkdir -p "$root"
+  export TMPDIR="$root"
+  SINGBOX_DIR="$root"; SINGBOX_BIN="$root/core"
+  SINGBOX_NODES="$root/nodes.json"; SINGBOX_CONF="$root/config.json"
+  caddy_file="$root/Caddyfile"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  jq --arg cf "$caddy_file" ".nodes[1].caddy_file = \$cf" "$3" > "$SINGBOX_NODES"
+  render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  printf "original Caddy content\n" > "$caddy_file"
+  cp "$caddy_file" "$root/caddy.before"
+  cp "$SINGBOX_NODES" "$root/nodes.before"; cp "$SINGBOX_CONF" "$root/config.before"
+  core_fail=false; recovery_fail=false
+  pause() { :; }; confirm() { return 0; }; secure_singbox_files() { :; }
+  close_port() { return 99; }
+  systemctl() {
+    case "$1" in
+      is-active) return 0 ;;
+      restart)
+        if $core_fail && [[ ! -f "$root/core-failed" ]]; then touch "$root/core-failed"; return 1; fi
+        return 0 ;;
+      *) return 99 ;;
+    esac
+  }
+  caddy_remove_route() { printf "other site\n" > "$2"; }
+  caddy_reload() {
+    printf "reload\n" >> "$root/reloads"
+    if $recovery_fail && cmp -s "$1" "$root/caddy.before"; then return 1; fi
+    return 0
+  }
+  caddy_add_route() { printf "%s %s %s\n" "$2" "$3" "$4" >> "$5"; caddy_reload "$5"; }
+  mktemp() {
+    local generated
+    if (($# == 0)); then
+      generated=$(command mktemp "$root/caddy-backup.XXXXXXXX") || return 1
+      printf "%s\n" "$generated" > "$root/last-backup"
+    else
+      generated=$(command mktemp "$@") || return 1
+    fi
+    printf "%s\n" "$generated"
+  }
+  for operation in path delete; do
+    core_fail=true; rm -f "$root/core-failed"; : > "$root/reloads"
+    if [[ "$operation" == path ]]; then
+      if update_trojan_route b2c3d4e5 "$caddy_file" node.example.com /updated 20001 ws_path /updated; then exit 1; fi
+    else
+      if del_node b2c3d4e5; then exit 1; fi
+    fi
+    cmp "$caddy_file" "$root/caddy.before" && cmp "$SINGBOX_NODES" "$root/nodes.before" && cmp "$SINGBOX_CONF" "$root/config.before" || exit 1
+    [[ $(wc -l < "$root/reloads") -eq 2 && ! -e $(<"$root/last-backup") ]] || exit 1
+  done
+  core_fail=false
+  update_trojan_route b2c3d4e5 "$caddy_file" node.example.com /updated 20001 ws_path /updated || exit 1
+  jq -e ".nodes[1].ws_path == \"/updated\"" "$SINGBOX_NODES" >/dev/null || exit 1
+  jq -e ".inbounds[1].transport.path == \"/updated\"" "$SINGBOX_CONF" >/dev/null || exit 1
+  update_trojan_route b2c3d4e5 "$caddy_file" changed.example.com /updated 20001 domain changed.example.com || exit 1
+  jq -e ".nodes[1].domain == \"changed.example.com\"" "$SINGBOX_NODES" >/dev/null || exit 1
+  grep -q "changed.example.com /updated 20001" "$caddy_file" || exit 1
+  cp "$caddy_file" "$root/caddy.before"
+  cp "$SINGBOX_NODES" "$root/nodes.before"; cp "$SINGBOX_CONF" "$root/config.before"
+  for operation in path delete; do
+    core_fail=true; recovery_fail=true; rm -f "$root/core-failed"
+    if [[ "$operation" == path ]]; then
+      if update_trojan_route b2c3d4e5 "$caddy_file" changed.example.com /failure 20001 ws_path /failure; then exit 1; fi
+    else
+      if del_node b2c3d4e5; then exit 1; fi
+    fi
+    retained=$(<"$root/last-backup")
+    [[ -f "$retained" ]] && cmp "$retained" "$root/caddy.before" || exit 1
+    cmp "$SINGBOX_NODES" "$root/nodes.before" && cmp "$SINGBOX_CONF" "$root/config.before" || exit 1
+    rm "$retained"
+  done
+  core_fail=false; recovery_fail=false
+  del_node b2c3d4e5 || exit 1
+  jq -e "all(.nodes[]; .id != \"b2c3d4e5\")" "$SINGBOX_NODES" >/dev/null || exit 1
+  jq -e "all(.inbounds[]; .type != \"trojan\")" "$SINGBOX_CONF" >/dev/null || exit 1
+  [[ $(<"$caddy_file") == "other site" && ! -e $(<"$root/last-backup") ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "Trojan route rebuild saves a rediscovered Caddyfile path" bash -c '
+  source "$1"
+  root="$2/caddy-rediscovery"; mkdir -p "$root"
+  SINGBOX_DIR="$root"; SINGBOX_BIN="$root/core"
+  SINGBOX_NODES="$root/nodes.json"; SINGBOX_CONF="$root/config.json"
+  discovered="$root/Caddyfile"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  printf "other site\n" > "$discovered"
+  jq --arg cf "$root/missing" ".nodes[1].caddy_file = \$cf" "$3" > "$SINGBOX_NODES"
+  render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  pause() { :; }; secure_singbox_files() { :; }; systemctl() { return 0; }
+  find_caddyfile() { printf "%s\n" "$discovered"; }
+  caddy_remove_route() { printf "other site\n" > "$2"; }
+  caddy_reload() { return 0; }
+  caddy_add_route() { printf "%s %s %s\n" "$2" "$3" "$4" >> "$5"; caddy_reload "$5"; }
+  rebuild_trojan_route b2c3d4e5
+  jq -e --arg cf "$discovered" ".nodes[1].caddy_file == \$cf" "$SINGBOX_NODES" >/dev/null
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+# Core validation must invoke the real check interface, even on a fresh install.
+assert_true "real validator rejects missing core and propagates check failures" bash -c '
+  source "$1"
+  SINGBOX_BIN="$2/core"; SINGBOX_CONF="$2/config.json"
+  printf "{}\n" > "$SINGBOX_CONF"
+  if validate_singbox_config "$SINGBOX_CONF" "$2/check.log"; then exit 1; fi
+  printf "#!/usr/bin/env bash\n[[ \$1 == check && \$2 == -c && -f \$3 ]] || exit 99\nprintf SECRET_CORE_OUTPUT\\\\n\nexit 7\n" > "$SINGBOX_BIN"
+  chmod +x "$SINGBOX_BIN"
+  if validate_singbox_config "$SINGBOX_CONF" "$2/check.log"; then exit 1; fi
+  grep -q SECRET_CORE_OUTPUT "$2/check.log"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP"
+
+# Every install path and runtime effect is isolated; no host services are touched.
+assert_true "fresh installation refuses conflicts and verifies ownership" bash -c '
+  source "$1"
+  root="$2/install-ownership"; mkdir -p "$root"
+  SINGBOX_DIR="$root/config"; SINGBOX_BIN="$root/core"
+  SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_NODES="$SINGBOX_DIR/nodes.json"
+  SINGBOX_SERVICE="$root/core.service"
+  conflict=""; show_failed=false
+  systemctl() {
+    [[ "$1" == show ]] || return 99
+    $show_failed && return 1
+    if [[ "$*" == *"$conflict" && -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; fi
+  }
+  check_singbox_conflicts || exit 1
+  for conflict in xray.service xray@.service sing-box.service singbox.service onevps-sing-box.service; do
+    if check_singbox_conflicts; then exit 1; fi
+  done
+  conflict=""; show_failed=true
+  if check_singbox_conflicts; then exit 1; fi
+  show_failed=false
+  for path in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_SERVICE"; do
+    printf "unmanaged\n" > "$path"
+    if check_singbox_conflicts; then exit 1; fi
+    [[ $(<"$path") == unmanaged ]] || exit 1
+    rm "$path"
+  done
+  mkdir "$SINGBOX_DIR"
+  cp "$3" "$SINGBOX_NODES"; printf "{}\n" > "$SINGBOX_CONF"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  printf "OneVPS sing-box schema 1\n" > "$SINGBOX_DIR/.onevps-managed"
+  if singbox_owned; then exit 1; fi
+  write_service > "$SINGBOX_SERVICE"
+  singbox_owned && check_singbox_conflicts || exit 1
+  grep -q "User=nobody" "$SINGBOX_SERVICE" || exit 1
+  grep -Fq "run -c $SINGBOX_CONF" "$SINGBOX_SERVICE" || exit 1
+  for path in "$SINGBOX_BIN" "$SINGBOX_CONF" "$SINGBOX_NODES" "$SINGBOX_SERVICE" "$SINGBOX_DIR/.onevps-managed"; do
+    mv "$path" "$path.original"; ln -s "$path.original" "$path"
+    if singbox_owned; then exit 1; fi
+    rm "$path"; mv "$path.original" "$path"
+  done
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "installation is atomic across download validation enable and restart failures" bash -c '
+  source "$1"
+  root="$2/install-transaction"; mkdir -p "$root"
+  SINGBOX_DIR="$root/config"; SINGBOX_BIN="$root/core"
+  SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_NODES="$SINGBOX_DIR/nodes.json"
+  SINGBOX_SERVICE="$root/core.service"
+  state="$root/state"; enabled_file="$root/enabled"; calls="$root/calls"
+  printf "inactive\n" > "$state"; printf "false\n" > "$enabled_file"
+  failure=none
+  ensure_deps() { :; }; secure_singbox_files() { :; }
+  installed_version() { printf "test-version\n"; }
+  systemctl() {
+    printf "%s\n" "$*" >> "$calls"
+    case "$1" in
+      show) printf "not-found\n" ;;
+      is-active) [[ $(<"$state") == active ]] ;;
+      is-enabled) [[ $(<"$enabled_file") == true ]] ;;
+      daemon-reload) return 0 ;;
+      enable) [[ "$failure" != enable ]] || return 1; printf "true\n" > "$enabled_file" ;;
+      disable) printf "false\n" > "$enabled_file" ;;
+      stop) printf "inactive\n" > "$state" ;;
+      restart)
+        if [[ "$failure" == restart && ! -e "$root/failed-once" ]]; then touch "$root/failed-once"; return 1; fi
+        printf "active\n" > "$state" ;;
+      *) return 99 ;;
+    esac
+  }
+  download_singbox() {
+    [[ "$failure" != download ]] || return 1
+    if [[ "$failure" == validate ]]; then
+      printf "#!/bin/sh\nexit 1\n" > "$1/sing-box"
+    else
+      printf "#!/bin/sh\nexit 0\n" > "$1/sing-box"
+    fi
+    chmod +x "$1/sing-box"
+  }
+  for failure in download validate enable restart; do
+    rm -f "$root/failed-once"
+    if install_singbox; then exit 1; fi
+    [[ ! -e "$SINGBOX_DIR" && ! -e "$SINGBOX_BIN" && ! -e "$SINGBOX_SERVICE" ]] || exit 1
+    [[ $(<"$state") == inactive && $(<"$enabled_file") == false ]] || exit 1
+  done
+  failure=none
+  install_singbox && singbox_owned || exit 1
+  jq -e ".schema_version == 1 and .nodes == []" "$SINGBOX_NODES" >/dev/null || exit 1
+  jq -e "(.outbounds|length)==1 and .outbounds[0].type==\"direct\" and .route.rules[0].action==\"sniff\"" "$SINGBOX_CONF" >/dev/null || exit 1
+  [[ $(<"$state") == active && $(<"$enabled_file") == true ]] || exit 1
+  cp "$3" "$SINGBOX_NODES"
+  render_config "$SINGBOX_NODES" "$SINGBOX_CONF" || exit 1
+  printf "#!/bin/sh\n# original core\nexit 0\n" > "$SINGBOX_BIN"
+  for path in "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES"; do cp -p "$path" "$path.before"; done
+  for failure in download validate restart; do
+    rm -f "$root/failed-once"
+    if install_singbox; then exit 1; fi
+    for path in "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_CONF" "$SINGBOX_NODES"; do cmp "$path" "$path.before" || exit 1; done
+    [[ $(<"$state") == active && $(<"$enabled_file") == true ]] || exit 1
+  done
+  printf "inactive\n" > "$state"; printf "false\n" > "$enabled_file"
+  failure=restart; rm -f "$root/failed-once"
+  if install_singbox; then exit 1; fi
+  [[ $(<"$state") == inactive && $(<"$enabled_file") == false ]] || exit 1
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
 
 # Isolate all host tuning operations and paths, including child shells.
 (

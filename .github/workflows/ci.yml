@@ -31,31 +31,32 @@ jobs:
           ref: ${{ inputs.ref || '' }}
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh
+        run: bash -n onevps.sh tests/test_onevps.sh tests/test_singbox.sh
 
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
+          sudo apt-get install --no-install-recommends --yes jq openssl shellcheck python3
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh
+        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_singbox.sh
 
       - name: Test configuration generation
         run: bash tests/test_onevps.sh
 
-      - name: Validate outbounds with Xray 26.3.27
+      - name: Validate configuration and forwarding with sing-box 1.14.3
         run: |
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           curl --fail --location --retry 3 \
-            https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip \
-            -o "$work/xray.zip"
+            https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz \
+            -o "$work/sing-box.tar.gz"
           printf '%s  %s\n' \
-            23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae \
-            "$work/xray.zip" | sha256sum --check -
-          unzip -q "$work/xray.zip" -d "$work/core"
-          XRAY_TEST_BIN="$work/core/xray" bash tests/test_xray_outbounds.sh
+            e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee \
+            "$work/sing-box.tar.gz" | sha256sum --check -
+          mkdir "$work/core"
+          tar -xzf "$work/sing-box.tar.gz" -C "$work/core"
+          SINGBOX_TEST_BIN="$work/core/sing-box-1.14.3-linux-amd64/sing-box" bash tests/test_singbox.sh
 
       - name: Lint Markdown
         run: npx --yes markdownlint-cli2@0.23.2 "**/*.md"

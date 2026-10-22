@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "nodes": [
     {
       "id": "a1b2c3d4",
@@ -15,7 +16,6 @@
       "reality_private_key": "PRIVATE_KEY_FIXTURE",
       "reality_public_key": "PUBLIC_KEY_FIXTURE",
       "reality_short_id": "0123456789abcdef",
-      "spider_x": "/",
       "enabled": true
     },
     {
@@ -26,7 +26,7 @@
       "port": 20001,
       "password": "test+pass@example",
       "domain": "node.example.com",
-      "ws_path": "/secret path",
+      "ws_path": "/secret-path",
       "caddy_file": "/etc/caddy/Caddyfile",
       "enabled": true
     },
@@ -45,7 +45,6 @@
       "reality_private_key": "DISABLED_PRIVATE_KEY",
       "reality_public_key": "DISABLED_PUBLIC_KEY",
       "reality_short_id": "fedcba9876543210",
-      "spider_x": "/",
       "enabled": false
     }
   ]
