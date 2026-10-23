@@ -290,10 +290,15 @@ check_singbox_conflicts() {
   for p in /usr/local/etc/xray /etc/xray /etc/sing-box /usr/local/etc/sing-box /etc/singbox /usr/local/etc/singbox; do
     if [[ -e "$p" || -L "$p" ]]; then err "conflicting configuration: $p"; return 1; fi
   done
-  for unit in xray.service xray@.service sing-box.service singbox.service; do
+  for unit in xray.service sing-box.service singbox.service; do
     loaded=$(systemctl show -p LoadState --value "$unit") || return 1
     if [[ "$loaded" != not-found ]]; then err "conflicting service: $unit"; return 1; fi
   done
+  # Templates cannot be queried with show; also reject instances still in memory.
+  loaded=$(systemctl list-unit-files --no-legend --no-pager 'xray@*.service') || return 1
+  [[ -z "$loaded" ]] || { err 'conflicting service: xray@*.service (unit files)'; return 1; }
+  loaded=$(systemctl list-units --all --plain --no-legend --no-pager 'xray@*.service') || return 1
+  [[ -z "$loaded" ]] || { err 'conflicting service: xray@*.service (loaded instances)'; return 1; }
   if singbox_owned; then
     [[ -x "$SINGBOX_BIN" && -f "$SINGBOX_CONF" && -f "$SINGBOX_NODES" ]] || return 1
     validate_node_metadata "$SINGBOX_NODES" || return 1

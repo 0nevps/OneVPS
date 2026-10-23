@@ -1074,19 +1074,41 @@ assert_true "fresh installation refuses conflicts and verifies ownership" bash -
   SINGBOX_DIR="$root/config"; SINGBOX_BIN="$root/core"
   SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_NODES="$SINGBOX_DIR/nodes.json"
   SINGBOX_SERVICE="$root/core.service"
-  conflict=""; show_failed=false
+  conflict=""; failed_query=""; template_state=disabled; instance_state=running
   systemctl() {
-    [[ "$1" == show ]] || return 99
-    $show_failed && return 1
-    if [[ "$*" == *"$conflict" && -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; fi
+    [[ "$1" != "$failed_query" ]] || return 1
+    case "$1" in
+      show)
+        if [[ "${@: -1}" == xray@.service ]]; then
+          printf "template is not a valid unit for show\n" >&2; return 1
+        fi
+        if [[ "$*" == *"$conflict" && -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; fi ;;
+      list-unit-files)
+        [[ "$*" == "list-unit-files --no-legend --no-pager xray@*.service" ]] || return 99
+        if [[ "$conflict" == xray@.service || "$conflict" == xray@file.service ]]; then printf "%s %s -\n" "$conflict" "$template_state"; fi ;;
+      list-units)
+        [[ "$*" == "list-units --all --plain --no-legend --no-pager xray@*.service" ]] || return 99
+        if [[ "$conflict" == xray@test.service ]]; then printf "xray@test.service loaded %s Xray\n" "$instance_state"; fi ;;
+      *) return 99 ;;
+    esac
   }
   check_singbox_conflicts || exit 1
-  for conflict in xray.service xray@.service sing-box.service singbox.service onevps-sing-box.service; do
+  for conflict in xray.service xray@.service xray@file.service xray@test.service sing-box.service singbox.service onevps-sing-box.service; do
     if check_singbox_conflicts; then exit 1; fi
   done
-  conflict=""; show_failed=true
-  if check_singbox_conflicts; then exit 1; fi
-  show_failed=false
+  conflict=xray@.service
+  for template_state in enabled disabled masked; do
+    if check_singbox_conflicts; then exit 1; fi
+  done
+  conflict=xray@test.service
+  for instance_state in "active running" "inactive dead" "failed failed"; do
+    if check_singbox_conflicts; then exit 1; fi
+  done
+  conflict=""
+  for failed_query in show list-unit-files list-units; do
+    if check_singbox_conflicts; then exit 1; fi
+  done
+  failed_query=""
   for path in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_SERVICE"; do
     printf "unmanaged\n" > "$path"
     if check_singbox_conflicts; then exit 1; fi
@@ -1130,6 +1152,7 @@ assert_true "installation is atomic across download validation enable and restar
     printf "%s\n" "$*" >> "$calls"
     case "$1" in
       show) printf "not-found\n" ;;
+      list-unit-files|list-units) return 0 ;;
       is-active) [[ $(<"$state") == active ]] ;;
       is-enabled) [[ $(<"$enabled_file") == true ]] ;;
       daemon-reload) return 0 ;;
