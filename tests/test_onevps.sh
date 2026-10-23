@@ -345,6 +345,71 @@ assert_true "HY2 preflight rejects HTTP listener owned by another process" bash 
   ! hysteria2_preflight "$3"
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$TEST_TMP/hy2.json"
 
+assert_true "shared transactions report stages on stderr and identify failures before rollback" bash -c '
+  source "$1"
+  SINGBOX_DIR="$2/progress"; mkdir "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"
+  SINGBOX_BIN="$SINGBOX_DIR/core"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  systemctl() { :; }; hysteria2_preflight() { :; }; open_port() { :; }
+  mock_singbox_readiness
+  verify_hysteria2_nodes() { [[ "$mode" != probe-fail ]]; }
+  jq '\''.nodes += [{id:"progress-snell",tag:"snell-progress-snell",type:"snell",name:"Snell",port:20001,enabled:true,version:5,psk:"0123456789abcdef0123456789abcdef"}]'\'' "$3" > "$2/progress-fixture.json" || exit 1
+  for type in vless-reality snell hysteria2 mixed; do
+    if [[ "$type" == mixed ]]; then cp "$2/progress-fixture.json" "$SINGBOX_NODES"
+    else jq --arg type "$type" ".nodes |= map(select(.type == \$type))" "$2/progress-fixture.json" > "$SINGBOX_NODES"; fi
+    render_config "$SINGBOX_NODES" "$SINGBOX_CONF" || exit 1
+    mode=ok
+    jq_update_nodes "." > "$2/progress.out" 2> "$2/progress.err" || exit 1
+    [[ ! -s "$2/progress.out" ]] || exit 1
+    for text in "Starting node" "generate configuration" "validate sing-box" "open firewall" "restart sing-box" "verify all enabled" "update completed"; do
+      grep -q "$text" "$2/progress.err" || exit 1
+    done
+  done
+  cp "$SINGBOX_NODES" "$2/progress.before"
+  mode=probe-fail
+  if jq_update_nodes ".nodes[0].name = \"Changed\"" > "$2/progress.out" 2> "$2/progress.err"; then exit 1; fi
+  cmp "$SINGBOX_NODES" "$2/progress.before" || exit 1
+  grep -q "failed during: verify all enabled" "$2/progress.err" &&
+    grep -q "Rolling back configuration" "$2/progress.err" &&
+    ! grep -q "update completed" "$2/progress.err"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"
+
+assert_true "listener waits report elapsed time without stdout output" bash -c '
+  source "$1"
+  systemctl() { if [[ "$1" == show ]]; then printf "42\n"; fi; }
+  ss() { :; }
+  sleep() { SECONDS=$((SECONDS + 5)); }
+  if wait_singbox_ready "$3" > "$2/listener.out" 2> "$2/listener.err"; then exit 1; fi
+  [[ ! -s "$2/listener.out" ]] &&
+    grep -q "Still waiting for service listeners (5s elapsed" "$2/listener.err" &&
+    grep -q "journalctl -fu" "$2/listener.err" &&
+    grep -q "ACME certificate issuance" "$2/listener.err"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$TEST_TMP/hy2.json"
+
+assert_true "HY2 probes report retries and success without credentials" bash -c '
+  source "$1"
+  SINGBOX_BIN="$2/progress-probe-core"
+  printf "#!/bin/sh\nexec sleep 60\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  mkdir "$2/progress-probe"
+  rand_port() { printf "23456\n"; }
+  sleep() { SECONDS=$((SECONDS + 5)); }
+  attempts=0
+  curl() { attempts=$((attempts + 1)); (( attempts >= 3 )); }
+  jq ".nodes |= map(select(.type == \"hysteria2\"))" "$3" > "$2/progress-hy2.json"
+  verify_hysteria2_nodes "$2/progress-hy2.json" "$2/progress-probe" > "$2/probe.out" 2> "$2/probe.err" || exit 1
+  [[ ! -s "$2/probe.out" ]] &&
+    grep -q "Still verifying Hysteria 2 node" "$2/probe.err" &&
+    grep -q "verified (" "$2/probe.err" || exit 1
+  password=$(jq -r ".nodes[0].password" "$2/progress-hy2.json")
+  ! grep -qF "$password" "$2/probe.err" || exit 1
+  curl() { return 1; }
+  if verify_hysteria2_nodes "$2/progress-hy2.json" "$2/progress-probe" > "$2/probe-fail.log" 2>&1; then exit 1; fi
+  grep -q "Still verifying Hysteria 2 node" "$2/probe-fail.log" &&
+    grep -q "probe timed out" "$2/probe-fail.log" &&
+    ! grep -q "verified (" "$2/probe-fail.log"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$TEST_TMP/hy2.json"
+
 # Consumed by pub_ip() in the sourced script.
 # shellcheck disable=SC2034
 PUBIP="203.0.113.10"

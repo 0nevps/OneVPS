@@ -511,10 +511,20 @@ validate_singbox_config() {
 # and every configured listener to belong to it across multiple samples.
 wait_singbox_ready() {
   local source="$1" pid previous='' stable=0 attempt rows port proto flags listeners line found owned rounds=10
+  local started=$SECONDS next_notice=$((SECONDS + 5))
   if jq -e 'any(.nodes[]; .enabled and .type == "hysteria2")' "$source" >/dev/null; then rounds=90; fi
+  info 'Waiting for sing-box process and all enabled node listeners to become ready...' >&2
+  if (( rounds == 90 )); then
+    info 'Enabled Hysteria 2 nodes may need time for ACME certificate issuance; checking up to 90 rounds.' >&2
+  fi
+  info 'Service logs (in another terminal): journalctl -fu onevps-sing-box' >&2
   command -v ss >/dev/null 2>&1 || { err 'ss is required for service readiness'; return 1; }
   rows=$(jq -r '.nodes[] | select(.enabled) | "\(.port) \(if .type == "hysteria2" then "udp" else "tcp" end)"' "$source") || return 1
   for ((attempt=0; attempt<rounds; attempt++)); do
+    if (( SECONDS >= next_notice )); then
+      info "Still waiting for service listeners ($((SECONDS - started))s elapsed, check $((attempt + 1))/$rounds)..." >&2
+      next_notice=$((SECONDS + 5))
+    fi
     systemctl is-active --quiet onevps-sing-box || return 1
     pid=$(systemctl show -p MainPID --value onevps-sing-box) || return 1
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -530,7 +540,10 @@ wait_singbox_ready() {
       $owned || found=false
     done <<<"$rows"
     if $found && [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=0; fi
-    (( stable >= 2 )) && return 0
+    if (( stable >= 2 )); then
+      info "Service listeners ready ($((SECONDS - started))s elapsed)." >&2
+      return 0
+    fi
     previous="$pid"
     sleep 1
   done
@@ -931,9 +944,12 @@ check_hysteria2_dns() {
 # The HTTPS probe also needs the selected default user's outbound to work.
 verify_hysteria2_nodes() (
   local source="$1" work="$2" n port pid='' deadline result=0
+  local started next_notice tag
   trap 'if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi' EXIT
   while IFS= read -r n; do
     [[ -n "$n" ]] || continue
+    tag=$(jq -r '.tag' <<<"$n") || return 1
+    info "Verifying enabled Hysteria 2 node $tag: trusted TLS, QUIC, authentication and egress (90s retry window)..." >&2
     port=$(rand_port) || return 1
     printf '%s\n' "$n" | jq --argjson port "$port" '{
       log:{level:"error"},
@@ -945,8 +961,14 @@ verify_hysteria2_nodes() (
     "$SINGBOX_BIN" run -c "$work/probe.json" > "$work/probe.log" 2>&1 &
     pid=$!
     deadline=$((SECONDS + 90))
+    started=$SECONDS
+    next_notice=$((SECONDS + 5))
     result=1
     while (( SECONDS < deadline )); do
+      if (( SECONDS >= next_notice )); then
+        info "Still verifying Hysteria 2 node $tag ($((SECONDS - started))s elapsed)..." >&2
+        next_notice=$((SECONDS + 5))
+      fi
       kill -0 "$pid" 2>/dev/null || break
       if curl --silent --fail --noproxy '' --proxy "socks5h://127.0.0.1:$port" \
           --connect-timeout 3 --max-time 5 https://www.example.com/ -o /dev/null; then
@@ -958,6 +980,7 @@ verify_hysteria2_nodes() (
     wait "$pid" 2>/dev/null || true
     pid=''
     (( result == 0 )) || { err 'Hysteria 2 certificate/QUIC/egress probe timed out; candidate will roll back'; return 1; }
+    info "Hysteria 2 node $tag verified ($((SECONDS - started))s elapsed)." >&2
   done < <(jq -c '.nodes[] | select(.enabled and .type == "hysteria2")' "$source")
 )
 
@@ -967,8 +990,9 @@ apply_candidate_transaction() (
   local prepare="$1"
   shift
   umask 077
+  info 'Starting node configuration update...' >&2
   acquire_singbox_lock || return 1
-  local tx active=false touched=false committed=false preserve=false
+  local tx active=false touched=false committed=false preserve=false stage='prepare node metadata'
   local path
   for path in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_NODES" "$SINGBOX_CONF" "$SINGBOX_SERVICE"; do
     [[ ! -L "$path" ]] || { err "refusing symlink: $path"; return 1; }
@@ -980,7 +1004,9 @@ apply_candidate_transaction() (
   transaction_cleanup() {
     local status=$? failed=false
     trap - EXIT INT TERM HUP
+    if ! $committed; then err "Node update failed during: $stage" >&2; fi
     if $touched && ! $committed; then
+      info 'Rolling back configuration and restoring the previous service state...' >&2
       cp -p "$tx/nodes.backup" "$SINGBOX_NODES" || failed=true
       cp -p "$tx/config.backup" "$SINGBOX_CONF" || failed=true
       if $active; then
@@ -1004,25 +1030,37 @@ apply_candidate_transaction() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
+  info "Stage: $stage" >&2
   "$prepare" "$SINGBOX_NODES" "$tx/nodes.json" "$@" || return 1
+  stage='generate configuration'; info "Stage: $stage" >&2
   render_config "$tx/nodes.json" "$tx/config.json" || return 1
+  stage='check Hysteria 2 prerequisites (if enabled)'; info "Stage: $stage" >&2
   hysteria2_preflight "$tx/nodes.json" || return 1
+  stage='validate sing-box configuration'; info "Stage: $stage" >&2
   if ! validate_singbox_config "$tx/config.json" "$tx/check.log"; then
     err "candidate sing-box validation failed"; return 1
   fi
+  stage='back up configuration'; info "Stage: $stage" >&2
   cp -p "$SINGBOX_NODES" "$tx/nodes.backup" || return 1
   cp -p "$SINGBOX_CONF" "$tx/config.backup" || return 1
   # Copy attributes from each original before filling replacement contents.
   cp -p "$SINGBOX_NODES" "$tx/nodes.next" && cp -p "$SINGBOX_CONF" "$tx/config.next" || return 1
   cat "$tx/nodes.json" > "$tx/nodes.next" && cat "$tx/config.json" > "$tx/config.next" || return 1
   if systemctl is-active --quiet onevps-sing-box; then active=true; fi
+  stage='open firewall ports'; info "Stage: $stage" >&2
   open_node_ports "$tx/nodes.json" || return 1
+  stage='activate configuration'; info "Stage: $stage" >&2
   touched=true
   mv -f "$tx/nodes.next" "$SINGBOX_NODES" || return 1
   mv -f "$tx/config.next" "$SINGBOX_CONF" || return 1
-  systemctl restart onevps-sing-box && wait_singbox_ready "$SINGBOX_NODES" || return 1
+  stage='restart sing-box'; info "Stage: $stage" >&2
+  systemctl restart onevps-sing-box || return 1
+  stage='wait for service listeners'
+  wait_singbox_ready "$SINGBOX_NODES" || return 1
+  stage='verify all enabled Hysteria 2 nodes (if any)'; info "Stage: $stage" >&2
   verify_hysteria2_nodes "$tx/nodes.json" "$tx" || return 1
   committed=true
+  info 'Node configuration update completed.' >&2
 )
 
 # Inherit is a command, never a stored mode. Object travels on stdin.
