@@ -735,7 +735,7 @@ build_proxy_outbound() {
 build_outbound_routes() {
   local source="$1" rows row object tag proxy proxies='[]' rules assignments
   assignments=$(jq -c '
-    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "hysteria2")) | . as $n |
+    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "hysteria2" or .type == "snell")) | . as $n |
       (if has("default_outbound") then
         {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
        else empty end),
@@ -771,6 +771,7 @@ render_config() {
     case "$type" in
       vless-reality) ib=$(build_reality_inbound "$n") || return 1 ;;
       hysteria2)     ib=$(build_hysteria2_inbound "$n") || return 1 ;;
+      snell)        ib=$(build_snell_inbound "$n") || return 1 ;;
       *) continue ;;
     esac
     inbounds=$(printf '%s\n%s\n' "$inbounds" "$ib" | jq -sc '.[0] + [.[1]]') || return 1
@@ -834,7 +835,14 @@ validate_node_metadata() {
     .schema_version == 1 and (has("users") | not) and (has("clients") | not) and
     (.nodes | type == "array") and
     all(.nodes[]; (has("clients") | not) and (has("spider_x") | not) and
-      (.type == "vless-reality" or .type == "hysteria2") and
+      (.type == "vless-reality" or .type == "hysteria2" or .type == "snell") and
+      (if .type == "snell" then
+         .version == 5 and (.tag == ("snell-" + .id)) and
+         (.tag | test("[^A-Za-z0-9_-]") | not) and
+         (.psk | type == "string" and length == 32 and test("^[0-9a-f]{32}$")) and
+         (has("users") | not) and (has("default_outbound") | not) and
+         (has("obfs_mode") | not) and (has("mode") | not)
+       else true end) and
       (if .type == "hysteria2" then
          (.domain | type == "string" and length <= 253 and
            test("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$")) and
@@ -1021,6 +1029,9 @@ apply_candidate_transaction() (
 prepare_outbound_assignment() {
   local source="$1" output="$2" id="$3" scope="${4:-all}" selected="${5:-[]}" outbound
   [[ "$scope" == all || "$scope" == selected ]] || return 1
+  if [[ "$scope" == selected ]] && jq -e --arg id "$id" 'any(.nodes[]; .id == $id and .type == "snell")' "$source" >/dev/null; then
+    err 'Snell supports node-level outbound only'; return 1
+  fi
   if [[ "$scope" == selected ]]; then validate_node_selection "$source" "$id" "$selected" || return 1; fi
   outbound=$(jq -c -s -e 'select(length == 1) | .[0]') || return 1
   [[ "$outbound" == '"inherit"' ]] || validate_outbound <<<"$outbound" || return 1
@@ -1117,6 +1128,7 @@ manage_node_users() {
   local id="$1" n action name uid credential payload selected
   while :; do
     n=$(node_by_id "$id") || return 1
+    [[ $(jq -r '.type' <<<"$n") != snell ]] || { err 'Snell uses one PSK per node; node users are unsupported'; return 1; }
     printf '\nUsers:\n'
     list_node_users "$n"
     printf '\nActions:\n1) Add user\n2) Delete user\n3) User share link\n0) Back\n'
@@ -1152,12 +1164,17 @@ manage_node_users() {
 manage_outbound() {
   local id="$1" action link='' outbound scope selected='[]' n
   n=$(node_by_id "$id") || return 1
-  printf '1) All users (overwrite every individual outbound)\n2) Selected users\n0) Cancel\n'
-  case "$(ask 'Scope')" in
-    1) scope=all ;;
-    2) scope=selected; selected=$(pick_node_users "$n") || return 0 ;;
-    *) return 0 ;;
-  esac
+  if [[ $(jq -r '.type' <<<"$n") == snell ]]; then
+    scope=all
+    info 'Snell outbound applies to the entire node.'
+  else
+    printf '1) All users (overwrite every individual outbound)\n2) Selected users\n0) Cancel\n'
+    case "$(ask 'Scope')" in
+      1) scope=all ;;
+      2) scope=selected; selected=$(pick_node_users "$n") || return 0 ;;
+      *) return 0 ;;
+    esac
+  fi
   info 'Restore default means inherit for selected users; direct for all users.'
   printf '1) Restore default\n2) Explicit direct\n3) Proxy link\n0) Cancel\n'
   action=$(ask 'Select')
@@ -1177,6 +1194,10 @@ manage_outbound() {
   confirm 'Apply outbound setting?' n || return 0
   if apply_outbound_assignment "$id" "$scope" "$selected" <<<"$outbound"; then ok 'outbound applied'
   else err 'outbound not applied'; return 1; fi
+}
+
+build_snell_inbound() {
+  jq '{type:"snell",tag,listen:"0.0.0.0",listen_port:.port,version,psk}' <<<"$1"
 }
 
 build_hysteria2_inbound() {
@@ -1373,7 +1394,43 @@ add_reality_node() {
 }
 
 # ----------------------------------------------------------------------------
-# [4b] Add Hysteria 2 node with native ACME
+# [4b] Add Snell node
+# ----------------------------------------------------------------------------
+add_snell_node() {
+  require_singbox
+  ensure_nodes_file || return 1
+  local name port id psk node
+  info 'Add Snell (server v5 / Surge v4; UDP over TCP, no QUIC Proxy Mode)'
+  warn 'Snell has no forward secrecy or dedicated replay protection. Keep the generated PSK secret.'
+  name=$(ask 'Node name' "snell-$(openssl rand -hex 2)")
+  while :; do
+    port=$(ask 'Snell TCP port' 8443)
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || { warn 'invalid port'; continue; }
+    port=$((10#$port))
+    (( port >= 1 && port <= 65535 )) || { warn 'port out of range'; continue; }
+    if port_taken_by_node "$port" tcp || port_in_use "$port" tcp; then
+      warn 'TCP port is occupied; choose another port'; continue
+    fi
+    break
+  done
+  id=$(openssl rand -hex 4) || return 1
+  psk=$(rand_password) || return 1
+  node=$(printf '%s\n' "$psk" | jq -Rn --arg id "$id" --arg name "$name" --argjson port "$port" '
+    {id:$id,type:"snell",name:$name,tag:("snell-" + $id),port:$port,
+      version:5,psk:input,enabled:true}') || return 1
+  warn "Allow TCP/$port in your cloud security group. No UDP listener is required."
+  confirm 'Create Snell node?' n || return
+  if apply_candidate_transaction prepare_add_node <<<"$node"; then
+    ok 'Snell node added; listener ready (client interoperability not verified)'
+    node_link "$(node_by_id "$id")" || warn 'node is active; client configuration export failed'
+  else
+    err 'Snell activation failed'; return 1
+  fi
+  pause
+}
+
+# ----------------------------------------------------------------------------
+# [4c] Add Hysteria 2 node with native ACME
 # ----------------------------------------------------------------------------
 add_hysteria2_node() {
   require_singbox
@@ -1448,6 +1505,12 @@ node_link() {
       "$(jq -r '.reality_target' <<<"$n")" "$(jq -r '.reality_target_port // 443' <<<"$n")" \
       "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
 
+  elif [[ "$type" == "snell" ]]; then
+    addr=$(pub_ip) || { err 'client configuration unavailable; set PUBIP to a valid server IPv4 and retry'; return 1; }
+    pw=$(jq -r '.psk' <<<"$n")
+    # Use the generated tag, not a free-form display name, in Surge syntax.
+    printf '\n[Proxy]\n%s = snell, %s, %s, psk=%s, version=4\n' "$(jq -r '.tag' <<<"$n")" "$addr" "$port" "$pw"
+    info "TCP/$port; UDP over TCP; no QUIC Proxy Mode. This configuration contains the node PSK."
   elif [[ "$type" == "hysteria2" ]]; then
     pw=$(jq -r '.password' <<<"$n")
     domain=$(jq -r '.domain' <<<"$n")
@@ -1480,6 +1543,7 @@ list_nodes() {
     en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
     case "$(jq -r '.type' <<<"$n")" in
       hysteria2) kind="hy2/udp"; dest=$(jq -r '.domain' <<<"$n") ;;
+      snell)     kind="snell/tcp"; dest='server v5 / client v4' ;;
       *)         kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
     esac
     printf '  %d) %-18s %-8s port:%-6s %-26s %s\n' \
@@ -1513,7 +1577,18 @@ manage_nodes() {
   while :; do
     clear
     node_link "$n" || warn 'share link unavailable; node management remains available'
-    if [[ "$type" == "hysteria2" ]]; then
+    if [[ "$type" == "snell" ]]; then
+      printf '\n1) Change TCP port\n2) Rotate PSK\n3) Enable/disable\n4) Delete node\n5) Set node outbound\n0) Back\n'
+      case "$(ask 'Select')" in
+        1) edit_port "$id" ;;
+        2) rotate_snell_psk "$id" ;;
+        3) toggle_enabled "$id" ;;
+        4) del_node "$id"; return ;;
+        5) manage_outbound "$id" || true ;;
+        0|"") return ;;
+        *) continue ;;
+      esac
+    elif [[ "$type" == "hysteria2" ]]; then
       printf '\n1) Change UDP port\n2) Reset default password\n3) Enable/disable\n4) Delete node\n5) Manage node users\n6) Set node outbound\n0) Back\n'
       case "$(ask 'Select')" in
         1) edit_port "$id" ;;
@@ -1608,6 +1683,26 @@ edit_reality_target() {
   jq_update_nodes --arg id "$id" --arg target "$target" '
     (.nodes[]|select(.id==$id)) |= (.reality_sni=$target | .reality_target=$target | .reality_target_port=443)' || { err 'apply failed'; return 1; }
   ok "target changed to $target"
+  pause
+}
+
+prepare_snell_rotation() {
+  local source="$1" output="$2" id="$3"
+  validate_node_metadata "$source" || return 1
+  jq -Rse --slurpfile source "$source" --arg id "$id" '
+    split("\n") | select(length == 2 and .[1] == "") | .[0] |
+    select(test("^[0-9a-f]{32}$")) as $psk | $source[0] |
+    select(any(.nodes[]; .id == $id and .type == "snell")) |
+    (.nodes[] | select(.id == $id)).psk = $psk' > "$output" || return 1
+  validate_node_metadata "$output"
+}
+
+rotate_snell_psk() {
+  local id="$1" psk
+  confirm 'Rotate Snell PSK? All existing client configurations for this node will stop working.' n || return
+  psk=$(rand_password) || return 1
+  printf '%s\n' "$psk" | apply_candidate_transaction prepare_snell_rotation "$id" || { err 'PSK rotation failed'; return 1; }
+  ok 'Snell PSK rotated; export the new client configuration'
   pause
 }
 
@@ -2136,13 +2231,14 @@ EOF
   1) Install / update sing-box-core
   2) Add node - VLESS + Reality + Vision + uTLS
   4) Manage nodes
-  5) Show default node share links
+  5) Show default node links / client configurations
   6) Restart service
   7) BBR acceleration
   8) TCP optimization
   9) Uninstall
   10) Realm relay
   11) Add node - Hysteria 2 + native ACME
+  12) Add node - Snell (Surge v4)
   0) Exit
 EOF
     case "$(ask 'Select')" in
@@ -2156,6 +2252,7 @@ EOF
       9) uninstall ;;
       10) realm_menu ;;
       11) add_hysteria2_node || { err 'Hysteria 2 node not added'; pause; } ;;
+      12) add_snell_node || { err 'Snell node not added'; pause; } ;;
       0|"") exit 0 ;;
       *) ;;
     esac

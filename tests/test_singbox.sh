@@ -105,4 +105,17 @@ jq '(.nodes[] | select(.id == "b2c3d4e5")).users |= map(select(.id != "alice"))'
 render_config "$TEST_TMP/hy2-deleted-nodes.json" "$TEST_TMP/runtime-hy2-deleted.json"
 "$CORE" check -c "$TEST_TMP/runtime-hy2-deleted.json"
 printf 'ok - real sing-box accepts generated HY2 ACME, salamander and deleted-user configs (check only)\n'
+# Keep Snell fixture generation local: the shared fixture remains unchanged.
+jq '.nodes += [{id:"snell-test",type:"snell",name:"Snell Test",tag:"snell-snell-test",
+  port:20002,enabled:true,version:5,psk:"0123456789abcdef0123456789abcdef"}]' \
+  "$TEST_TMP/base.json" > "$TEST_TMP/snell-nodes.json"
+printf '%s\n' '{"mode":"proxy","protocol":"socks","server":"127.0.0.1","port":1080}' |
+  prepare_outbound_assignment "$TEST_TMP/snell-nodes.json" "$TEST_TMP/snell-proxy.json" snell-test
+render_config "$TEST_TMP/snell-proxy.json" "$TEST_TMP/runtime-snell.json"
+"$CORE" check -c "$TEST_TMP/runtime-snell.json"
+printf '%s\n' 'abcdef0123456789abcdef0123456789' |
+  prepare_snell_rotation "$TEST_TMP/snell-proxy.json" "$TEST_TMP/snell-rotated.json" snell-test
+render_config "$TEST_TMP/snell-rotated.json" "$TEST_TMP/runtime-snell-rotated.json"
+"$CORE" check -c "$TEST_TMP/runtime-snell-rotated.json"
+printf 'ok - real sing-box accepts generated Snell v5 node route and rotated PSK\n'
 python3 -I "$ROOT_DIR/tests/runtime_singbox.py" "$CORE" "$TEST_TMP/runtime-base.json" "$TEST_TMP"

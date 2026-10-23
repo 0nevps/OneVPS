@@ -16,7 +16,9 @@ OneVPS is a Bash tool for deploying and operating **sing-box v1.14.3** nodes on 
 - **VLESS + TCP + REALITY + Vision**: standalone deployment without your own domain or certificate;
   client links use `xtls-rprx-vision` and the `chrome` uTLS fingerprint.
 - **Hysteria 2 + native ACME**: standalone UDP, automatic HTTP-01 certificate management and optional salamander.
-- Node-local users, independent credentials and share links, node outbounds and per-user outbound overrides.
+- **Snell**: native sing-box server v5 with Surge v4 export, one PSK per node and UDP over TCP.
+- Node-local users, independent credentials and share links for Reality/Hysteria 2,
+  node outbounds and per-user outbound overrides.
 - Candidate configuration validation, service management, independent Realm relays, BBR and optional TCP tuning.
 
 No traffic accounting, subscriptions, web panel, configuration migration, or dual-core operation is provided.
@@ -48,7 +50,7 @@ sudo bash onevps.sh
 ```
 
 The script runs as root and can change services, firewall rules and optional kernel settings.
-Use the install-core menu entry first, then add a Reality or Hysteria 2 node.
+Use the install-core menu entry first, then add a Reality, Hysteria 2 or Snell node.
 The core is pinned to the official **sing-box v1.14.3** release, not a floating latest version;
 installation verifies the downloaded archive's SHA-256 before installing it. Verification failure must stop installation.
 
@@ -57,6 +59,28 @@ check the release notes before downloading. Once a sing-box release is available
 that same version into a clean directory, run `sha256sum --check SHA256SUMS`, inspect the script, then execute it.
 Checksums detect corruption but do not independently establish the publisher's identity.
 See [release procedures](CONTRIBUTING.md#releases); [CHANGELOG.md](CHANGELOG.md) retains historical release notes.
+
+## Snell
+
+Menu **12** adds a native sing-box Snell node; no separate snell-server, domain or certificate is required.
+The server uses `version: 5`, while exported Surge `[Proxy]` entries explicitly use `version=4`.
+This is intentional: sing-box does not implement v5 QUIC Proxy Mode. TCP and UDP over TCP use only the selected
+TCP listener (default 8443); allow that TCP port in cloud security groups. Do not change the Surge version to 5.
+
+Each node has one randomly generated 32-character hexadecimal PSK. Node management supports port changes,
+PSK rotation, enable/disable, deletion and node-level outbounds. Node-local users and per-user outbound overrides
+are not supported for Snell. Use separate nodes/ports for independent credentials. Export uses a stable generated
+node tag as the Surge policy name, not the free-form display name. Exported configurations contain the PSK.
+Rotation invalidates existing client configurations after successful application; export the replacement afterward.
+
+Snell shares existing configuration validation, listener checks, rollback and private-address blocking with other
+nodes. Listener readiness is not a client handshake test. Firewall allowances remain after deletion or port changes.
+No subscriptions, Snell outbound import, v6, optional obfuscation settings or plaintext modes are included.
+Older OneVPS scripts reject metadata containing Snell nodes; remove those nodes with this version before downgrading.
+
+Snell does not provide forward secrecy or dedicated replay protection. Keep the generated PSK secret; do not treat
+its security properties as equivalent to TLS. Real Surge interoperability and Linux host-level deployment remain
+pending acceptance; same-core tests alone do not establish either.
 
 ## Hysteria 2 and native ACME
 
@@ -135,8 +159,8 @@ restore the previous service state; this is not a power-loss-safe transaction gu
 Install, configuration changes and uninstall share a nonblocking process lock; retry after another operation finishes.
 Activation checks a stable service PID and ownership of every enabled TCP/UDP listener before committing, then
 runs the HY2 client probe when applicable. Listener readiness waits up to approximately 10 seconds, or 90 seconds
-with enabled HY2 nodes to allow certificate initialization; it is not an end-to-end Reality handshake test.
-A failed public-IPv4 lookup does not produce a broken Reality link or prevent node management. Retry with
+with enabled HY2 nodes to allow certificate initialization; it is not an end-to-end Reality or Snell handshake test.
+A failed public-IPv4 lookup does not produce a broken Reality link or Snell export, or prevent node management. Retry with
 `sudo env PUBIP=YOUR_SERVER_IPV4 bash onevps.sh` to supply the server address explicitly.
 
 ## Files and operations

@@ -347,6 +347,103 @@ assert_true "HY2 preflight rejects HTTP listener owned by another process" bash 
 # Consumed by pub_ip() in the sourced script.
 # shellcheck disable=SC2034
 PUBIP="203.0.113.10"
+# Snell has one PSK, no synthetic default user or per-user routing.
+snell_node='{"id":"snell-test","type":"snell","name":"Snell Test","tag":"snell-snell-test","port":20001,"enabled":true,"version":5,"psk":"0123456789abcdef0123456789abcdef"}'
+jq --argjson node "$snell_node" '.nodes += [$node]' "$FIXTURE" > "$TEST_TMP/snell.json"
+assert_true "Snell TCP coexists with HY2 UDP on the same port" validate_node_metadata "$TEST_TMP/snell.json"
+assert_eq "Snell listener uses TCP" tcp "$(node_network snell)"
+assert_jq "Snell inbound preserves v5 PSK without users or TLS" "$(build_snell_inbound "$snell_node")" \
+  '.type == "snell" and .version == 5 and .psk == "0123456789abcdef0123456789abcdef" and .listen == "0.0.0.0" and .listen_port == 20001 and (has("users")|not) and (has("tls")|not)'
+assert_contains "Snell exports Surge version 4, not the core version" "$(node_link "$snell_node")" \
+  'snell-snell-test = snell, 203.0.113.10, 20001, psk=0123456789abcdef0123456789abcdef, version=4'
+assert_eq "Snell export uses stable tag rather than injectable display name" "$(node_link "$snell_node")" \
+  "$(node_link "$(jq -c '.name="Injected, version=6\nOther = direct"' <<<"$snell_node")")"
+for mutation in '.nodes[-1].tag="wrong-tag"' 'del(.nodes[-1].psk)' '.nodes[-1].psk=""' '.nodes[-1].psk="0123456789ABCDEF0123456789ABCDEF"' \
+  '.nodes[-1].psk="0123456789abcdef0123456789abcde"' '.nodes[-1].psk="0123456789abcdef0123456789abcdef0"' \
+  '.nodes[-1].psk="g123456789abcdef0123456789abcdef"' '.nodes[-1].psk=123' \
+  'del(.nodes[-1].version)' '.nodes[-1].version=4' '.nodes[-1].version="5"' \
+  '.nodes[-1].users=[]' '.nodes[-1].users=null' '.nodes[-1].default_outbound={mode:"direct"}' \
+  '.nodes[-1].default_outbound=null' '.nodes[-1].port=443'; do
+  jq "$mutation" "$TEST_TMP/snell.json" > "$TEST_TMP/snell-invalid.json"
+  assert_false "rejects Snell metadata $mutation" validate_node_metadata "$TEST_TMP/snell-invalid.json"
+  assert_false "refuses invalid Snell render $mutation" render_config "$TEST_TMP/snell-invalid.json" "$TEST_TMP/snell-config.json"
+done
+snell_proxy='{"mode":"proxy","protocol":"socks","server":"127.0.0.1","port":1080}'
+assert_true "Snell supports node outbound assignment" prepare_outbound_assignment "$TEST_TMP/snell.json" "$TEST_TMP/snell-proxy.json" snell-test <<<"$snell_proxy"
+render_config "$TEST_TMP/snell-proxy.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "Snell node route follows safety rules without auth_user" "$TEST_TMP/snell-config.json" \
+  '.route.rules[0].action == "sniff" and .route.rules[1].action == "resolve" and all(.route.rules[2:4][]; .action == "reject") and .route.rules[4].inbound == ["snell-snell-test"] and .route.rules[4].outbound == "node-out-snell-test" and all(.route.rules[]; has("auth_user")|not) and any(.outbounds[]; .tag == "node-out-snell-test" and .type == "socks")'
+assert_file_jq "Snell assignment never introduces users" "$TEST_TMP/snell-proxy.json" '.nodes[-1] | (has("users")|not) and (has("default_outbound")|not)'
+for selection in '["default"]' '["alice"]'; do
+  assert_false "Snell rejects selected assignment $selection" prepare_outbound_assignment "$TEST_TMP/snell.json" "$TEST_TMP/snell-invalid.json" snell-test selected "$selection" <<<'{"mode":"direct"}'
+done
+for action in add reset delete; do
+  assert_false "Snell rejects user operation $action" prepare_node_user_change "$TEST_TMP/snell.json" "$TEST_TMP/snell-invalid.json" snell-test "$action" alice <<<'"disposable-password"'
+done
+assert_true "Snell explicit direct replaces node proxy" prepare_outbound_assignment "$TEST_TMP/snell-proxy.json" "$TEST_TMP/snell-direct.json" snell-test <<<'{"mode":"direct"}'
+render_config "$TEST_TMP/snell-direct.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "Snell direct emits no unused proxy" "$TEST_TMP/snell-config.json" '(.outbounds|length)==1 and .route.rules[4].outbound=="direct"'
+assert_true "Snell can restore inherited direct" prepare_outbound_assignment "$TEST_TMP/snell-proxy.json" "$TEST_TMP/snell-inherit.json" snell-test <<<'"inherit"'
+render_config "$TEST_TMP/snell-inherit.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "Snell inherit removes outbound and route" "$TEST_TMP/snell-inherit.json" '.nodes[-1]|has("outbound")|not'
+assert_file_jq "Snell inherited route uses global direct" "$TEST_TMP/snell-config.json" '(.route.rules|length)==4 and (.outbounds|length)==1'
+jq '.nodes[-1].enabled=false' "$TEST_TMP/snell-proxy.json" > "$TEST_TMP/snell-disabled.json"
+render_config "$TEST_TMP/snell-disabled.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "disabled Snell omits inbound route and proxy" "$TEST_TMP/snell-config.json" 'all(.inbounds[]; .type!="snell") and (.route.rules|length)==4 and (.outbounds|length)==1'
+jq '.nodes[-1].port=20003' "$TEST_TMP/snell-proxy.json" > "$TEST_TMP/snell-port.json"
+render_config "$TEST_TMP/snell-port.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "Snell port update reaches inbound" "$TEST_TMP/snell-config.json" 'any(.inbounds[]; .type=="snell" and .listen_port==20003)'
+jq 'del(.nodes[-1])' "$TEST_TMP/snell-proxy.json" > "$TEST_TMP/snell-deleted.json"
+render_config "$TEST_TMP/snell-deleted.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "Snell deletion removes inbound and node proxy" "$TEST_TMP/snell-config.json" 'all(.inbounds[]; .type!="snell") and (.route.rules|length)==4 and (.outbounds|length)==1'
+assert_true "Snell rotation validation and restart failures roll back both files" bash -c '
+  source "$1"; SINGBOX_DIR="$2/snell-rollback"; mkdir "$SINGBOX_DIR"
+  SINGBOX_NODES="$SINGBOX_DIR/nodes.json"; SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_BIN="$SINGBOX_DIR/core"
+  printf "#!/bin/sh\nexit 0\n" > "$SINGBOX_BIN"; chmod +x "$SINGBOX_BIN"
+  cp "$3" "$SINGBOX_NODES"; render_config "$SINGBOX_NODES" "$SINGBOX_CONF"
+  cp "$SINGBOX_NODES" "$SINGBOX_DIR/nodes.before"; cp "$SINGBOX_CONF" "$SINGBOX_DIR/config.before"
+  hysteria2_preflight() { :; }; verify_hysteria2_nodes() { :; }; open_port() { :; }; mock_singbox_readiness
+  mode=validate
+  validate_singbox_config() { [[ "$mode" != validate ]]; }
+  systemctl() {
+    if [[ "$1" == restart && "$mode" == restart && ! -e "$SINGBOX_DIR/failed" ]]; then touch "$SINGBOX_DIR/failed"; return 1; fi
+    return 0
+  }
+  for mode in validate restart; do
+    if printf "%s\n" abcdef0123456789abcdef0123456789 | apply_candidate_transaction prepare_snell_rotation snell-test; then exit 1; fi
+    cmp "$SINGBOX_NODES" "$SINGBOX_DIR/nodes.before" && cmp "$SINGBOX_CONF" "$SINGBOX_DIR/config.before" || exit 1
+  done
+  mode=ok
+  printf "%s\n" abcdef0123456789abcdef0123456789 | apply_candidate_transaction prepare_snell_rotation snell-test || exit 1
+  jq -e '\''.nodes[-1].psk=="abcdef0123456789abcdef0123456789"'\'' "$SINGBOX_NODES" >/dev/null &&
+    jq -e '\''any(.inbounds[]; .type=="snell" and .psk=="abcdef0123456789abcdef0123456789")'\'' "$SINGBOX_CONF" >/dev/null
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$TEST_TMP/snell-proxy.json"
+
+new_psk=abcdef0123456789abcdef0123456789
+assert_true "Snell rotates raw PSK from stdin" prepare_snell_rotation "$TEST_TMP/snell-proxy.json" "$TEST_TMP/snell-rotated.json" snell-test <<<"$new_psk"
+assert_eq "Snell rotation changes only PSK" "$(jq -cS 'del(.nodes[-1].psk)' "$TEST_TMP/snell-proxy.json")" "$(jq -cS 'del(.nodes[-1].psk)' "$TEST_TMP/snell-rotated.json")"
+assert_file_jq "Snell source keeps old PSK" "$TEST_TMP/snell-proxy.json" '.nodes[-1].psk=="0123456789abcdef0123456789abcdef"'
+render_config "$TEST_TMP/snell-rotated.json" "$TEST_TMP/snell-config.json"
+assert_file_jq "Snell rotation reaches rendered inbound" "$TEST_TMP/snell-config.json" 'any(.inbounds[]; .type=="snell" and .psk=="abcdef0123456789abcdef0123456789")'
+assert_contains "Snell rotation reaches Surge export" "$(node_link "$(jq -c '.nodes[-1]' "$TEST_TMP/snell-rotated.json")")" "psk=$new_psk"
+for bad_psk in '' invalid 0123456789ABCDEF0123456789ABCDEF "$new_psk"$'\n'"$new_psk"; do
+  assert_false "Snell rotation rejects malformed PSK" prepare_snell_rotation "$TEST_TMP/snell.json" "$TEST_TMP/snell-invalid.json" snell-test <<<"$bad_psk"
+done
+for id in missing a1b2c3d4 b2c3d4e5; do
+  assert_false "Snell rotation rejects non-Snell target $id" prepare_snell_rotation "$TEST_TMP/snell.json" "$TEST_TMP/snell-invalid.json" "$id" <<<"$new_psk"
+done
+
+assert_true "Snell rotation keeps raw credentials out of external argv" bash -c '
+  source "$1"; capture="$4"
+  jq() { printf "%s\n" "$@" >> "$capture"; command jq "$@"; }
+  openssl() { printf "%s\n" "$@" >> "$capture"; command openssl "$@"; }
+  printf "%s\n" abcdef0123456789abcdef0123456789 | prepare_snell_rotation "$2" "$3" snell-test || exit 1
+  render_config "$3" "$3.config" || exit 1
+  PUBIP=203.0.113.10
+  node_link "$(command jq -c ".nodes[-1]" "$3")" >/dev/null || exit 1
+  ! command grep -Eq "abcdef0123456789abcdef0123456789|0123456789abcdef0123456789abcdef" "$capture"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/snell-proxy.json" "$TEST_TMP/snell-secret.json" "$TEST_TMP/snell-argv"
+
 reality_link_output=$(node_link "$reality_node")
 assert_contains "builds a complete VLESS share link" "$reality_link_output" \
   "vless://123e4567-e89b-12d3-a456-426614174000@203.0.113.10:443?"

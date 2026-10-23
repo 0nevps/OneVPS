@@ -220,6 +220,65 @@ try:
         assert request(port, destination_port) == expected, "HY2 auth_user route isolation failed"
     print("ok - HY2 trusted TLS TCP: default and inherited user proxy, explicit user direct")
 
+    def snell_server(name, fixture="runtime-snell.json", direct_route=False, guard=False):
+        config = json.loads((WORK / fixture).read_text())
+        node = next(item for item in config["inbounds"] if item["type"] == "snell")
+        assert node["version"] == 5 and "users" not in node
+        node.update(listen="127.0.0.1", listen_port=free_port())
+        config.pop("certificate_providers", None)
+        config["inbounds"] = [node]
+        if not guard:
+            config["route"]["rules"] = [rule for rule in config["route"]["rules"]
+                                        if rule.get("action") not in ("sniff", "reject")]
+        else:
+            assert any("127.0.0.0/8" in rule.get("ip_cidr", []) for rule in config["route"]["rules"])
+        for outbound in config["outbounds"]:
+            if outbound["type"] == "socks":
+                outbound["server_port"] = relay_port
+        if direct_route:
+            config["route"]["rules"] = []
+            config["outbounds"] = [{"type": "direct", "tag": "direct"}]
+        start(name, config, node["listen_port"])
+        return node
+
+    def snell_client(name, node, psk):
+        port = free_port()
+        start(name, {"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": port}],
+                     "outbounds": [{"type": "snell", "server": "127.0.0.1",
+                                    "server_port": node["listen_port"], "version": 4, "psk": psk}]}, port)
+        return port
+
+    snell = snell_server("snell-server")
+    snell_direct = snell_server("snell-direct-server", direct_route=True)
+    snell_rotated = snell_server("snell-rotated-server", "runtime-snell-rotated.json")
+    snell_ports = [snell_client("snell-proxy-client", snell, snell["psk"]),
+                   snell_client("snell-direct-client", snell_direct, snell_direct["psk"]),
+                   snell_client("snell-rotated-client", snell_rotated, snell_rotated["psk"])]
+    for port, marker in zip(snell_ports, (b"upstream", b"direct", b"upstream")):
+        assert request(port, destination_port) == marker
+    print("ok - Snell v5 TCP forwards through node proxy, direct and rotated credentials")
+    snell_rejected = [snell_client("snell-wrong-psk", snell, "f" * 32),
+                      snell_client("snell-old-psk", snell_rotated, snell["psk"])]
+    for port in snell_rejected:
+        try:
+            result = request(port, destination_port)
+        except (OSError, http.client.HTTPException):
+            pass
+        else:
+            raise AssertionError("Snell invalid PSK forwarded TCP: " + repr(result))
+    print("ok - Snell rejects wrong and rotated-out PSKs on TCP")
+    snell_guarded = snell_server("snell-guarded-server", guard=True)
+    snell_guarded_port = snell_client("snell-guarded-client", snell_guarded, snell_guarded["psk"])
+    for host in ("127.0.0.1", "localhost"):
+        assert request(snell_ports[0], destination_port, host) == b"upstream"
+        try:
+            result = request(snell_guarded_port, destination_port, host)
+        except (OSError, http.client.HTTPException):
+            pass
+        else:
+            raise AssertionError("Snell private destination bypassed safety rules: " + repr(result))
+    print("ok - Snell blocks private IP and resolved localhost before node proxy")
+
     # UDP markers distinguish direct routing from the node's SOCKS relay as well.
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as direct_udp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_udp:
         direct_udp.bind(("127.0.0.1", 0))
@@ -242,6 +301,16 @@ try:
         try:
             for port, marker in zip(hy2_ports, (b"upstream:", b"direct:", b"upstream:")):
                 assert udp_request(port, direct_udp.getsockname()[1]).endswith(marker + b"onevps-udp-forwarding")
+            for port, marker in zip(snell_ports, (b"upstream:", b"direct:", b"upstream:")):
+                assert udp_request(port, direct_udp.getsockname()[1]).endswith(marker + b"onevps-udp-forwarding")
+            for port in snell_rejected:
+                try:
+                    result = udp_request(port, direct_udp.getsockname()[1])
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError("Snell invalid PSK forwarded UDP: " + repr(result))
+            print("ok - Snell UDP preserves node routes and rejects wrong and rotated-out PSKs")
         finally:
             stop_udp.set()
             for worker in workers:

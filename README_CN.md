@@ -16,7 +16,8 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 - **VLESS + TCP + REALITY + Vision**：独立部署，无需自备域名或证书；
   客户端链接使用 `xtls-rprx-vision` 与 `chrome` uTLS 指纹。
 - **Hysteria 2 + 原生 ACME**：独立 UDP，自动 HTTP-01 证书管理，可选 salamander 混淆。
-- 节点内用户、独立凭据与分享链接、节点出口及用户独立出口覆盖。
+- **Snell**：原生 sing-box 服务端 v5、Surge v4 配置导出，每节点独立 PSK，支持 UDP over TCP。
+- Reality/Hysteria 2 节点内用户、独立凭据与分享链接、节点出口及用户独立出口覆盖。
 - 候选配置校验、服务管理、独立 Realm 中转、BBR 与可选 TCP 优化。
 
 不提供流量统计、订阅、Web 面板、配置迁移或双内核运行。
@@ -47,13 +48,32 @@ sudo bash onevps.sh
 ```
 
 脚本以 root 运行，可能修改服务、防火墙规则与可选内核参数。
-先从菜单安装核心，再添加 Reality 或 Hysteria 2 节点。
+先从菜单安装核心，再添加 Reality、Hysteria 2 或 Snell 节点。
 核心固定为官方 **sing-box v1.14.3**，不跟随 latest；安装前对下载归档执行 SHA-256 校验，校验失败必须停止安装。
 
 OneVPS 正式版本包含 `onevps.sh` 与 `SHA256SUMS`。**旧发行版可能仍使用 Xray**，下载前请确认发布说明。
 待 sing-box 版本发布后，将同一版本的两项资产下载到干净目录，执行 `sha256sum --check SHA256SUMS`，
 审阅脚本后再运行。校验和可检测内容损坏，但不能独立证明发布者身份。
 发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md#releases)；[CHANGELOG.md](CHANGELOG.md) 保留历史发布记录。
+
+## Snell
+
+菜单 **12** 添加原生 sing-box Snell 节点，无需独立 snell-server、域名或证书。
+服务端使用 `version: 5`，导出的 Surge `[Proxy]` 配置明确使用 `version=4`。
+这是有意的版本配对：sing-box 不实现 v5 QUIC Proxy Mode。TCP 和 UDP over TCP 共用选定的 TCP
+监听端口（默认 8443），云安全组只需开放该 TCP 端口。不要将 Surge 配置改为 v5。
+
+每个节点使用随机生成的 32 位十六进制 PSK。节点管理支持改端口、轮换 PSK、启停、删除及节点出口。
+Snell 不支持节点内多用户及用户级出口覆盖；独立凭据使用不同节点和端口。
+导出使用稳定生成的节点 tag 作为 Surge 策略名称，不使用自由输入的显示名称。导出配置包含 PSK，需妥善保管。
+轮换成功应用后，旧客户端配置失效，需重新导出。
+
+Snell 复用现有配置校验、监听检查、回滚和私网阻断。监听就绪不等于客户端握手通过。
+删除和改端口后保留防火墙放行规则。首期不提供订阅、Snell 出站导入、v6、可选混淆设置或明文模式。
+旧版 OneVPS 会拒绝包含 Snell 节点的元数据；降级前需用当前版本删除 Snell 节点。
+
+Snell 不提供前向保密或专门的重放保护。请保护随机 PSK，不将其安全属性视为与 TLS 等同。
+真实 Surge 互通与 Linux 主机级部署仍需验收，同内核测试不能替代这些验证。
 
 ## Hysteria 2 与原生 ACME
 
@@ -121,8 +141,8 @@ SOCKS5 不加密流量或凭据，请使用可信或受保护的链路；UDP 能
 启用失败需要回滚元数据与配置，并尝试恢复原服务状态；这不保证文件替换过程具有断电安全性。
 安装、配置变更与卸载共用非阻塞进程锁；存在其他操作时需待其完成后重试。
 提交前检查服务 PID 持续稳定，且所有启用节点的 TCP/UDP 监听均属于该进程；存在 HY2 时再执行客户端探测。
-监听就绪等待约 10 秒；含启用 HY2 节点时约 90 秒，以便初始化证书。这不等同于 Reality 端到端握手验证。
-公网 IPv4 查询失败不会输出无效 Reality 链接，也不阻止节点管理。
+监听就绪等待约 10 秒；含启用 HY2 节点时约 90 秒，以便初始化证书。这不等同于 Reality 或 Snell 端到端握手验证。
+公网 IPv4 查询失败不会输出无效 Reality 链接或 Snell 配置，也不阻止节点管理。
 可用 `sudo env PUBIP=YOUR_SERVER_IPV4 bash onevps.sh` 显式指定服务器地址后重试。
 
 ## 文件与运维
