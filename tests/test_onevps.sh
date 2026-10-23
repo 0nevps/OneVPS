@@ -849,7 +849,7 @@ for node_id in a1b2c3d4 b2c3d4e5; do
        "$(command cat "$capture")" == "$selected all []"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
   ' _ "$ROOT_DIR/onevps.sh" "$SINGBOX_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
-printf '11\n0\n' > "$TEST_TMP/menu-input"
+printf '3\n0\n' > "$TEST_TMP/menu-input"
 assert_true "main menu dispatches Hysteria 2 without restoring global users" bash -c '
   source "$1"; exec 3< "$2"
   clear() { :; }; status_line() { :; }
@@ -858,6 +858,39 @@ assert_true "main menu dispatches Hysteria 2 without restoring global users" bas
   add_hysteria2_node() { printf "HY2_DISPATCH\n"; }
   output=$(main_menu)
   [[ "$output" == *HY2_DISPATCH* && "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
+printf '%s\n' {1..11} 0 > "$TEST_TMP/menu-input"
+assert_true "main menu displays and dispatches consecutive grouped options" bash -c '
+  source "$1"; exec 3< "$2"
+  clear() { :; }; status_line() { :; }; pause() { :; }
+  ask() { local answer; IFS= read -r answer <&3 || exit 1; printf "%s\n" "$answer"; }
+  install_singbox() { echo DISPATCH:install; }
+  add_reality_node() { echo DISPATCH:reality; }
+  add_hysteria2_node() { echo DISPATCH:hysteria2; }
+  add_snell_node() { echo DISPATCH:snell; }
+  manage_nodes() { echo DISPATCH:manage; }
+  show_links() { echo DISPATCH:links; }
+  realm_menu() { echo DISPATCH:realm; }
+  enable_bbr() { echo DISPATCH:bbr; }
+  optimize_system() { echo DISPATCH:tcp; }
+  restart_service() { echo DISPATCH:restart; }
+  uninstall() { echo DISPATCH:uninstall; }
+  output=$(main_menu) || exit 1
+  expected=$(printf "DISPATCH:%s\n" install reality hysteria2 snell manage links realm bbr tcp restart uninstall)
+  [[ "$(printf "%s\n" "$output" | command grep "^DISPATCH:")" == "$expected" ]] || exit 1
+  displayed=$(printf "%s\n" "$output" | sed -n "/^  [0-9][0-9]*) /p" | head -n 12)
+  expected=$(printf "  %s\n" \
+    "1) Install / update sing-box-core" \
+    "2) Add node - VLESS + Reality + Vision + uTLS" \
+    "3) Add node - Hysteria 2 + native ACME" \
+    "4) Add node - Snell (Surge v4)" \
+    "5) Manage nodes" \
+    "6) Show default node links / client configurations" \
+    "7) Realm relay" "8) BBR acceleration" "9) TCP optimization" \
+    "10) Restart service" "11) Uninstall" "0) Exit")
+  [[ "$displayed" == "$expected" && "$output" == *"Core installation"* &&
+     "$output" == *"Node management"* && "$output" == *"Relay and optimization"* &&
+     "$output" == *"Service maintenance"* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
 for removed in manage_users show_user_links prepare_user_assignment apply_user_assignment validate_user_metadata; do
   assert_false "removed function $removed is absent" declare -F "$removed"

@@ -2225,31 +2225,39 @@ EOF
     status_line
     cat <<EOF
 
+  Core installation
   1) Install / update sing-box-core
+
+  Node management
   2) Add node - VLESS + Reality + Vision + uTLS
-  4) Manage nodes
-  5) Show default node links / client configurations
-  6) Restart service
-  7) BBR acceleration
-  8) TCP optimization
-  9) Uninstall
-  10) Realm relay
-  11) Add node - Hysteria 2 + native ACME
-  12) Add node - Snell (Surge v4)
+  3) Add node - Hysteria 2 + native ACME
+  4) Add node - Snell (Surge v4)
+  5) Manage nodes
+  6) Show default node links / client configurations
+
+  Relay and optimization
+  7) Realm relay
+  8) BBR acceleration
+  9) TCP optimization
+
+  Service maintenance
+  10) Restart service
+  11) Uninstall
+
   0) Exit
 EOF
     case "$(ask 'Select')" in
       1) install_singbox; pause ;;
       2) add_reality_node ;;
-      4) manage_nodes ;;
-      5) show_links ;;
-      6) restart_service ;;
-      7) enable_bbr || { err "BBR configuration failed; some settings may already be applied"; pause; } ;;
-      8) optimize_system ;;
-      9) uninstall ;;
-      10) realm_menu ;;
-      11) add_hysteria2_node || { err 'Hysteria 2 node not added'; pause; } ;;
-      12) add_snell_node || { err 'Snell node not added'; pause; } ;;
+      3) add_hysteria2_node || { err 'Hysteria 2 node not added'; pause; } ;;
+      4) add_snell_node || { err 'Snell node not added'; pause; } ;;
+      5) manage_nodes ;;
+      6) show_links ;;
+      7) realm_menu ;;
+      8) enable_bbr || { err "BBR configuration failed; some settings may already be applied"; pause; } ;;
+      9) optimize_system ;;
+      10) restart_service ;;
+      11) uninstall ;;
       0|"") exit 0 ;;
       *) ;;
     esac

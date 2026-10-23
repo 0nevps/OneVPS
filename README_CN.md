@@ -74,7 +74,7 @@ Release 发布功能独立保留，不作为安装前提；流程见 [CONTRIBUTI
 
 ## Snell
 
-菜单 **12** 添加原生 sing-box Snell 节点，无需独立 snell-server、域名或证书。
+菜单 **4** 添加原生 sing-box Snell 节点，无需独立 snell-server、域名或证书。
 服务端使用 `version: 5`，导出的 Surge `[Proxy]` 配置明确使用 `version=4`。
 这是有意的版本配对：sing-box 不实现 v5 QUIC Proxy Mode。TCP 和 UDP over TCP 共用选定的 TCP
 监听端口（默认 8443），云安全组只需开放该 TCP 端口。不要将 Surge 配置改为 v5。
@@ -93,7 +93,7 @@ Snell 不提供前向保密或专门的重放保护。请保护随机 PSK，不�
 
 ## Hysteria 2 与原生 ACME
 
-菜单 **11** 添加 Hysteria 2 节点，要求固定核心包含 `with_quic`、`with_acme`。
+菜单 **3** 添加 Hysteria 2 节点，要求固定核心包含 `with_quic`、`with_acme`。
 已有 OneVPS 安装请先通过菜单 **1** 更新服务单元，允许 ACME 持久目录写入。
 不依赖 Caddy 或外部 ACME 客户端。首期要求域名 A 记录直接指向本 VPS，并具备 `getent`、`ss`，
 公网 TCP/80 必须在申请及续期时可达。若存在 AAAA 记录，也需指向可达的本机地址；

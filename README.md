@@ -81,7 +81,7 @@ Releases remain available independently of installation: see [release procedures
 
 ## Snell
 
-Menu **12** adds a native sing-box Snell node; no separate snell-server, domain or certificate is required.
+Menu **4** adds a native sing-box Snell node; no separate snell-server, domain or certificate is required.
 The server uses `version: 5`, while exported Surge `[Proxy]` entries explicitly use `version=4`.
 This is intentional: sing-box does not implement v5 QUIC Proxy Mode. TCP and UDP over TCP use only the selected
 TCP listener (default 8443); allow that TCP port in cloud security groups. Do not change the Surge version to 5.
@@ -103,7 +103,7 @@ pending acceptance; same-core tests alone do not establish either.
 
 ## Hysteria 2 and native ACME
 
-Menu **11** adds a Hysteria 2 node using the pinned core's `with_quic` and `with_acme` features.
+Menu **3** adds a Hysteria 2 node using the pinned core's `with_quic` and `with_acme` features.
 Use menu **1** first to update an existing OneVPS service unit with the writable ACME storage allowance.
 No Caddy or separate ACME client is required. The initial implementation requires a domain with an A record
 pointing directly to this VPS, `getent`, `ss`, and publicly reachable TCP/80 for HTTP-01 issuance and renewal.
