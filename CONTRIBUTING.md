@@ -50,9 +50,10 @@ git switch -c fix/short-description
 The sing-box rewrite and its CI checks are being implemented together. The required check set is:
 
 ```bash
-bash -n onevps.sh tests/test_onevps.sh tests/test_singbox.sh
-shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_singbox.sh
+for script in onevps.sh install.sh tests/*.sh; do bash -n "$script"; done
+shellcheck --severity=warning onevps.sh install.sh tests/test_install.sh tests/test_onevps.sh tests/test_singbox.sh
 bash tests/test_onevps.sh
+bash tests/test_install.sh
 python3 -I -c 'import ast, pathlib; ast.parse(pathlib.Path("tests/runtime_singbox.py").read_text())'
 SINGBOX_TEST_BIN=/absolute/path/to/onevps-sing-box bash tests/test_singbox.sh
 npx --yes markdownlint-cli2@0.23.2 "**/*.md"
@@ -94,8 +95,8 @@ Use fresh installations for the rewrite; do not test it by importing or overwrit
 
 ## Releases
 
-Push an existing stable version tag such as `v0.1.2` to trigger the Release workflow. It validates the tagged
-commit with the same checks as CI, then publishes `onevps.sh` and `SHA256SUMS` with generated release notes.
+Push an existing stable version tag such as `v0.2.0` to trigger the Release workflow. It validates the tagged
+commit with the same checks as CI, then publishes `onevps.sh`, `install.sh` and `SHA256SUMS` with generated release notes.
 Only the publishing job has permission to write releases.
 
 To backfill an existing tag, run the Release workflow from `main` and supply the tag:
@@ -107,7 +108,18 @@ gh workflow run release.yml --ref main -f tag=v0.1.2
 The workflow must already exist on the default branch. Manual dispatch requires repository Actions write
 access. Do not move or recreate published tags. Repeated runs verify existing assets without replacing them;
 incomplete or conflicting releases fail for manual inspection. Historical backfills do not replace a newer
-version as Latest. New releases remain drafts until both uploaded assets have been verified.
+version as Latest. New releases remain drafts until all uploaded assets have been verified.
+
+For new releases, `ONEVPS_VERSION` must exactly match the tag; the workflow rejects mismatches.
+Historical tags without `install.sh` retain their original two-asset manifest and verification path; historical
+CI runs their original pinned Xray suite instead of the sing-box suite. No published asset is replaced.
+`tests/test_install.sh` uses mocked downloads and rewritten fixed paths in disposable copies, never host services
+or the real `/usr/local/bin`. It checks installer/update implementation parity, failure preservation and first-run
+orchestration. Keep the marked release-installation block identical in both standalone scripts; this small deliberate
+duplication avoids downloading/executing an updater or installing an additional runtime helper.
+
+新版 tag 必须与 `ONEVPS_VERSION` 一致；旧 tag 没有安装器时仍按原来的两项资产验证，不覆盖已有资产。
+安装器隔离测试不操作宿主服务或真实安装路径，同时约束两份独立脚本的发布安装实现一致。
 
 ## Reporting Bugs
 
@@ -138,7 +150,7 @@ firewall rules, generated credentials, or systemd hardening.
 
 ## 中文说明
 
-- 推送 `v0.1.2` 格式的稳定版本 tag 后，Release workflow 验证该提交并自动发布脚本和校验文件。
+- 新版计划使用 `v0.2.0`，尚未发布；Release workflow 发布管理脚本、安装器与校验文件。
 - 补发已有 tag 时，从 `main` 手动运行 Release，输入 tag；需要仓库 Actions 写权限，workflow 必须已在默认分支。
 - 不移动或重建已发布 tag；重复运行只验证已有资产，不覆盖文件。不完整或冲突的 Release 需人工检查。
 - 上传资产验证成功前保持草稿；补发旧版本不会替换较新版本的 Latest 标记。

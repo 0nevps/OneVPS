@@ -66,7 +66,14 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          sha256sum onevps.sh > SHA256SUMS
+          assets=(onevps.sh)
+          if [[ -f install.sh ]]; then
+            grep -Fqx "ONEVPS_VERSION=$TAG" onevps.sh
+            assets+=(install.sh)
+          fi
+          sha256sum "${assets[@]}" > SHA256SUMS
+          patterns=(--pattern SHA256SUMS)
+          for asset in "${assets[@]}"; do patterns+=(--pattern "$asset"); done
           sha256sum --check SHA256SUMS
 
           # Listing releases distinguishes a missing release from an API failure.
@@ -79,8 +86,8 @@ jobs:
             fi
             work=$(mktemp -d)
             trap 'rm -rf "$work"' EXIT
-            gh release download "$TAG" --pattern onevps.sh --pattern SHA256SUMS --dir "$work"
-            cmp onevps.sh "$work/onevps.sh"
+            gh release download "$TAG" "${patterns[@]}" --dir "$work"
+            for asset in "${assets[@]}"; do cmp "$asset" "$work/$asset"; done
             cmp SHA256SUMS "$work/SHA256SUMS"
             printf 'Release %s already has identical assets.\n' "$TAG"
             exit 0
@@ -96,11 +103,11 @@ jobs:
           fi
 
           # The existing tag pins the commit; a historical --target can require workflow-write access.
-          gh release create "$TAG" onevps.sh SHA256SUMS \
+          gh release create "$TAG" "${assets[@]}" SHA256SUMS \
             --verify-tag --title "OneVPS $TAG" --generate-notes --draft
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
-          gh release download "$TAG" --pattern onevps.sh --pattern SHA256SUMS --dir "$work"
-          cmp onevps.sh "$work/onevps.sh"
+          gh release download "$TAG" "${patterns[@]}" --dir "$work"
+          for asset in "${assets[@]}"; do cmp "$asset" "$work/$asset"; done
           cmp SHA256SUMS "$work/SHA256SUMS"
           gh release edit "$TAG" --draft=false --latest="$make_latest"

@@ -31,7 +31,8 @@ jobs:
           ref: ${{ inputs.ref || '' }}
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh tests/test_onevps.sh tests/test_singbox.sh
+        run: |
+          for script in onevps.sh tests/*.sh; do bash -n "$script"; done
 
       - name: Install test dependencies
         run: |
@@ -39,12 +40,21 @@ jobs:
           sudo apt-get install --no-install-recommends --yes jq openssl shellcheck python3
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_singbox.sh
+        run: shellcheck --severity=warning onevps.sh tests/*.sh
+
+      - name: Validate release installer when present
+        run: |
+          if [[ -f install.sh ]]; then
+            bash -n install.sh tests/test_install.sh
+            shellcheck --severity=warning install.sh tests/test_install.sh
+            bash tests/test_install.sh
+          fi
 
       - name: Test configuration generation
         run: bash tests/test_onevps.sh
 
       - name: Validate configuration and forwarding with sing-box 1.14.3
+        if: hashFiles('tests/test_singbox.sh') != ''
         run: |
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
@@ -57,6 +67,25 @@ jobs:
           mkdir "$work/core"
           tar -xzf "$work/sing-box.tar.gz" -C "$work/core"
           SINGBOX_TEST_BIN="$work/core/sing-box-1.14.3-linux-amd64/sing-box" bash tests/test_singbox.sh
+
+      # Historical release backfills still validate their original core, not sing-box.
+      - name: Validate historical Xray outbounds
+        if: hashFiles('tests/test_singbox.sh') == '' && hashFiles('tests/test_xray_outbounds.sh') != ''
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip \
+            -o "$work/xray.zip"
+          printf '%s  %s\n' \
+            23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae \
+            "$work/xray.zip" | sha256sum --check -
+          mkdir "$work/core"
+          unzip -q "$work/xray.zip" -d "$work/core"
+          XRAY_TEST_BIN="$work/core/xray" bash tests/test_xray_outbounds.sh
+
+      - name: Require a core validation suite
+        run: test -f tests/test_singbox.sh || test -f tests/test_xray_outbounds.sh
 
       - name: Lint Markdown
         run: npx --yes markdownlint-cli2@0.23.2 "**/*.md"

@@ -36,25 +36,42 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 
 ### 获取脚本
 
-开发期间请在临时环境审阅指定的 `main` 提交：
+**新版 sing-box Release 尚未发布，下方 `v0.2.0` 是计划中的首个版本。**
+此命令仅供**发布后**使用，目前应明确失败，不能安装旧 Xray `v0.1.2`，也不会退回 `main`。
+先审阅发布说明和安装器。在受支持的 Linux 上准备 Bash、curl、jq、OpenSSL、SHA-256 工具、
+CA 证书和 sudo 后，使用一条命令下载到私有目录、校验再执行：
 
 ```bash
-git clone https://github.com/0nevps/OneVPS.git
-cd OneVPS
-git switch main
-git rev-parse HEAD
-less onevps.sh
-sudo bash onevps.sh
+bash -c 'set -euo pipefail; umask 077; v=v0.2.0; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; u="https://github.com/0nevps/OneVPS/releases/download/$v"; for f in install.sh SHA256SUMS; do curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"; done; h=$(awk '\''$2 == "install.sh" && NF == 2 {print $1}'\'' "$d/SHA256SUMS"); [[ "$h" =~ ^[0-9a-f]{64}$ ]]; printf "%s  %s\n" "$h" "$d/install.sh" | sha256sum -c -; bash -n "$d/install.sh"; sudo bash "$d/install.sh" "$v"'
 ```
 
-脚本以 root 运行，可能修改服务、防火墙规则与可选内核参数。
-先从菜单安装核心，再添加 Reality、Hysteria 2 或 Snell 节点。
-核心固定为官方 **sing-box v1.14.3**，不跟随 latest；安装前对下载归档执行 SHA-256 校验，校验失败必须停止安装。
+必须在交互终端执行，**不要使用 `curl | bash`**。没有 sudo 的 root 用户可将 `sudo bash` 换成 `bash`。
+引导命令从同一个固定 tag 下载 `install.sh` 与清单；安装器验证该 tag 是正式、非草稿、非预发布版本，
+再下载同 tag 的管理脚本和清单，只校验 `onevps.sh` 的唯一摘要条目，不访问清单内其他路径。
+校验和能检测损坏，**不能证明发布者身份**；安装器、脚本与清单共享 GitHub/HTTPS 信任边界。
+不需要 GitHub token 或其他凭据，curl 忽略本地 curlrc 配置。
 
-OneVPS 正式版本包含 `onevps.sh` 与 `SHA256SUMS`。**旧发行版可能仍使用 Xray**，下载前请确认发布说明。
-待 sing-box 版本发布后，将同一版本的两项资产下载到干净目录，执行 `sha256sum --check SHA256SUMS`，
-审阅脚本后再运行。校验和可检测内容损坏，但不能独立证明发布者身份。
-发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md#releases)；[CHANGELOG.md](CHANGELOG.md) 保留历史发布记录。
+安装器原子安装到 `/usr/local/bin/onevps`，拒绝非托管文件和符号链接；下载、摘要或语法失败保留原脚本。
+需要 root（可通过 sudo）、Linux/systemd 和 amd64/arm64/armv7。首次运行确认安装固定核心后，选择
+Reality、Hysteria 2 或 Snell，并继续使用已有参数交互；已有托管安装跳过核心安装，不重置配置。
+不自动启用 BBR、TCP 优化或 Realm；保留现有核心冲突保护与激活回滚。
+
+```bash
+sudo onevps                       # 再次管理，或继续首次安装
+onevps --version                 # 无需 root，显示脚本版本和固定核心版本
+sudo onevps update               # 最新兼容正式版，仅更新管理脚本
+sudo onevps update v0.2.0        # 指定稳定版本，需等待发布
+```
+
+当前兼容范围为 `v0.x` 内的稳定版 `v0.2.0+`，拒绝 `v0.1.2`、预发布和未来主版本。
+未指定版本时仅解析一次 GitHub Latest，再锁定 tag 下载两项资产；Latest 不兼容就明确失败，不退回 `main`。
+更新不获取执行另一个安装器，不升级核心、不修改节点、不重启服务；核心更新保留为明确的菜单操作。
+核心固定为官方 **sing-box v1.14.3**，安装前校验归档 SHA-256。
+源码目前声明的是计划版本 `v0.2.0`，不代表该版本已经发布。
+
+开发期间只能在临时环境审阅指定仓库提交后运行 `sudo bash onevps.sh`；该方式绕过发布安装，
+不会安装 `onevps` 命令。发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md#releases)；
+[CHANGELOG.md](CHANGELOG.md) 保留历史发布记录。
 
 ## Snell
 

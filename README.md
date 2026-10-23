@@ -38,27 +38,44 @@ Distribution and architecture compatibility still needs runtime validation.
 
 ### Obtaining the script
 
-During development, inspect a specific `main` commit in a disposable environment:
+**The new sing-box release is not published yet; `v0.2.0` below is the planned first release.**
+The command is for use **after publication** and currently must fail, not install Xray `v0.1.2` or fall back to `main`.
+Review the release and installer first. On a supported Linux host, with Bash, curl, jq, OpenSSL, SHA-256 tools,
+CA certificates and sudo installed, download to a private directory, verify, then execute (one command):
 
 ```bash
-git clone https://github.com/0nevps/OneVPS.git
-cd OneVPS
-git switch main
-git rev-parse HEAD
-less onevps.sh
-sudo bash onevps.sh
+bash -c 'set -euo pipefail; umask 077; v=v0.2.0; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; u="https://github.com/0nevps/OneVPS/releases/download/$v"; for f in install.sh SHA256SUMS; do curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"; done; h=$(awk '\''$2 == "install.sh" && NF == 2 {print $1}'\'' "$d/SHA256SUMS"); [[ "$h" =~ ^[0-9a-f]{64}$ ]]; printf "%s  %s\n" "$h" "$d/install.sh" | sha256sum -c -; bash -n "$d/install.sh"; sudo bash "$d/install.sh" "$v"'
 ```
 
-The script runs as root and can change services, firewall rules and optional kernel settings.
-Use the install-core menu entry first, then add a Reality, Hysteria 2 or Snell node.
-The core is pinned to the official **sing-box v1.14.3** release, not a floating latest version;
-installation verifies the downloaded archive's SHA-256 before installing it. Verification failure must stop installation.
+Run as an interactive terminal command, **not** `curl | bash`. Root users without sudo can replace `sudo bash`
+with `bash`. The bootstrap downloads `install.sh` and its manifest from the same fixed tag; the installer then
+resolves that official, non-draft, non-prerelease tag and verifies only `onevps.sh` from that same tag.
+Checksums detect corruption, **not publisher identity**: the installer, manifest and script share the GitHub/HTTPS
+trust boundary. No credentials or GitHub token are required; curl ignores local curlrc configuration.
 
-Versioned OneVPS releases include `onevps.sh` and `SHA256SUMS`. **Older releases may still use Xray**;
-check the release notes before downloading. Once a sing-box release is available, download both assets from
-that same version into a clean directory, run `sha256sum --check SHA256SUMS`, inspect the script, then execute it.
-Checksums detect corruption but do not independently establish the publisher's identity.
-See [release procedures](CONTRIBUTING.md#releases); [CHANGELOG.md](CHANGELOG.md) retains historical release notes.
+The installer atomically installs `/usr/local/bin/onevps`, refusing unmanaged files and symlinks. Download,
+checksum or syntax failures preserve the existing script. It requires root (use sudo), Linux/systemd and
+amd64/arm64/armv7. First run asks to install the pinned core and then choose Reality, Hysteria 2 or Snell;
+existing managed installations skip core installation and keep their configuration. BBR, TCP tuning and Realm
+are never enabled automatically. Core conflicts and activation rollback retain their existing protections.
+
+```bash
+sudo onevps                       # return to management / resume first-run setup
+onevps --version                 # script version and pinned core version, no root required
+sudo onevps update               # latest compatible stable release, management script ONLY
+sudo onevps update v0.2.0        # explicit stable version (after publication)
+```
+
+Compatibility is currently stable `v0.2.0+` within `v0.x`; `v0.1.2`, prereleases and future major versions are
+rejected. Without a version, the installer/update resolves GitHub Latest once and pins its tag for both downloads;
+if Latest is incompatible, it fails explicitly. There is no `main` fallback. Updates do not execute another
+installer and never upgrade the core, change nodes or restart services. The existing core menu action remains
+explicit. The core stays pinned to official **sing-box v1.14.3**, with archive SHA-256 verification.
+The source currently declares the planned `v0.2.0`; that alone is not evidence of a published release.
+
+For development only, inspect a specific repository commit in a disposable environment, then run
+`sudo bash onevps.sh`; this bypasses release installation and does not install the `onevps` command.
+See [release procedures](CONTRIBUTING.md#releases); [CHANGELOG.md](CHANGELOG.md) retains historical notes.
 
 ## Snell
 
