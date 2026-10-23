@@ -1100,6 +1100,89 @@ assert_true "real validator rejects missing core and propagates check failures" 
   grep -q SECRET_CORE_OUTPUT "$2/check.log"
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP"
 
+assert_true "sing-box download progress respects terminals and preserves verification" bash -c '
+  root="$2/download-progress"; mkdir -p "$root"
+  cat > "$root/check.sh" <<'\''CHECK'\''
+set -euo pipefail
+source "$1"
+root="$2"; mode="$3"; expected="$4"
+ARCH=amd64
+asset="sing-box-${SINGBOX_VERSION#v}-linux-$ARCH.tar.gz"
+mkdir -p "$root/fixture/${asset%.tar.gz}" "$root/dest"
+printf "#!/bin/sh\nprintf '\''sing-box version %s\\n'\''\n" "${SINGBOX_VERSION#v}" > "$root/fixture/${asset%.tar.gz}/sing-box"
+tar -czf "$root/archive.tar.gz" -C "$root/fixture" "${asset%.tar.gz}/sing-box"
+fixture_digest=$(openssl dgst -sha256 "$root/archive.tar.gz"); fixture_digest=${fixture_digest##* }
+[[ "$mode" != checksum ]] || fixture_digest=$(printf "%064d" 0)
+curl() {
+  if [[ "$*" == *api.github.com* ]]; then
+    jq -n --arg version "$SINGBOX_VERSION" --arg asset "$asset" --arg digest "sha256:$fixture_digest" \
+      '\''{tag_name:$version,assets:[{name:$asset,digest:$digest,browser_download_url:("https://github.com/SagerNet/sing-box/releases/download/"+$version+"/"+$asset)}]}'\''
+    return
+  fi
+  printf "%s\n" "$@" > "$root/curl-args"
+  [[ "$mode" != failure ]] || return 22
+  local output=""
+  while (( $# )); do
+    if [[ "$1" == -o ]]; then output="$2"; break; fi
+    shift
+  done
+  cp "$root/archive.tar.gz" "$output"
+}
+status=0
+download_singbox "$root/dest" || status=$?
+grep -qx -- "$expected" "$root/curl-args"
+if [[ "$expected" == --silent ]]; then
+  ! grep -qx -- --progress-bar "$root/curl-args"
+else
+  ! grep -qx -- --silent "$root/curl-args"
+fi
+if [[ "$mode" == success ]]; then
+  [[ "$status" == 0 && -x "$root/dest/sing-box" ]]
+else
+  [[ "$status" != 0 && ! -e "$root/dest/sing-box" ]]
+fi
+CHECK
+  python3 - "$1" "$root" <<'\''PY'\''
+import os
+import pathlib
+import pty
+import select
+import subprocess
+import sys
+
+source, root = sys.argv[1:]
+for terminal_stdout, terminal_stderr in [(False, False), (True, True), (False, True), (True, False)]:
+    for mode in ["success", "failure", "checksum"]:
+        work = pathlib.Path(root) / f"{terminal_stdout}-{terminal_stderr}-{mode}"
+        work.mkdir()
+        master, slave = pty.openpty()
+        expected = "--progress-bar" if terminal_stdout and terminal_stderr else "--silent"
+        try:
+            result = subprocess.run(
+                ["bash", str(pathlib.Path(root) / "check.sh"), source, str(work), mode, expected],
+                stdout=slave if terminal_stdout else subprocess.PIPE,
+                stderr=slave if terminal_stderr else subprocess.PIPE,
+                timeout=30,
+            )
+            output = result.stdout or b""
+            errors = result.stderr or b""
+            # Drain before closing the slave: macOS may discard unread PTY data.
+            while select.select([master], [], [], 0.1)[0]:
+                chunk = os.read(master, 4096)
+                if not chunk:
+                    break
+                output += chunk
+        finally:
+            os.close(slave)
+            os.close(master)
+        assert result.returncode == 0, (work, output, errors)
+        assert b"downloading sing-box" in output, (work, output)
+        assert (b"download complete; verifying" in output) == (mode != "failure"), (work, output)
+        if mode == "checksum":
+            assert b"SHA-256 mismatch" in output + errors, (work, output, errors)
+PY
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP"
+
 # Every install path and runtime effect is isolated; no host services are touched.
 assert_true "fresh installation checks only OneVPS conflicts and verifies ownership" bash -c '
   source "$1"

@@ -308,17 +308,23 @@ check_singbox_conflicts() {
 # Extract one regular member to stdout: never unpack archive paths or links.
 download_singbox() {
   local dest="$1" asset url digest actual member listing
+  local -a progress=(--silent)
   case "$ARCH" in amd64|arm64|armv7) ;; *) return 1 ;; esac
   asset="sing-box-${SINGBOX_VERSION#v}-linux-$ARCH.tar.gz"
   member="${asset%.tar.gz}/sing-box"
   mkdir "$dest/download" || return 1
+  info "fetching sing-box $SINGBOX_VERSION release information ($ARCH)"
   curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 \
     "https://api.github.com/repos/SagerNet/sing-box/releases/tags/$SINGBOX_VERSION" > "$dest/download/release.json" || return 1
   url=$(jq -er --arg name "$asset" --arg version "$SINGBOX_VERSION" \
     'select(.tag_name == $version) | [.assets[] | select(.name == $name)] | select(length == 1) | .[0].browser_download_url' "$dest/download/release.json") || return 1
   digest=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest' "$dest/download/release.json") || return 1
   [[ "$url" == "https://github.com/SagerNet/sing-box/releases/download/$SINGBOX_VERSION/$asset" && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
-  curl -fsSL --proto '=https' --connect-timeout 15 --max-time 180 "$url" -o "$dest/download/archive.tar.gz" || return 1
+  info "downloading sing-box $SINGBOX_VERSION ($ARCH)"
+  # curl writes progress to stderr; keep redirected output free of dynamic bars.
+  if [[ -t 1 && -t 2 ]]; then progress=(--progress-bar); fi
+  curl -fSL "${progress[@]}" --proto '=https' --connect-timeout 15 --max-time 180 "$url" -o "$dest/download/archive.tar.gz" || return 1
+  info 'download complete; verifying sing-box checksum and binary'
   actual=$(openssl dgst -sha256 "$dest/download/archive.tar.gz") || return 1
   [[ "${actual##* }" == "${digest#sha256:}" ]] || { err 'sing-box SHA-256 mismatch'; return 1; }
   listing=$(tar -tvzf "$dest/download/archive.tar.gz" "$member") || return 1
