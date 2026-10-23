@@ -40,18 +40,45 @@ Distribution and architecture compatibility still needs runtime validation.
 
 **The new sing-box release is not published yet; `v0.2.0` below is the planned first release.**
 The command is for use **after publication** and currently must fail, not install Xray `v0.1.2` or fall back to `main`.
-Review the release and installer first. On a supported Linux host, with Bash, curl, jq, OpenSSL, SHA-256 tools,
-CA certificates and sudo installed, download to a private directory, verify, then execute (one command):
+Review the release and installer first. On a supported Linux host, with Bash, curl, jq, OpenSSL,
+CA certificates and sudo installed, download completely to a private temporary file, then execute:
 
 ```bash
-bash -c 'set -euo pipefail; umask 077; v=v0.2.0; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; u="https://github.com/0nevps/OneVPS/releases/download/$v"; for f in install.sh SHA256SUMS; do curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"; done; h=$(awk '\''$2 == "install.sh" && NF == 2 {print $1}'\'' "$d/SHA256SUMS"); [[ "$h" =~ ^[0-9a-f]{64}$ ]]; printf "%s  %s\n" "$h" "$d/install.sh" | sha256sum -c -; bash -n "$d/install.sh"; sudo bash "$d/install.sh" "$v"'
+bash -c 'f=$(mktemp) || exit; trap '\''rm -f "$f"'\'' EXIT; curl -q -fsSL --proto =https --proto-redir =https https://github.com/0nevps/OneVPS/releases/download/v0.2.0/install.sh -o "$f" && sudo bash "$f" v0.2.0'
 ```
 
 Run as an interactive terminal command, **not** `curl | bash`. Root users without sudo can replace `sudo bash`
-with `bash`. The bootstrap downloads `install.sh` and its manifest from the same fixed tag; the installer then
-resolves that official, non-draft, non-prerelease tag and verifies only `onevps.sh` from that same tag.
+with `bash`. This short command trusts GitHub/HTTPS and does **not** verify the installer's checksum before execution.
+The installer still verifies that the requested tag is official, non-draft and non-prerelease, then downloads
+and verifies `onevps.sh` from that same tag. No credentials or GitHub token are required; curl ignores local curlrc.
+
+#### Optional: verify the installer checksum before execution
+
+This alternative also requires `sha256sum`. Copy the entire block into Bash:
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  v=v0.2.0
+  d=$(mktemp -d)
+  trap 'rm -rf "$d"' EXIT
+  u="https://github.com/0nevps/OneVPS/releases/download/$v"
+  for f in install.sh SHA256SUMS; do
+    curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"
+  done
+  h=$(awk '$2 == "install.sh" && NF == 2 {print $1}' "$d/SHA256SUMS")
+  [[ "$h" =~ ^[0-9a-f]{64}$ ]]
+  printf '%s  %s\n' "$h" "$d/install.sh" | sha256sum -c -
+  bash -n "$d/install.sh"
+  sudo bash "$d/install.sh" "$v"
+)
+```
+
 Checksums detect corruption, **not publisher identity**: the installer, manifest and script share the GitHub/HTTPS
-trust boundary. No credentials or GitHub token are required; curl ignores local curlrc configuration.
+trust boundary. Only the installer's exact checksum entry is used; other manifest paths are not accessed.
+
+#### Installation behavior
 
 The installer atomically installs `/usr/local/bin/onevps`, refusing unmanaged files and symlinks. Download,
 checksum or syntax failures preserve the existing script. It requires root (use sudo), Linux/systemd and

@@ -38,18 +38,45 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 
 **新版 sing-box Release 尚未发布，下方 `v0.2.0` 是计划中的首个版本。**
 此命令仅供**发布后**使用，目前应明确失败，不能安装旧 Xray `v0.1.2`，也不会退回 `main`。
-先审阅发布说明和安装器。在受支持的 Linux 上准备 Bash、curl、jq、OpenSSL、SHA-256 工具、
-CA 证书和 sudo 后，使用一条命令下载到私有目录、校验再执行：
+先审阅发布说明和安装器。在受支持的 Linux 上准备 Bash、curl、jq、OpenSSL、CA 证书和 sudo 后，
+使用一条命令完整下载到私有临时文件，再执行：
 
 ```bash
-bash -c 'set -euo pipefail; umask 077; v=v0.2.0; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; u="https://github.com/0nevps/OneVPS/releases/download/$v"; for f in install.sh SHA256SUMS; do curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"; done; h=$(awk '\''$2 == "install.sh" && NF == 2 {print $1}'\'' "$d/SHA256SUMS"); [[ "$h" =~ ^[0-9a-f]{64}$ ]]; printf "%s  %s\n" "$h" "$d/install.sh" | sha256sum -c -; bash -n "$d/install.sh"; sudo bash "$d/install.sh" "$v"'
+bash -c 'f=$(mktemp) || exit; trap '\''rm -f "$f"'\'' EXIT; curl -q -fsSL --proto =https --proto-redir =https https://github.com/0nevps/OneVPS/releases/download/v0.2.0/install.sh -o "$f" && sudo bash "$f" v0.2.0'
 ```
 
 必须在交互终端执行，**不要使用 `curl | bash`**。没有 sudo 的 root 用户可将 `sudo bash` 换成 `bash`。
-引导命令从同一个固定 tag 下载 `install.sh` 与清单；安装器验证该 tag 是正式、非草稿、非预发布版本，
-再下载同 tag 的管理脚本和清单，只校验 `onevps.sh` 的唯一摘要条目，不访问清单内其他路径。
-校验和能检测损坏，**不能证明发布者身份**；安装器、脚本与清单共享 GitHub/HTTPS 信任边界。
+短命令依赖 GitHub/HTTPS 信任，执行前**不校验安装器自身的摘要**。安装器仍会验证指定 tag 是正式、
+非草稿、非预发布版本，再下载并校验同 tag 的 `onevps.sh`。
 不需要 GitHub token 或其他凭据，curl 忽略本地 curlrc 配置。
+
+#### 可选：执行前校验安装器摘要
+
+此方案额外需要 `sha256sum`。将整个代码块复制到 Bash 执行：
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  v=v0.2.0
+  d=$(mktemp -d)
+  trap 'rm -rf "$d"' EXIT
+  u="https://github.com/0nevps/OneVPS/releases/download/$v"
+  for f in install.sh SHA256SUMS; do
+    curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"
+  done
+  h=$(awk '$2 == "install.sh" && NF == 2 {print $1}' "$d/SHA256SUMS")
+  [[ "$h" =~ ^[0-9a-f]{64}$ ]]
+  printf '%s  %s\n' "$h" "$d/install.sh" | sha256sum -c -
+  bash -n "$d/install.sh"
+  sudo bash "$d/install.sh" "$v"
+)
+```
+
+校验和能检测损坏，**不能证明发布者身份**；安装器、脚本与清单共享 GitHub/HTTPS 信任边界。
+仅使用安装器的精确摘要条目，不访问清单内其他路径。
+
+#### 安装行为
 
 安装器原子安装到 `/usr/local/bin/onevps`，拒绝非托管文件和符号链接；下载、摘要或语法失败保留原脚本。
 需要 root（可通过 sudo）、Linux/systemd 和 amd64/arm64/armv7。首次运行确认安装固定核心后，选择
