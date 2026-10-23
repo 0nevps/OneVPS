@@ -1068,37 +1068,27 @@ assert_true "real validator rejects missing core and propagates check failures" 
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP"
 
 # Every install path and runtime effect is isolated; no host services are touched.
-assert_true "fresh installation refuses conflicts and verifies ownership" bash -c '
+assert_true "fresh installation checks only OneVPS conflicts and verifies ownership" bash -c '
   source "$1"
   root="$2/install-ownership"; mkdir -p "$root"
   SINGBOX_DIR="$root/config"; SINGBOX_BIN="$root/core"
   SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_NODES="$SINGBOX_DIR/nodes.json"
   SINGBOX_SERVICE="$root/core.service"
-  conflict=""; failed_query=""; template_state=disabled; instance_state=running
+  conflict=""; failed_query=""
   missing_status=0; failed_output=""
   systemctl() {
+    [[ "$*" == "show -p LoadState --value onevps-sing-box.service" ]] || {
+      printf "unexpected service query: %s\n" "$*" >&2; return 99;
+    }
     [[ "$1" != "$failed_query" ]] || { printf "%s" "$failed_output"; return 1; }
-    case "$1" in
-      show)
-        if [[ "${@: -1}" == xray@.service ]]; then
-          printf "template is not a valid unit for show\n" >&2; return 1
-        fi
-        if [[ "$*" == *"$conflict" && -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; return "$missing_status"; fi ;;
-      list-unit-files)
-        [[ "$*" == "list-unit-files --no-legend --no-pager xray@*.service" ]] || return 99
-        if [[ "$conflict" == xray@.service || "$conflict" == xray@file.service ]]; then printf "%s %s -\n" "$conflict" "$template_state"; fi ;;
-      list-units)
-        [[ "$*" == "list-units --all --plain --no-legend --no-pager xray@*.service" ]] || return 99
-        if [[ "$conflict" == xray@test.service ]]; then printf "xray@test.service loaded %s Xray\n" "$instance_state"; fi ;;
-      *) return 99 ;;
-    esac
+    if [[ -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; return "$missing_status"; fi
   }
   check_singbox_conflicts || exit 1
   missing_status=1
   check_singbox_conflicts || exit 1
   # Exercise first-run orchestration in a fresh shell with errexit enabled.
   export -f systemctl
-  export conflict failed_query failed_output missing_status template_state instance_state
+  export conflict failed_query failed_output missing_status
   bash -c '\''
     source "$1"
     SINGBOX_DIR="$2/config"; SINGBOX_BIN="$2/core"
@@ -1112,24 +1102,11 @@ assert_true "fresh installation refuses conflicts and verifies ownership" bash -
   '\'' _ "$1" "$root" > "$root/startup.log" || exit 1
   grep -qx "install reached" "$root/startup.log" || exit 1
   grep -qx "startup continued" "$root/startup.log" || exit 1
-  for conflict in xray.service xray@.service xray@file.service xray@test.service sing-box.service singbox.service onevps-sing-box.service; do
-    if check_singbox_conflicts; then exit 1; fi
-  done
-  conflict=xray@.service
-  for template_state in enabled disabled masked; do
-    if check_singbox_conflicts; then exit 1; fi
-  done
-  conflict=xray@test.service
-  for instance_state in "active running" "inactive dead" "failed failed"; do
-    if check_singbox_conflicts; then exit 1; fi
-  done
+  conflict=onevps-sing-box.service
+  if check_singbox_conflicts; then exit 1; fi
   conflict=""
-  for failed_query in show list-unit-files list-units; do
-    if check_singbox_conflicts 2> "$root/query-error"; then exit 1; fi
-    grep -q "failed to query" "$root/query-error" || exit 1
-  done
   failed_query=show
-  for failed_output in loaded error $'\''not-found\nerror'\''; do
+  for failed_output in "" loaded error $'\''not-found\nerror'\''; do
     if check_singbox_conflicts 2> "$root/query-error"; then exit 1; fi
     grep -q "failed to query" "$root/query-error" || exit 1
   done

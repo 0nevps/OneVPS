@@ -285,27 +285,8 @@ singbox_owned() {
 }
 
 check_singbox_conflicts() {
-  local p unit loaded
-  # No migration and no dual-core installation, even if the old unit is stopped.
-  for p in /usr/local/etc/xray /etc/xray /etc/sing-box /usr/local/etc/sing-box /etc/singbox /usr/local/etc/singbox; do
-    if [[ -e "$p" || -L "$p" ]]; then err "conflicting configuration: $p"; return 1; fi
-  done
-  for unit in xray.service sing-box.service singbox.service; do
-    # Missing units may report not-found with a nonzero exit status.
-    loaded=$(systemctl show -p LoadState --value "$unit") || {
-      [[ "$loaded" == not-found ]] || { err "failed to query service: $unit"; return 1; }
-    }
-    if [[ "$loaded" != not-found ]]; then err "conflicting service: $unit"; return 1; fi
-  done
-  # Templates cannot be queried with show; also reject instances still in memory.
-  loaded=$(systemctl list-unit-files --no-legend --no-pager 'xray@*.service') || {
-    err 'failed to query xray@*.service unit files'; return 1;
-  }
-  [[ -z "$loaded" ]] || { err 'conflicting service: xray@*.service (unit files)'; return 1; }
-  loaded=$(systemctl list-units --all --plain --no-legend --no-pager 'xray@*.service') || {
-    err 'failed to query xray@*.service loaded instances'; return 1;
-  }
-  [[ -z "$loaded" ]] || { err 'conflicting service: xray@*.service (loaded instances)'; return 1; }
+  local p loaded
+  # Protect OneVPS-owned resources; other proxies are checked by port usage.
   if singbox_owned; then
     [[ -x "$SINGBOX_BIN" && -f "$SINGBOX_CONF" && -f "$SINGBOX_NODES" ]] || return 1
     validate_node_metadata "$SINGBOX_NODES" || return 1
