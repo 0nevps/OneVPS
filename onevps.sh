@@ -2219,7 +2219,7 @@ main_menu() {
     clear
     cat <<'EOF'
  ╔════════════════════════════════════════════════╗
- ║   OneVPS - sing-box Reality / Vision / uTLS     ║
+ ║   OneVPS - sing-box Reality / Vision / uTLS    ║
  ╚════════════════════════════════════════════════╝
 EOF
     status_line
