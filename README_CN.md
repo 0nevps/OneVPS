@@ -36,49 +36,23 @@ OneVPS 是在 Linux VPS 上部署与管理 **sing-box v1.14.3** 节点的 Bash �
 
 ### 获取脚本
 
-**新版 sing-box Release 尚未发布，下方 `v0.2.0` 是计划中的首个版本。**
-此命令仅供**发布后**使用，目前应明确失败，不能安装旧 Xray `v0.1.2`，也不会退回 `main`。
-先审阅发布说明和安装器。在受支持的 Linux 上准备 Bash、curl、jq、OpenSSL、CA 证书和 sudo 后，
-使用一条命令完整下载到私有临时文件，再执行：
+安装与更新直接下载仓库 `main` 分支的当前文件，不依赖 GitHub Release、Release API、tag 或校验清单。
+执行前先审阅源码。在受支持的 Linux 上准备 Bash、curl、CA 证书和 sudo 后，从可信且可写的目录运行：
 
 ```bash
-bash -c 'f=$(mktemp) || exit; trap '\''rm -f "$f"'\'' EXIT; curl -q -fsSL --proto =https --proto-redir =https https://github.com/0nevps/OneVPS/releases/download/v0.2.0/install.sh -o "$f" && sudo bash "$f" v0.2.0'
+curl -fsSLo install.sh https://raw.githubusercontent.com/0nevps/OneVPS/main/install.sh && sudo bash install.sh
 ```
 
-必须在交互终端执行，**不要使用 `curl | bash`**。没有 sudo 的 root 用户可将 `sudo bash` 换成 `bash`。
-短命令依赖 GitHub/HTTPS 信任，执行前**不校验安装器自身的摘要**。安装器仍会验证指定 tag 是正式、
-非草稿、非预发布版本，再下载并校验同 tag 的 `onevps.sh`。
-不需要 GitHub token 或其他凭据，curl 忽略本地 curlrc 配置。
-
-#### 可选：执行前校验安装器摘要
-
-此方案额外需要 `sha256sum`。将整个代码块复制到 Bash 执行：
-
-```bash
-(
-  set -euo pipefail
-  umask 077
-  v=v0.2.0
-  d=$(mktemp -d)
-  trap 'rm -rf "$d"' EXIT
-  u="https://github.com/0nevps/OneVPS/releases/download/$v"
-  for f in install.sh SHA256SUMS; do
-    curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"
-  done
-  h=$(awk '$2 == "install.sh" && NF == 2 {print $1}' "$d/SHA256SUMS")
-  [[ "$h" =~ ^[0-9a-f]{64}$ ]]
-  printf '%s  %s\n' "$h" "$d/install.sh" | sha256sum -c -
-  bash -n "$d/install.sh"
-  sudo bash "$d/install.sh" "$v"
-)
-```
-
-校验和能检测损坏，**不能证明发布者身份**；安装器、脚本与清单共享 GitHub/HTTPS 信任边界。
-仅使用安装器的精确摘要条目，不访问清单内其他路径。
+命令会保存（或覆盖）当前目录下的 `install.sh`。必须在交互终端执行，**不要使用 `curl | bash`**。
+没有 sudo 的 root 用户可将 `sudo bash` 换成 `bash`。
+命令与下载的管理脚本依赖 GitHub/HTTPS 信任，不进行 Release 摘要或签名校验。
+安装器下载 `main/onevps.sh` 时仅允许 HTTPS 重定向并忽略本地 curlrc，无需 token。
+两次下载之间 `main` 可能变化，不保证不可变的发布快照。
 
 #### 安装行为
 
-安装器原子安装到 `/usr/local/bin/onevps`，拒绝非托管文件和符号链接；下载、摘要或语法失败保留原脚本。
+安装器检查 Bash 语法、托管标记和版本字段基本格式后，原子安装到 `/usr/local/bin/onevps` 并启动。
+拒绝非托管目标和符号链接；下载或验证失败保留原脚本。这些检查不等于发布者身份验证。
 需要 root（可通过 sudo）、Linux/systemd 和 amd64/arm64/armv7。首次运行确认安装固定核心后，选择
 Reality、Hysteria 2 或 Snell，并继续使用已有参数交互；已有托管安装跳过核心安装，不重置配置。
 不自动启用 BBR、TCP 优化或 Realm；保留现有核心冲突保护与激活回滚。
@@ -86,18 +60,16 @@ Reality、Hysteria 2 或 Snell，并继续使用已有参数交互；已有托�
 ```bash
 sudo onevps                       # 再次管理，或继续首次安装
 onevps --version                 # 无需 root，显示脚本版本和固定核心版本
-sudo onevps update               # 最新兼容正式版，仅更新管理脚本
-sudo onevps update v0.2.0        # 指定稳定版本，需等待发布
+sudo onevps update               # 当前 main，仅更新管理脚本
 ```
 
-当前兼容范围为 `v0.x` 内的稳定版 `v0.2.0+`，拒绝 `v0.1.2`、预发布和未来主版本。
-未指定版本时仅解析一次 GitHub Latest，再锁定 tag 下载两项资产；Latest 不兼容就明确失败，不退回 `main`。
-更新不获取执行另一个安装器，不升级核心、不修改节点、不重启服务；核心更新保留为明确的菜单操作。
+`install.sh` 与 `onevps update` 均不接受版本参数。更新直接下载同一份 `main` 原始脚本，
+不获取执行另一个安装器，不升级核心、不修改节点、不重启服务；核心更新保留为明确的菜单操作。
 核心固定为官方 **sing-box v1.14.3**，安装前校验归档 SHA-256。
-源码目前声明的是计划版本 `v0.2.0`，不代表该版本已经发布。
+脚本版本字段仅供显示，不代表已经发布，也不能唯一标识 `main` 提交。
 
-开发期间只能在临时环境审阅指定仓库提交后运行 `sudo bash onevps.sh`；该方式绕过发布安装，
-不会安装 `onevps` 命令。发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md#releases)；
+开发时可在临时环境审阅指定仓库提交后运行 `sudo bash onevps.sh`，该方式不会安装 `onevps` 命令。
+Release 发布功能独立保留，不作为安装前提；流程见 [CONTRIBUTING.md](CONTRIBUTING.md#releases)。
 [CHANGELOG.md](CHANGELOG.md) 保留历史发布记录。
 
 ## Snell

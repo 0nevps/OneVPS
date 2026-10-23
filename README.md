@@ -38,71 +38,46 @@ Distribution and architecture compatibility still needs runtime validation.
 
 ### Obtaining the script
 
-**The new sing-box release is not published yet; `v0.2.0` below is the planned first release.**
-The command is for use **after publication** and currently must fail, not install Xray `v0.1.2` or fall back to `main`.
-Review the release and installer first. On a supported Linux host, with Bash, curl, jq, OpenSSL,
-CA certificates and sudo installed, download completely to a private temporary file, then execute:
+Installation and updates download the current files from the repository's `main` branch; no GitHub Release,
+Release API, tag or checksum manifest is required. Review the source before running it. On a supported Linux
+host with Bash, curl, CA certificates and sudo, run from a trusted writable directory:
 
 ```bash
-bash -c 'f=$(mktemp) || exit; trap '\''rm -f "$f"'\'' EXIT; curl -q -fsSL --proto =https --proto-redir =https https://github.com/0nevps/OneVPS/releases/download/v0.2.0/install.sh -o "$f" && sudo bash "$f" v0.2.0'
+curl -fsSLo install.sh https://raw.githubusercontent.com/0nevps/OneVPS/main/install.sh && sudo bash install.sh
 ```
 
-Run as an interactive terminal command, **not** `curl | bash`. Root users without sudo can replace `sudo bash`
-with `bash`. This short command trusts GitHub/HTTPS and does **not** verify the installer's checksum before execution.
-The installer still verifies that the requested tag is official, non-draft and non-prerelease, then downloads
-and verifies `onevps.sh` from that same tag. No credentials or GitHub token are required; curl ignores local curlrc.
-
-#### Optional: verify the installer checksum before execution
-
-This alternative also requires `sha256sum`. Copy the entire block into Bash:
-
-```bash
-(
-  set -euo pipefail
-  umask 077
-  v=v0.2.0
-  d=$(mktemp -d)
-  trap 'rm -rf "$d"' EXIT
-  u="https://github.com/0nevps/OneVPS/releases/download/$v"
-  for f in install.sh SHA256SUMS; do
-    curl -q -fsSL --proto =https --proto-redir =https "$u/$f" -o "$d/$f"
-  done
-  h=$(awk '$2 == "install.sh" && NF == 2 {print $1}' "$d/SHA256SUMS")
-  [[ "$h" =~ ^[0-9a-f]{64}$ ]]
-  printf '%s  %s\n' "$h" "$d/install.sh" | sha256sum -c -
-  bash -n "$d/install.sh"
-  sudo bash "$d/install.sh" "$v"
-)
-```
-
-Checksums detect corruption, **not publisher identity**: the installer, manifest and script share the GitHub/HTTPS
-trust boundary. Only the installer's exact checksum entry is used; other manifest paths are not accessed.
+This saves (or overwrites) `install.sh` in the current directory. Run in an interactive terminal, **not**
+`curl | bash`. Root users without sudo can replace `sudo bash` with `bash`.
+The command and downloaded management script trust GitHub/HTTPS, without a Release checksum or signature check.
+The installer downloads `main/onevps.sh` with HTTPS-only redirects and ignores local curlrc settings; no token
+is needed. `main` can change between downloads and is not an immutable release snapshot.
 
 #### Installation behavior
 
-The installer atomically installs `/usr/local/bin/onevps`, refusing unmanaged files and symlinks. Download,
-checksum or syntax failures preserve the existing script. It requires root (use sudo), Linux/systemd and
-amd64/arm64/armv7. First run asks to install the pinned core and then choose Reality, Hysteria 2 or Snell;
-existing managed installations skip core installation and keep their configuration. BBR, TCP tuning and Realm
-are never enabled automatically. Core conflicts and activation rollback retain their existing protections.
+The installer checks Bash syntax, the managed-script marker and basic version-field format, then atomically
+installs `/usr/local/bin/onevps` and starts it. Unmanaged targets and symlinks are refused; download or validation
+failures preserve the existing script. These checks are not proof of publisher identity.
+It requires root (use sudo), Linux/systemd and amd64/arm64/armv7. First run asks to install the pinned core and
+then choose Reality, Hysteria 2 or Snell; existing managed installations skip core installation and keep their
+configuration. BBR, TCP tuning and Realm are never enabled automatically. Core conflicts and activation rollback
+retain their existing protections.
 
 ```bash
 sudo onevps                       # return to management / resume first-run setup
 onevps --version                 # script version and pinned core version, no root required
-sudo onevps update               # latest compatible stable release, management script ONLY
-sudo onevps update v0.2.0        # explicit stable version (after publication)
+sudo onevps update               # current main, management script ONLY
 ```
 
-Compatibility is currently stable `v0.2.0+` within `v0.x`; `v0.1.2`, prereleases and future major versions are
-rejected. Without a version, the installer/update resolves GitHub Latest once and pins its tag for both downloads;
-if Latest is incompatible, it fails explicitly. There is no `main` fallback. Updates do not execute another
-installer and never upgrade the core, change nodes or restart services. The existing core menu action remains
-explicit. The core stays pinned to official **sing-box v1.14.3**, with archive SHA-256 verification.
-The source currently declares the planned `v0.2.0`; that alone is not evidence of a published release.
+Neither `install.sh` nor `onevps update` accepts a version argument. Updates download the same raw `main` script,
+do not execute another installer, and never upgrade the core, change nodes or restart services.
+The core menu action remains explicit. The core stays pinned to official **sing-box v1.14.3**, with archive
+SHA-256 verification. The script version field is informational, not evidence of a published release or a unique
+`main` commit.
 
-For development only, inspect a specific repository commit in a disposable environment, then run
-`sudo bash onevps.sh`; this bypasses release installation and does not install the `onevps` command.
-See [release procedures](CONTRIBUTING.md#releases); [CHANGELOG.md](CHANGELOG.md) retains historical notes.
+For development, inspect a specific repository commit in a disposable environment, then run
+`sudo bash onevps.sh`; this does not install the `onevps` command.
+Releases remain available independently of installation: see [release procedures](CONTRIBUTING.md#releases).
+[CHANGELOG.md](CHANGELOG.md) retains historical notes.
 
 ## Snell
 

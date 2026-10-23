@@ -95,6 +95,10 @@ Use fresh installations for the rewrite; do not test it by importing or overwrit
 
 ## Releases
 
+Installation and `onevps update` use raw files from repository `main`, without Release API or manifest access.
+They accept no version arguments. Releases and their checksums remain an independent distribution/history feature;
+core archive checksum verification is unchanged.
+
 Push an existing stable version tag such as `v0.2.0` to trigger the Release workflow. It validates the tagged
 commit with the same checks as CI, then publishes `onevps.sh`, `install.sh` and `SHA256SUMS` with generated release notes.
 Only the publishing job has permission to write releases.
@@ -115,11 +119,14 @@ Historical tags without `install.sh` retain their original two-asset manifest an
 CI runs their original pinned Xray suite instead of the sing-box suite. No published asset is replaced.
 `tests/test_install.sh` uses mocked downloads and rewritten fixed paths in disposable copies, never host services
 or the real `/usr/local/bin`. It checks installer/update implementation parity, failure preservation and first-run
-orchestration. Keep the marked release-installation block identical in both standalone scripts; this small deliberate
+orchestration, raw-main-only downloads, script validation and argument rejection. Keep the marked script-installation
+block identical in both standalone scripts; this small deliberate
 duplication avoids downloading/executing an updater or installing an additional runtime helper.
 
 新版 tag 必须与 `ONEVPS_VERSION` 一致；旧 tag 没有安装器时仍按原来的两项资产验证，不覆盖已有资产。
-安装器隔离测试不操作宿主服务或真实安装路径，同时约束两份独立脚本的发布安装实现一致。
+安装器隔离测试不操作宿主服务或真实安装路径，同时约束两份独立脚本的管理脚本安装实现一致。
+安装与 `onevps update` 仅下载仓库 `main` 原始文件，不接受版本参数，不访问 Release API 或清单；
+测试覆盖下载失败保留、脚本验证、参数拒绝和首次运行。Release 发布功能与核心归档校验保持不变。
 
 ## Reporting Bugs
 

@@ -42,7 +42,7 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck --severity=warning onevps.sh tests/*.sh
 
-      - name: Validate release installer when present
+      - name: Validate repository installer when present
         run: |
           if [[ -f install.sh ]]; then
             bash -n install.sh tests/test_install.sh
