@@ -286,7 +286,7 @@ assert_jq "enables Vision on native TCP" "$reality_inbound" \
   '.users[0].flow == "xtls-rprx-vision" and (has("transport") | not)'
 
 # Hysteria 2 uses native ACME, scoped passwords and protocol-aware ports.
-hy2_node='{"id":"hy2-test","type":"hysteria2","name":"HY2 / Test","tag":"hy2-test","domain":"hy2.example.com","acme_email":"ops@example.com","port":443,"password":"test+pass@hy2","enabled":true,"users":[{"id":"alice","name":"Alice","password":"alice-password"}]}'
+hy2_node='{"id":"hy2-test","type":"hysteria2","name":"HY2 / Test","tag":"hy2-test","domain":"hy2.example.com","port":443,"password":"test+pass@hy2","enabled":true,"users":[{"id":"alice","name":"Alice","password":"alice-password"}]}'
 jq --argjson node "$hy2_node" '.nodes += [$node]' "$FIXTURE" > "$TEST_TMP/hy2.json"
 assert_true "HY2 UDP/443 coexists with Reality TCP/443" validate_node_metadata "$TEST_TMP/hy2.json"
 render_config "$TEST_TMP/hy2.json" "$TEST_TMP/hy2-config.json"
@@ -301,15 +301,16 @@ assert_contains "HY2 user link selects independent password" "$(node_user_link "
 hy2_obfs=$(jq -c '.obfs_password="obfs+secret"' <<<"$hy2_node")
 assert_jq "HY2 salamander is optional" "$(build_hysteria2_inbound "$hy2_obfs")" '.obfs.type=="salamander" and .obfs.password=="obfs+secret"'
 assert_contains "HY2 link encodes obfuscation password" "$(node_link "$hy2_obfs")" 'obfs=salamander&obfs-password=obfs%2Bsecret'
-for mutation in '.nodes[-1].domain="../bad.example"' '.nodes[-1].domain="-bad.example"' '.nodes[-1].acme_email="invalid"' '.nodes[-1].obfs_password=""' '.nodes[-1].users[0].password=.nodes[-1].password' '.nodes[0].port=80'; do
+for mutation in '.nodes[-1].domain="../bad.example"' '.nodes[-1].domain="-bad.example"' '.nodes[-1].obfs_password=""' '.nodes[-1].users[0].password=.nodes[-1].password' '.nodes[0].port=80'; do
   jq "$mutation" "$TEST_TMP/hy2.json" > "$TEST_TMP/hy2-invalid.json"
   assert_false "rejects HY2 metadata $mutation" validate_node_metadata "$TEST_TMP/hy2-invalid.json"
 done
 jq '.nodes += [(.nodes[-1] | .id="hy2-second" | .tag="hy2-second" | .port=8443)]' "$TEST_TMP/hy2.json" > "$TEST_TMP/hy2-shared.json"
 render_config "$TEST_TMP/hy2-shared.json" "$TEST_TMP/hy2-config.json"
 assert_file_jq "HY2 nodes share one provider per domain" "$TEST_TMP/hy2-config.json" '(.certificate_providers|length)==1'
-jq '.nodes[-1].acme_email="other@example.com"' "$TEST_TMP/hy2-shared.json" > "$TEST_TMP/hy2-invalid.json"
-assert_false "shared domain rejects inconsistent ACME accounts" validate_node_metadata "$TEST_TMP/hy2-invalid.json"
+assert_true "HY2 nodes share a domain without email" validate_node_metadata "$TEST_TMP/hy2-shared.json"
+assert_file_jq "ACME provider omits email" "$TEST_TMP/hy2-config.json" \
+  '(.certificate_providers|length)==1 and (.certificate_providers[0]|has("email")|not)'
 jq '.nodes[-1].port=443' "$TEST_TMP/hy2-shared.json" > "$TEST_TMP/hy2-invalid.json"
 assert_false "same UDP port cannot belong to two nodes" validate_node_metadata "$TEST_TMP/hy2-invalid.json"
 jq '(.nodes[] | select(.type=="hysteria2")).enabled=false' "$TEST_TMP/hy2-shared.json" > "$TEST_TMP/hy2-disabled.json"
@@ -946,7 +947,7 @@ assert_true "creation rotation and encoded links keep credentials out of jq argv
     "Node name") printf "test\n" ;;
     "Listen port"|"Hysteria 2 UDP port") printf "8443\n" ;;
     "Certificate domain") printf "new.example.com\n" ;;
-    "ACME contact email") printf "ops@example.com\n" ;;
+    "ACME contact email") touch "$root/unexpected-email-prompt"; return 1 ;;
   esac; }
   apply_candidate_transaction() {
     local prepare="$1"; shift
@@ -959,6 +960,8 @@ assert_true "creation rotation and encoded links keep credentials out of jq argv
   rotate_reality_secret a1b2c3d4 >/dev/null || exit 1
   command jq -e '\''.nodes[0].reality_private_key == "SECRET_PRIVATE_KEY"'\'' "$SINGBOX_NODES" >/dev/null || exit 1
   add_hysteria2_node > "$root/hy2-output" || exit 1
+  [[ ! -e "$root/unexpected-email-prompt" ]] || exit 1
+  command jq -e '\''.nodes[-1] | has("acme_email") | not'\'' "$SINGBOX_NODES" >/dev/null || exit 1
   command jq -e '\''.nodes[-1].password == "SECRET_PASSWORD" and .nodes[-1].obfs_password == "SECRET_PASSWORD"'\'' "$SINGBOX_NODES" >/dev/null || exit 1
   ! grep -q "SECRET_PRIVATE_KEY\|SECRET_PASSWORD\|123e4567-e89b-12d3-a456-426614174099" "$capture"
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP" "$FIXTURE"

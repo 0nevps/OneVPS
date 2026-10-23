@@ -806,7 +806,7 @@ render_config() {
     } +
     ([$nodes[0].nodes[] | select(.enabled and .type == "hysteria2")] | unique_by(.domain) |
       if length == 0 then {} else {certificate_providers: map({
-        type:"acme", tag:("acme-" + .domain), domain:[.domain], email:.acme_email,
+        type:"acme", tag:("acme-" + .domain), domain:[.domain],
         provider:"letsencrypt", data_directory:$acme_dir,
         disable_http_challenge:false, disable_tls_alpn_challenge:true
       })} end)' > "$output"
@@ -849,14 +849,11 @@ validate_node_metadata() {
       (if .type == "hysteria2" then
          (.domain | type == "string" and length <= 253 and
            test("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$")) and
-         (.acme_email | type == "string" and test("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")) and
          (if has("obfs_password") then (.obfs_password | nonempty) else true end)
        else true end)) and
     (if any(.nodes[]; .enabled and .type == "hysteria2") then
       all(.nodes[]; (.enabled and .type != "hysteria2" and .port == 80) | not)
      else true end) and
-    ([.nodes[] | select(.type == "hysteria2")] | group_by(.domain) |
-      all(.[]; ([.[].acme_email] | unique | length) == 1)) and
     ([.nodes[] | [(if .type == "hysteria2" then "udp" else "tcp" end), .port]] |
       length == (unique | length)) and
     ([.nodes[].id] | length == (unique | length)) and
@@ -1438,14 +1435,13 @@ add_snell_node() {
 add_hysteria2_node() {
   require_singbox
   ensure_nodes_file
-  local name domain email password port id node obfs=''
+  local name domain password port id node obfs=''
   info "Add Hysteria 2 with native ACME HTTP-01 (Let's Encrypt)"
   warn 'Requires a domain pointing directly to this VPS and public TCP/80 for issuance and renewal.'
   warn 'The domain will be sent to the CA and published in public certificate transparency logs.'
   confirm 'Proceed with public certificate issuance?' n || return
   name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
   domain=$(normalize_domain "$(ask 'Certificate domain')")
-  email=$(ask 'ACME contact email')
   password=$(rand_password) || return 1
   while :; do
     port=$(ask 'Hysteria 2 UDP port' 443)
@@ -1460,15 +1456,15 @@ add_hysteria2_node() {
   if confirm 'Enable salamander obfuscation?' n; then obfs=$(rand_password) || return 1; fi
   id=$(openssl rand -hex 4) || return 1
   node=$(printf '%s\n' "$password" "$obfs" | jq -Rn --arg id "$id" --arg name "$name" --arg domain "$domain" \
-    --arg email "$email" --argjson port "$port" '
+    --argjson port "$port" '
     [inputs] as $secrets |
     {id:$id,type:"hysteria2",name:$name,tag:("hy2-" + $id),domain:$domain,
-      acme_email:$email,port:$port,password:$secrets[0],enabled:true} +
+      port:$port,password:$secrets[0],enabled:true} +
     (if $secrets[1] == "" then {} else {obfs_password:$secrets[1]} end)') || return 1
   local candidate
   candidate=$(mktemp_json) || return 1
   if ! prepare_add_node "$SINGBOX_NODES" "$candidate" <<<"$node"; then
-    rm -f "$candidate"; err 'invalid domain, email or conflicting node settings'; return 1
+    rm -f "$candidate"; err 'invalid domain or conflicting node settings'; return 1
   fi
   rm -f "$candidate"
   check_hysteria2_dns "$domain" || return 1

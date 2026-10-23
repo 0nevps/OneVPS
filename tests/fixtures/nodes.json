@@ -26,7 +26,6 @@
       "port": 20001,
       "password": "test+pass@example",
       "domain": "hy2.example.com",
-      "acme_email": "ops@example.com",
       "enabled": true
     },
     {
