@@ -1075,14 +1075,15 @@ assert_true "fresh installation refuses conflicts and verifies ownership" bash -
   SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_NODES="$SINGBOX_DIR/nodes.json"
   SINGBOX_SERVICE="$root/core.service"
   conflict=""; failed_query=""; template_state=disabled; instance_state=running
+  missing_status=0; failed_output=""
   systemctl() {
-    [[ "$1" != "$failed_query" ]] || return 1
+    [[ "$1" != "$failed_query" ]] || { printf "%s" "$failed_output"; return 1; }
     case "$1" in
       show)
         if [[ "${@: -1}" == xray@.service ]]; then
           printf "template is not a valid unit for show\n" >&2; return 1
         fi
-        if [[ "$*" == *"$conflict" && -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; fi ;;
+        if [[ "$*" == *"$conflict" && -n "$conflict" ]]; then printf "loaded\n"; else printf "not-found\n"; return "$missing_status"; fi ;;
       list-unit-files)
         [[ "$*" == "list-unit-files --no-legend --no-pager xray@*.service" ]] || return 99
         if [[ "$conflict" == xray@.service || "$conflict" == xray@file.service ]]; then printf "%s %s -\n" "$conflict" "$template_state"; fi ;;
@@ -1093,6 +1094,24 @@ assert_true "fresh installation refuses conflicts and verifies ownership" bash -
     esac
   }
   check_singbox_conflicts || exit 1
+  missing_status=1
+  check_singbox_conflicts || exit 1
+  # Exercise first-run orchestration in a fresh shell with errexit enabled.
+  export -f systemctl
+  export conflict failed_query failed_output missing_status template_state instance_state
+  bash -c '\''
+    source "$1"
+    SINGBOX_DIR="$2/config"; SINGBOX_BIN="$2/core"
+    SINGBOX_CONF="$SINGBOX_DIR/config.json"; SINGBOX_NODES="$SINGBOX_DIR/nodes.json"
+    SINGBOX_SERVICE="$2/core.service"
+    confirm() { return 0; }
+    install_singbox() { printf "install reached\n"; }
+    ask() { printf "0\n"; }
+    first_run
+    printf "startup continued\n"
+  '\'' _ "$1" "$root" > "$root/startup.log" || exit 1
+  grep -qx "install reached" "$root/startup.log" || exit 1
+  grep -qx "startup continued" "$root/startup.log" || exit 1
   for conflict in xray.service xray@.service xray@file.service xray@test.service sing-box.service singbox.service onevps-sing-box.service; do
     if check_singbox_conflicts; then exit 1; fi
   done
@@ -1106,8 +1125,15 @@ assert_true "fresh installation refuses conflicts and verifies ownership" bash -
   done
   conflict=""
   for failed_query in show list-unit-files list-units; do
-    if check_singbox_conflicts; then exit 1; fi
+    if check_singbox_conflicts 2> "$root/query-error"; then exit 1; fi
+    grep -q "failed to query" "$root/query-error" || exit 1
   done
+  failed_query=show
+  for failed_output in loaded error $'\''not-found\nerror'\''; do
+    if check_singbox_conflicts 2> "$root/query-error"; then exit 1; fi
+    grep -q "failed to query" "$root/query-error" || exit 1
+  done
+  failed_output=""
   failed_query=""
   for path in "$SINGBOX_DIR" "$SINGBOX_BIN" "$SINGBOX_SERVICE"; do
     printf "unmanaged\n" > "$path"
