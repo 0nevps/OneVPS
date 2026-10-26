@@ -31,7 +31,7 @@ jobs:
           ref: ${{ inputs.ref || '' }}
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh
+        run: bash -n onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh tests/test_hysteria2.sh tests/test_acme.sh
 
       - name: Install test dependencies
         run: |
@@ -39,10 +39,13 @@ jobs:
           sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh
+        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh tests/test_hysteria2.sh tests/test_acme.sh
 
       - name: Test configuration generation
-        run: bash tests/test_onevps.sh
+        run: |
+          bash tests/test_onevps.sh
+          bash tests/test_hysteria2.sh
+          bash tests/test_acme.sh
 
       - name: Validate outbounds with Xray 26.3.27
         run: |
@@ -56,6 +59,19 @@ jobs:
             "$work/xray.zip" | sha256sum --check -
           unzip -q "$work/xray.zip" -d "$work/core"
           XRAY_TEST_BIN="$work/core/xray" bash tests/test_xray_outbounds.sh
+
+      - name: Test native Hysteria2 with Xray 26.10.21
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip \
+            -o "$work/xray.zip"
+          printf '%s  %s\n' \
+            0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978 \
+            "$work/xray.zip" | sha256sum --check -
+          unzip -q "$work/xray.zip" -d "$work/core"
+          XRAY_TEST_BIN="$work/core/xray" bash tests/test_hysteria2.sh
 
       - name: Lint Markdown
         run: npx --yes markdownlint-cli2@0.23.2 "**/*.md"

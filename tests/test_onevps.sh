@@ -677,7 +677,7 @@ done
 ) || fail 'script update validates downloads, preserves files on failure and supports streamed launches'
 pass 'script update validates downloads, preserves files on failure and supports streamed launches'
 
-printf '11\n0\n' > "$TEST_TMP/menu-input"
+printf '6\n0\n' > "$TEST_TMP/menu-input"
 assert_true "main menu exposes script update without a version and exits the old menu after success" bash -c '
   source "$1"; exec 3< "$2"
   clear() { :; }; status_line() { :; }; pause() { :; }
@@ -685,18 +685,18 @@ assert_true "main menu exposes script update without a version and exits the old
   manage_users() { printf "REMOVED_DISPATCH\n"; }
   update_script() { printf "UPDATE_DISPATCH\n"; }
   output=$(main_menu)
-  [[ "$output" == *"Script:"*"11) Update script"*UPDATE_DISPATCH &&
+  [[ "$output" == *"Script:"*"6) Update script"*UPDATE_DISPATCH &&
      "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* &&
      "$output" != *"version"* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
-printf '11\n0\n' > "$TEST_TMP/menu-input"
+printf '6\n0\n' > "$TEST_TMP/menu-input"
 assert_true "failed script update returns to the current menu" bash -c '
   source "$1"; exec 3< "$2"
   clear() { :; }; status_line() { :; }; pause() { printf "UPDATE_FAILED\n"; }
   ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
   update_script() { return 1; }
   output=$(main_menu)
-  [[ "$output" == *UPDATE_FAILED*"Script:"*"11) Update script"* ]]
+  [[ "$output" == *UPDATE_FAILED*"Script:"*"6) Update script"* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
 for removed in manage_users show_user_links prepare_user_assignment apply_user_assignment validate_user_metadata; do
   assert_false "removed function $removed is absent" declare -F "$removed"
@@ -715,26 +715,22 @@ assert_true "main menu title aligns with both right borders" bash -c '
   [[ ${#top} -eq ${#title} && ${#title} -eq ${#bottom} ]]
 ' _ "$ROOT_DIR/onevps.sh"
 
-# Exercise every main-menu entry without invoking host operations.
-printf '99\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n0\n' > "$TEST_TMP/menu-input"
-assert_true "main menu groups all actions and preserves every dispatch number" bash -c '
+# Exercise categorized main entries without host operations.
+printf '99\n1\n2\n3\n4\n5\n9\n0\n' > "$TEST_TMP/menu-input"
+assert_true "main menu dispatches categories" bash -c '
   source "$1"; exec 3< "$2"; capture="$3"
   : > "$capture"
   clear() { :; }; status_line() { :; }; pause() { :; }
   ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
   install_xray() { printf "1\n" >> "$capture"; }
-  add_reality_node() { printf "2\n" >> "$capture"; }
-  add_trojan_node() { printf "3\n" >> "$capture"; }
-  manage_nodes() { printf "4\n" >> "$capture"; }
-  show_links() { printf "5\n" >> "$capture"; }
-  restart_service() { printf "6\n" >> "$capture"; }
-  enable_bbr() { printf "7\n" >> "$capture"; }
-  optimize_system() { printf "8\n" >> "$capture"; }
+  node_menu() { printf "2\n" >> "$capture"; }
+  certificate_menu() { printf "3\n" >> "$capture"; }
+  realm_menu() { printf "4\n" >> "$capture"; }
+  network_menu() { printf "5\n" >> "$capture"; }
   uninstall() { printf "9\n" >> "$capture"; }
-  realm_menu() { printf "10\n" >> "$capture"; }
   output=$(main_menu)
-  [[ "$output" == *"Xray setup:"*"Nodes / share links:"*"4) Manage nodes / users / outbound"*"Relay:"*"10) Manage Realm relay (independent of Xray)"*"Service / network:"*"6) Restart Xray service"*"Danger zone:"*"9) Uninstall Xray (keep Realm / Caddy)"*"0) Exit"* &&
-     "$(command cat "$capture")" == "$(printf "%s\n" 1 2 3 4 5 6 7 8 9 10)" ]]
+  [[ "$output" == *"3) Certificates (automatic ACME)"*"Danger zone:"* &&
+     "$(command cat "$capture")" == "$(printf "%s\n" 1 2 3 4 5 9)" ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input" "$TEST_TMP/main-dispatch"
 
 printf '1\n2\n3\n4\n5\n0\n' > "$TEST_TMP/menu-input"

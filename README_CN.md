@@ -9,12 +9,62 @@
 OneVPS 是一个开源的 Linux VPS Xray 节点部署与运维自动化工具。它把安装、配置生成、服务管理和日常维护步骤
 集中在一个可审阅的 Bash 工作流中。
 
-目前支持两种部署模式：
+目前支持三种部署模式：
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS**：独立部署，无需域名或证书。
 - **Trojan + WebSocket（Caddy 后端）**：复用 Caddy 的 `:443` 监听与证书，可与其他 Caddy 服务共存。
+- **Hysteria2 + QUIC + TLS**：原生 Xray 入站，默认自动 ACME，也可使用已有 PEM 证书与私钥。
 
 OneVPS 专注于基于 Xray 的部署，不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
+
+## Hysteria2（原生 Xray）
+
+通过菜单 **1** 更新 Xray，再选 **2 → 3** 添加 HY2 节点。OneVPS 要求 **Xray >= 26.10.21**，
+这是本功能的测试基线，不代表 HY2 首次受支持的版本。不安装独立 Hysteria 核心或服务；
+仅有 VLESS/Trojan 的配置不受该版本门槛影响。
+
+证书默认自动 ACME，申请时只填写域名。不询问可省略的邮箱、账户密码、CA、密钥类型和保存路径，
+也不生成虚假邮箱。固定使用经过 SHA-256 校验的 acme.sh 3.1.6、Let's Encrypt 和 EC-256；
+申请即同意 CA 服务条款。账户与订单独立存放在 `/etc/onevps-acme`，不修改用户已有 ACME 配置。
+HTTP-01 要求域名正确解析，公网 TCP 80 在首次签发和后续续期时均可达。
+80 空闲时使用 standalone；已有 Caddy 时为专用域名追加带标记的 HTTP 挑战站点，不停止网站。
+域名已存在于 Caddyfile 或 80 被其他服务占用时拒绝覆盖，提示使用专用域名或手动证书。
+已创建的 standalone 订单续期仍要求 TCP 80 空闲，不会静默切换验证方式。
+本轮不包含 DNS-01 API 自动化。
+
+`onevps-acme.timer` 每天检查两次，附带随机延迟。证书放在 `/etc/onevps-certs/<域名>/current/`，
+仅通过受限组权限允许 `nobody` 读取。完整证书/私钥对以符号链接原子切换；配置校验或重启失败时回退，
+即使证书未到续期时间也会重试未完成的部署。主菜单 **3** 提供状态、申请、续期检查与日志。
+
+保留手动 PEM 模式，检查有效期、域名、密钥匹配和 `nobody` 的读取权限（含父目录）。
+应使用 `/etc` 下的持久目录，不能使用被 systemd 隐藏的用户目录或临时目录。
+手动证书不会被更改权限、自动续期或删除。
+删除节点保留托管证书供复用；卸载 Xray 时另外询问是否清理 OneVPS 的 ACME 资源和 Caddy 标记块，
+不会删除外部证书。为避免影响其他服务，已放行的 TCP 80 防火墙规则保留。
+
+HY2 监听 IPv4 UDP，可与 TCP 共用端口号，但不能与其他 UDP 监听冲突。
+Caddy HTTP/3 可能占用 UDP 443，此时请选择其他 UDP 端口。
+除主机防火墙外，还需在云安全组放行该端口。IPv4-only 端点不要配置 AAAA 记录。
+现有 BBR/TCP 优化不等于 QUIC 调优。
+
+菜单 **2 → 4** 支持修改 UDP 端口、重置默认密码、管理用户、节点/用户出站分流、启停和删除。
+更新复用配置校验、服务重启与失败回滚事务。菜单 **2 → 4/5** 输出正确编码的 `hysteria2://` 链接，
+不关闭 TLS 校验。现有上游协议类型不变；本次不包含 HY2 上游导入、混淆或端口跳跃。
+
+实现依据：[Xray 入站文档](https://xtls.github.io/en/config/inbounds/hysteria.html)、
+[QUIC 传输文档](https://xtls.github.io/en/config/transports/hysteria.html)、
+[官方服务端示例](https://github.com/XTLS/Xray-examples/blob/main/Hysteria2/server.jsonc)和
+[分享链接规范](https://v2.hysteria.network/docs/developers/URI-Scheme/)。
+
+```bash
+bash tests/test_hysteria2.sh
+bash tests/test_acme.sh
+XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_hysteria2.sh
+```
+
+第二条命令需要 Python 3 和 OpenSSL，实测本机 TCP/UDP 流量、两个用户认证、错误密码拒绝与按用户 SOCKS 分流。
+只有隔离测试配置放行 loopback 目标，正式配置仍阻断私网。
+Linux systemd、实际证书权限和外部防火墙可达性仍需在部署环境验证。
 
 ## 为什么需要 OneVPS？
 
@@ -44,8 +94,8 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 | 类别 | 支持范围 |
 | --- | --- |
 | 核心 | [Xray-core](https://github.com/XTLS/Xray-core) |
-| 协议 | VLESS、Trojan |
-| 传输 | TCP、WebSocket |
+| 协议 | VLESS、Trojan、Hysteria2 |
+| 传输 | TCP、WebSocket、QUIC（UDP） |
 | 安全 | REALITY、XTLS Vision、由 Caddy 终结的 TLS |
 | 服务管理 | systemd |
 | 架构 | amd64、arm64、armv7 |
@@ -78,30 +128,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 
 ## 菜单
 
-菜单按任务分组，主菜单与子菜单的原有编号保持不变。
+主菜单按任务分类，节点和服务操作分别收纳在对应子菜单中。
 用户和出站管理位于 `4`，选中节点后分别选择 `7` 或 `8`。
 删除和卸载操作单独放在 **Danger zone** 分组，保留原有确认提示。
 
 ```text
-Xray setup:
+Setup / management:
  1) Install / update Xray-core
-
-Nodes / share links:
- 2) Add node - VLESS + Reality + Vision + uTLS
- 3) Add node - Trojan + WS (behind Caddy)
- 4) Manage nodes / users / outbound
- 5) Show default node share links
-
-Relay:
-10) Manage Realm relay (independent of Xray)
-
-Service / network:
- 6) Restart Xray service
- 7) Enable BBR / show status
- 8) TCP optimization
+ 2) Nodes / users / outbound / share links
+ 3) Certificates (automatic ACME)
+ 4) Realm relay
+ 5) Service / network
 
 Script:
-11) Update script
+ 6) Update script
 
 Danger zone:
  9) Uninstall Xray (keep Realm / Caddy)
@@ -109,7 +149,7 @@ Danger zone:
  0) Exit
 ```
 
-菜单 `11`（**Update script**）确认后从仓库 `main` 分支下载 OneVPS，检查 Bash 语法并启动更新后的菜单，
+菜单 `6`（**Update script**）确认后从仓库 `main` 分支下载 OneVPS，检查 Bash 语法并启动更新后的菜单，
 不显示脚本版本号。本地脚本通过校验后才替换；通过管道式便捷命令启动时，使用临时脚本更新当前会话。
 下载或校验失败不会修改当前脚本。更新脚本不会升级 Xray 或 Realm。
 
@@ -198,7 +238,7 @@ CI 使用 Xray `26.3.27` 执行此检查。配置通过不代表上游可达，�
 
 ## Realm 端口中转
 
-选择菜单 `10`，再选择 `1`，即可安装 realm 并添加中转，无需先安装 Xray。
+选择菜单 `4`，再选择 `1`，即可安装 realm 并添加中转，无需先安装 Xray。
 依次输入本地端口、目标 IP 或域名、目标端口，以及 `tcp`（默认）或 `both`（TCP+UDP）。
 例如：将本地 `10443` 端口通过 TCP 转发到 `203.0.113.20:443`。
 目标支持 IPv4、域名和不带方括号的 IPv6 地址；本地监听 `0.0.0.0`（IPv4）。
@@ -226,7 +266,7 @@ Debian/Ubuntu 的 `ss` 来自 `iproute2`，RHEL 系来自 `iproute`。
 | 服务 | `/etc/systemd/system/onevps-realm.service` |
 
 上述路径存在非本脚本管理的文件时拒绝覆盖。其他 realm 安装不会被修改，但可能占用相同端口。
-菜单 `9` 仅卸载 Xray；卸载 realm 使用菜单 `10` → `5`，防火墙规则需自行清理。
+菜单 `9` 仅卸载 Xray；卸载 realm 使用菜单 `4` → `5`，防火墙规则需自行清理。
 
 ## VLESS + REALITY
 
@@ -272,7 +312,7 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 
 ## Trojan + WebSocket（Caddy 后端）
 
-菜单 `3` 创建与 Caddy 已管理服务共享 `443` 端口的 Trojan 节点。
+菜单 `2` → `2` 创建与 Caddy 已管理服务共享 `443` 端口的 Trojan 节点。
 
 工作方式：
 
@@ -342,7 +382,7 @@ Danger zone:
 ```
 
 `Rebuild Caddy route` 会重新生成受管理的 Caddy 配置块，但不更改节点密码、路径或端口。轮换 Reality 密钥或
-重置 Trojan 凭据会使旧客户端链接失效，需要从菜单 `5` 重新导入链接。
+重置 Trojan 凭据会使旧客户端链接失效，需要从菜单 `2` → `5` 重新导入链接。
 
 ## 安全模型
 
@@ -398,11 +438,11 @@ xray run -test -config /usr/local/etc/xray/config.json
 
 ## BBR 与 TCP 优化
 
-菜单 `7` 启用 BBR，并写入 `/etc/sysctl.d/99-bbr.conf`。状态分别显示默认 qdisc 与网卡实际队列。
+菜单 `5` → `2` 启用 BBR，并写入 `/etc/sysctl.d/99-bbr.conf`。状态分别显示默认 qdisc 与网卡实际队列。
 已有 fq 不变；只有单一默认 `pfifo_fast` root（handle 为 `0:` 且无 filters）才允许替换。
 自定义、多队列、fq_codel 和未知布局会保留。BBR 已启用分支不会改变队列。
 
-菜单 `8` 将可选 TCP 设置写入 `/etc/sysctl.d/99-onevps-tune.conf`：
+菜单 `5` → `3` 将可选 TCP 设置写入 `/etc/sysctl.d/99-onevps-tune.conf`：
 
 - 将 TCP buffer 上限设为 `67108864`，校验后保留各自当前的最小值和初始值
 - 读取失败、三元组非法或初始值超过目标上限时拒绝操作，不覆盖旧配置

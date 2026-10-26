@@ -10,15 +10,77 @@ OneVPS is an open-source automation tool for deploying and operating Xray nodes 
 It turns the installation, configuration, service management, and routine maintenance steps into one
 auditable Bash workflow.
 
-Two deployment modes are supported:
+Three deployment modes are supported:
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS** — a standalone deployment that does not require a domain
   or certificate.
 - **Trojan + WebSocket behind Caddy** — a deployment that shares Caddy's `:443` listener and certificates
   with other Caddy-managed services.
+- **Hysteria2 + QUIC + TLS** — a native Xray inbound with automatic ACME certificates or existing PEM files.
 
 OneVPS deliberately focuses on Xray-based deployments. It is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
+
+## Hysteria2 (native Xray)
+
+Update Xray using menu **1**, then choose **2 → 3** to add a HY2 node. OneVPS requires
+**Xray >= 26.10.21**, the tested baseline, not the first release supporting HY2.
+No separate Hysteria binary or service is installed. Existing VLESS/Trojan-only
+configurations do not acquire this version requirement.
+
+Automatic ACME is the default. Certificate application only needs the domain; optional
+email, account credentials, CA selection, key type and output paths are not requested.
+OneVPS pins acme.sh 3.1.6 (SHA-256 verified), explicitly uses Let's Encrypt and EC-256,
+and isolates account/order state under `/etc/onevps-acme`. Issuance agrees to the CA terms.
+HTTP-01 requires correct public DNS and inbound TCP 80, including on future renewals.
+With a free TCP 80 it uses standalone mode; with active Caddy it adds a marked HTTP-only
+challenge vhost for a dedicated domain, without stopping existing websites. An existing
+Caddyfile entry for that domain or a non-Caddy listener is rejected rather than overwritten.
+A saved standalone order still requires free TCP 80 for renewal; it will not silently switch modes.
+DNS-01 automation is not included.
+
+The systemd timer `onevps-acme.timer` checks twice daily with randomized delay. Certificates
+are installed under `/etc/onevps-certs/<domain>/current/` with restricted group access for
+`nobody`. A complete key/certificate pair is switched atomically; validation or restart
+failure restores the previous pair. Failed deployment is retried even if renewal is not due.
+Menu **3** provides status, domain-only application, renewal checks and journal logs.
+No fake email is registered and no DNS API secret is needed.
+
+Manual PEM mode remains available. It checks expiry, hostname, matching key and readability
+by `nobody`, including parent directory permissions. Use a persistent path under `/etc`, not
+systemd-hidden home/temp directories. Manual files are never chmodded, renewed or deleted.
+Deleting a node retains managed certificates for reuse; Xray uninstall separately offers
+removal of OneVPS-owned ACME resources and marked Caddy routes, never external certificates.
+TCP 80 firewall allowances are retained to avoid disrupting other services.
+
+HY2 listens on IPv4 UDP. A TCP listener can share the same port number, but another UDP
+listener cannot. Caddy HTTP/3 often occupies UDP 443: choose another UDP port in that case.
+Allow the chosen UDP port in your provider security group as well as the host firewall.
+Do not publish an AAAA record for an IPv4-only endpoint. BBR/TCP tuning is not QUIC tuning.
+
+Menu **2 → 4** supports changing the UDP port, resetting the default password, managing users,
+selecting node/user outbounds, enabling/disabling and deleting the node. Updates use the
+existing validation/restart/rollback transaction. Menus **2 → 4/5** emit URL-encoded
+`hysteria2://` links without disabling TLS verification. Existing supported outbound types
+remain unchanged; importing HY2 as an upstream, obfuscation and port hopping
+are not included in this implementation.
+
+Implementation references: [Xray HY2 inbound](https://xtls.github.io/en/config/inbounds/hysteria.html),
+[QUIC transport](https://xtls.github.io/en/config/transports/hysteria.html),
+[official server example](https://github.com/XTLS/Xray-examples/blob/main/Hysteria2/server.jsonc)
+and [share URI specification](https://v2.hysteria.network/docs/developers/URI-Scheme/).
+
+```bash
+bash tests/test_hysteria2.sh
+bash tests/test_acme.sh
+XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_hysteria2.sh
+```
+
+The second command requires Python 3 and OpenSSL. It exercises real TCP/UDP loopback
+traffic, two user credentials, rejection of invalid credentials and per-user SOCKS routing.
+Only disposable test configurations permit loopback destinations; production private-IP
+blocking remains intact. Linux systemd, certificate permissions and external firewall
+reachability still require deployment verification.
 
 ## Why OneVPS?
 
@@ -50,8 +112,8 @@ the same workflow on another supported host, and contribute fixes in one place.
 | Area | Supported options |
 | --- | --- |
 | Core | [Xray-core](https://github.com/XTLS/Xray-core) |
-| Protocols | VLESS, Trojan |
-| Transports | TCP, WebSocket |
+| Protocols | VLESS, Trojan, Hysteria2 |
+| Transports | TCP, WebSocket, QUIC (UDP) |
 | Security | REALITY, XTLS Vision, TLS terminated by Caddy |
 | Service manager | systemd |
 | Architectures | amd64, arm64, armv7 |
@@ -87,30 +149,20 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 
 ## Menu
 
-Menus are grouped by task. Existing option numbers are preserved, including in submenus.
+The main menu groups tasks into categories; node and service actions live in dedicated submenus.
 Node users and outbounds are under `4`, then select a node and choose `7` or `8`.
 Destructive actions are separated under **Danger zone** and retain their confirmation prompts.
 
 ```text
-Xray setup:
+Setup / management:
  1) Install / update Xray-core
-
-Nodes / share links:
- 2) Add node - VLESS + Reality + Vision + uTLS
- 3) Add node - Trojan + WS (behind Caddy)
- 4) Manage nodes / users / outbound
- 5) Show default node share links
-
-Relay:
-10) Manage Realm relay (independent of Xray)
-
-Service / network:
- 6) Restart Xray service
- 7) Enable BBR / show status
- 8) TCP optimization
+ 2) Nodes / users / outbound / share links
+ 3) Certificates (automatic ACME)
+ 4) Realm relay
+ 5) Service / network
 
 Script:
-11) Update script
+ 6) Update script
 
 Danger zone:
  9) Uninstall Xray (keep Realm / Caddy)
@@ -118,7 +170,7 @@ Danger zone:
  0) Exit
 ```
 
-Option `11` (**Update script**) downloads OneVPS from the repository `main` branch after confirmation,
+Option `6` (**Update script**) downloads OneVPS from the repository `main` branch after confirmation,
 checks Bash syntax, and starts the updated menu. No script version is displayed. A local script is replaced
 only after validation; a streamed launch uses a temporary script for the current session. Download or
 validation failures leave the current script unchanged. Updating the script does not update Xray or Realm.
@@ -228,7 +280,7 @@ Do not downgrade to preserve this version's access controls or outbound settings
 
 ## Realm port relay
 
-Choose menu `10`, then `1` to install realm and add a relay without installing Xray.
+Choose menu `4`, then `1` to install realm and add a relay without installing Xray.
 Enter a local port, destination IP or hostname, destination port, and `tcp` (default) or `both` (TCP+UDP).
 For example, forward local port `10443` to `203.0.113.20:443` using TCP.
 Destinations support IPv4, hostnames, and IPv6 literals without brackets; listeners bind to `0.0.0.0` (IPv4).
@@ -257,7 +309,7 @@ Requires systemd with `DynamicUser` support (232+), `tar`, and `ss` from `iprout
 | Service | `/etc/systemd/system/onevps-realm.service` |
 
 Existing unmanaged files at these paths are not overwritten. Other realm installations are left alone, but may
-conflict on listening ports. Menu `9` only uninstalls Xray; remove realm using menu `10` → `5`.
+conflict on listening ports. Menu `9` only uninstalls Xray; remove realm using menu `4` → `5`.
 
 ## VLESS + REALITY
 
@@ -306,7 +358,7 @@ warning.
 
 ## Trojan + WebSocket Behind Caddy
 
-Menu option `3` creates a Trojan node that shares port `443` with services already managed by Caddy.
+Menu `2` → `2` creates a Trojan node that shares port `443` with services already managed by Caddy.
 
 How it works:
 
@@ -379,7 +431,7 @@ Danger zone:
 
 `Rebuild Caddy route` regenerates the managed Caddy block without changing the node password, path, or port.
 Rotating Reality secrets or resetting Trojan credentials invalidates old client links; import the updated link
-from menu option `5`.
+from menu `2` → `5`.
 
 ## Security Model
 
@@ -438,12 +490,12 @@ sanitized command output.
 
 ## BBR and TCP Tuning
 
-Menu option `7` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`. Status distinguishes the default qdisc
+Menu `5` → `2` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`. Status distinguishes the default qdisc
 from the interface's actual queues. Existing fq is unchanged; only a single default `pfifo_fast` root
 (handle `0:`, without filters) is eligible for replacement. Custom, multiqueue, fq_codel and unknown layouts
 are preserved. The already-enabled BBR path does not change queues.
 
-Menu option `8` writes optional TCP settings to `/etc/sysctl.d/99-onevps-tune.conf`:
+Menu `5` → `3` writes optional TCP settings to `/etc/sysctl.d/99-onevps-tune.conf`:
 
 - Raises TCP buffer ceilings to `67108864`, preserving each current minimum and initial value after validation
 - Rejects unreadable/invalid triples or initial values above the target without overwriting the old file

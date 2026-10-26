@@ -4,6 +4,7 @@
 # Protocols:
 #   - VLESS + TCP + REALITY + XTLS Vision + uTLS (standalone)
 #   - Trojan + WebSocket behind Caddy (coexists with Caddy-proxied sites)
+#   - Hysteria2 + QUIC + TLS (native Xray inbound)
 #
 set -euo pipefail
 umask 077
@@ -26,6 +27,14 @@ REALM_DIR=/usr/local/etc/onevps-realm
 REALM_BIN=/usr/local/bin/onevps-realm
 REALM_SERVICE=/etc/systemd/system/onevps-realm.service
 REALM_VERSION=v2.9.6
+HY2_MIN_VERSION=26.10.21
+ACME_DIR=/etc/onevps-acme
+ACME_CERT_DIR=/etc/onevps-certs
+ACME_WEBROOT=/var/lib/onevps-acme
+ACME_RUNNER=/usr/local/lib/onevps/acme-runner.sh
+ACME_UNIT_DIR=/etc/systemd/system
+ACME_VERSION=3.1.6
+ACME_ARCHIVE_SHA256=0d3f9000ac44a6331314742a88c475f79134e24fc991997883652adc59efc486
 
 REALITY_DESTS=(
   "www.cloudflare.com"
@@ -339,9 +348,11 @@ close_port() {
 }
 
 port_in_use() {
-  local p="$1"
+  local p="$1" proto="${2:-both}" flags=-tunl
+  [[ "$proto" != udp ]] || flags=-unl
+  [[ "$proto" != tcp ]] || flags=-tnl
   if command -v ss >/dev/null 2>&1; then
-    ss -tunl 2>/dev/null | awk '{print $5}' | grep -qE ":$p$"
+    ss "$flags" 2>/dev/null | awk '{print $(NF-1)}' | grep -qE ":$p$"
   else
     return 1
   fi
@@ -349,7 +360,10 @@ port_in_use() {
 
 port_taken_by_node() {
   [[ -f "$XRAY_NODES" ]] || return 1
-  jq -e --argjson p "$1" '.nodes[]|select(.port==$p)' "$XRAY_NODES" >/dev/null 2>&1
+  jq -e --argjson p "$1" --arg proto "${2:-both}" --arg exclude "${3:-}" '
+    .nodes[] | select(.port == $p and .id != $exclude) |
+    select($proto == "both" or (if .type == "hysteria2" then "udp" else "tcp" end) == $proto)
+  ' "$XRAY_NODES" >/dev/null 2>&1
 }
 
 # ----------------------------------------------------------------------------
@@ -659,6 +673,9 @@ node_by_id() {
 validate_xray_config() {
   local conf="$1" err_file="$2"
   [[ -x "$XRAY_BIN" ]] || return 0
+  if jq -e 'any(.inbounds[]; .protocol == "hysteria")' "$conf" >/dev/null; then
+    require_hy2_core || return 1
+  fi
   "$XRAY_BIN" run -test -config "$conf" >"$err_file" 2>&1
 }
 
@@ -852,7 +869,7 @@ build_proxy_outbound() {
 build_outbound_routes() {
   local source="$1" rows row object tag proxy proxies='[]' rules assignments
   assignments=$(jq -c '
-    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws")) | . as $n |
+    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2")) | . as $n |
       (if has("default_outbound") then
         {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
        else empty end),
@@ -888,6 +905,7 @@ render_config() {
     case "$type" in
       vless-reality) ib=$(build_reality_inbound "$n") || return 1 ;;
       trojan-ws)     ib=$(build_trojan_inbound "$n") || return 1 ;;
+      hysteria2)     ib=$(build_hysteria_inbound "$n") || return 1 ;;
       *) continue ;;
     esac
     inbounds=$(printf '%s\n%s\n' "$inbounds" "$ib" | jq -sc '.[0] + [.[1]]') || return 1
@@ -953,6 +971,7 @@ node_clients() {
     [{uuid:.uuid,password:.password,email:(.tag + "@onevps")}] +
       [(.users // [])[] | . + {email:(([ $n.id, .id ] | tojson | @base64) + "@onevps-user")}] |
     map(if $n.type == "vless-reality" then {id:.uuid,flow:"xtls-rprx-vision",email}
+        elif $n.type == "hysteria2" then {auth:.password,email}
         else {password,email} end)' <<<"$1"
 }
 
@@ -970,8 +989,15 @@ validate_node_metadata() {
     all(.nodes[];
       . as $n |
       (.id | nonempty) and
+      (if .type == "hysteria2" then
+        (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+        (.domain | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+        (.tls_cert | type == "string" and startswith("/")) and
+        (.tls_key | type == "string" and startswith("/")) and
+        (.enabled | type == "boolean") and (.tag | nonempty)
+       else true end) and
       (if .type == "vless-reality" then (.uuid | nonempty)
-       elif .type == "trojan-ws" then (.password | nonempty)
+       elif .type == "trojan-ws" or .type == "hysteria2" then (.password | nonempty)
        else true end) and
       (if has("users") then (.users | type == "array") else true end) and
       ((.users // []) as $users |
@@ -982,7 +1008,7 @@ validate_node_metadata() {
           (.name | type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]") | not)) and
           (if $n.type == "vless-reality" then
              (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))
-           elif $n.type == "trojan-ws" then (.password | nonempty)
+           elif $n.type == "trojan-ws" or $n.type == "hysteria2" then (.password | nonempty)
            else false end)) and
         (if .type == "vless-reality" then ([.uuid, $users[].uuid] | map(ascii_downcase))
          else [.password, $users[].password] end | length == (unique | length))))
@@ -1087,7 +1113,7 @@ validate_node_selection() {
 prepare_node_user_change() {
   local source="$1" output="$2" id="$3" action="$4" uid="${5:-}" payload
   validate_node_metadata "$source" || return 1
-  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "trojan-ws"))' "$source" >/dev/null || return 1
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "trojan-ws" or .type == "hysteria2"))' "$source" >/dev/null || return 1
   case "$action" in
     add|reset) payload=$(jq -cse 'select(length == 1) | .[0]') || return 1 ;;
     delete)
@@ -1205,6 +1231,423 @@ manage_outbound() {
   confirm 'Apply outbound setting?' n || return 0
   if apply_outbound_assignment "$id" "$scope" "$selected" <<<"$outbound"; then ok 'outbound applied'
   else err 'outbound not applied'; return 1; fi
+}
+
+# ----------------------------------------------------------------------------
+# OneVPS-owned ACME: isolated account, public challenge root, private deployment.
+# ----------------------------------------------------------------------------
+acme_owned() { [[ -f "$ACME_DIR/.onevps-owned" && ! -L "$ACME_DIR" ]]; }
+
+acme_domain_valid() {
+  [[ ${#1} -le 253 && "$1" == *.* && "$1" != *..* && "$1" != *[!a-z0-9.-]* ]] || return 1
+  local label
+  local -a labels
+  IFS=. read -r -a labels <<< "$1"
+  [[ "$1" != *. ]] || return 1
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 && "$label" != -* && "$label" != *- ]] || return 1
+  done
+}
+
+acme_exec() {
+  "$ACME_DIR/client/acme.sh" --home "$ACME_DIR/client" --config-home "$ACME_DIR/account" \
+    --cert-home "$ACME_DIR/orders" --server letsencrypt "$@"
+}
+
+acme_install() {
+  ensure_deps
+  local tmp actual
+  if ! acme_owned; then
+    for tmp in "$ACME_DIR" "$ACME_CERT_DIR" "$ACME_WEBROOT" "$ACME_RUNNER" \
+      "$ACME_UNIT_DIR/onevps-acme.service" "$ACME_UNIT_DIR/onevps-acme.timer"; do
+      [[ ! -e "$tmp" && ! -L "$tmp" ]] || { err "refusing unmanaged ACME path: $tmp"; return 1; }
+    done
+    mkdir -p "$ACME_DIR" || return 1
+    chmod 700 "$ACME_DIR" || return 1
+    touch "$ACME_DIR/.onevps-owned" || return 1
+  fi
+  if [[ ! -x "$ACME_DIR/client/acme.sh" ]]; then
+    tmp=$(mktemp -d "$ACME_DIR/.install.XXXXXXXX") || return 1
+    if ! download_file --connect-timeout 15 --max-time 180 \
+      "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tags/$ACME_VERSION" -o "$tmp/client.tar.gz"; then
+      rm -rf "$tmp"; return 1
+    fi
+    actual=$(openssl dgst -sha256 "$tmp/client.tar.gz") || { rm -rf "$tmp"; return 1; }
+    [[ "${actual##* }" == "$ACME_ARCHIVE_SHA256" ]] || { err 'ACME archive checksum mismatch'; rm -rf "$tmp"; return 1; }
+    tar -xzf "$tmp/client.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
+    mv "$tmp/acme.sh-$ACME_VERSION" "$ACME_DIR/client" || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+  fi
+  # No installer: no user profile changes, default cron jobs or account email prompts.
+  mkdir -p "$ACME_DIR/account" "$ACME_DIR/orders" "$ACME_DIR/domains" "$ACME_DIR/staging" \
+    "$ACME_CERT_DIR" "$ACME_WEBROOT/.well-known/acme-challenge" "$(dirname "$ACME_RUNNER")" || return 1
+  chmod 755 "$ACME_WEBROOT" "$ACME_WEBROOT/.well-known" "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
+  chmod 750 "$ACME_CERT_DIR" || return 1
+  chown root:"$(id -gn nobody)" "$ACME_CERT_DIR" || return 1
+  tmp=$(mktemp "${ACME_RUNNER}.XXXXXXXX") || return 1
+  if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! bash -n "$tmp"; then rm -f "$tmp"; return 1; fi
+  chmod 700 "$tmp" && mv -f "$tmp" "$ACME_RUNNER" || return 1
+  cat > "$ACME_UNIT_DIR/onevps-acme.service" <<EOF_SERVICE
+[Unit]
+Description=Renew OneVPS ACME certificates
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $ACME_RUNNER --acme-renew
+UMask=0077
+TimeoutStartSec=30min
+EOF_SERVICE
+  cat > "$ACME_UNIT_DIR/onevps-acme.timer" <<'EOF_TIMER'
+[Unit]
+Description=Check OneVPS certificate renewal twice daily
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  systemctl daemon-reload && systemctl enable --now onevps-acme.timer
+}
+
+# Append an explicit HTTP-only vhost; never stop Caddy or edit existing site blocks.
+acme_caddy_route() {
+  local domain="$1" file="$2" backup
+  grep -qF "# OneVPS-acme:$domain BEGIN" "$file" && return 0
+  if grep -qiF "$domain" "$file"; then
+    err 'domain already exists in Caddyfile; use a dedicated HY2 domain or manual certificate'; return 1
+  fi
+  backup=$(mktemp "$ACME_DIR/.caddy.XXXXXXXX") || return 1
+  cp -p "$file" "$backup" || return 1
+  cat >> "$file" <<EOF_ROUTE
+
+# OneVPS-acme:$domain BEGIN
+http://$domain {
+    handle /.well-known/acme-challenge/* {
+        root * $ACME_WEBROOT
+        file_server
+    }
+    handle {
+        respond 404
+    }
+}
+# OneVPS-acme:$domain END
+EOF_ROUTE
+  if ! caddy_reload "$file"; then
+    cp -p "$backup" "$file" && caddy_reload "$file" || err "Caddy restore failed; backup: $backup"
+    return 1
+  fi
+  rm -f "$backup"
+}
+
+acme_challenge_mode() {
+  local domain="$1" meta="$ACME_DIR/domains/$1.json" file mode
+  if [[ -f "$meta" ]]; then
+    mode=$(jq -er '.mode' "$meta") || return 1
+    if [[ "$mode" == webroot ]]; then
+      file=$(jq -er '.caddy_file' "$meta") || return 1
+      systemctl is-active --quiet caddy && acme_caddy_route "$domain" "$file" >&2 || return 1
+      echo webroot; return
+    fi
+    if [[ "$mode" == standalone ]] && port_in_use 80 tcp; then
+      err 'standalone renewal requires free TCP 80; refusing to stop the listener or silently change the saved ACME mode'
+      return 1
+    fi
+  fi
+  if port_in_use 80 tcp; then
+    systemctl is-active --quiet caddy || { err 'TCP 80 is occupied by a non-Caddy service; refusing to interrupt it'; return 1; }
+    file=$(find_caddyfile)
+    [[ -n "$file" && -f "$file" ]] || { err 'Caddyfile not found'; return 1; }
+    acme_caddy_route "$domain" "$file" >&2 || return 1
+    mode=webroot
+  else
+    mode=standalone; file=''
+    command -v socat >/dev/null 2>&1 || pkg_install socat >&2 || return 1
+  fi
+  jq -n --arg mode "$mode" --arg file "$file" '{mode:$mode,caddy_file:$file}' > "$meta" || return 1
+  echo "$mode"
+}
+
+# Switch a symlink to a complete key/cert pair, retaining the previous pair on failure.
+acme_deploy() (
+  local domain="$1" stage="$ACME_DIR/staging/$1" dir="$ACME_CERT_DIR/$1"
+  local version previous='' active=false switched=false committed=false used=false check_log ng
+  acme_domain_valid "$domain" || return 1
+  validate_hy2_pem "$domain" "$stage/fullchain.pem" "$stage/key.pem" || return 1
+  ng=$(id -gn nobody) || return 1
+  mkdir -p "$dir" || return 1
+  chown root:"$ng" "$dir" && chmod 750 "$dir" || return 1
+  version=$(mktemp -d "$dir/cert.XXXXXXXX") || return 1
+  check_log="$version/check.log"
+  if [[ -L "$dir/current" ]]; then previous=$(readlink "$dir/current") || return 1
+  elif [[ -e "$dir/current" ]]; then err 'refusing unmanaged current certificate'; return 1; fi
+  deploy_cleanup() {
+    local status=$? failed=false
+    trap - EXIT INT TERM HUP
+    if $switched && ! $committed; then
+      if [[ -n "$previous" ]]; then
+        ln -s "$previous" "$version/rollback" && mv -Tf "$version/rollback" "$dir/current" || failed=true
+      else rm -f "$dir/current" || failed=true; fi
+      if $active; then systemctl restart xray && systemctl is-active --quiet xray || failed=true; fi
+      if $failed; then err "certificate rollback failed; retained $version"; exit 1; fi
+    fi
+    if ! $committed; then rm -rf "$version"; fi
+    exit "$status"
+  }
+  trap deploy_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  install -m 640 "$stage/fullchain.pem" "$version/fullchain.pem" &&
+    install -m 640 "$stage/key.pem" "$version/key.pem" || return 1
+  chown -R root:"$ng" "$version" && chmod 750 "$version" || return 1
+  if [[ -n "$previous" ]] && cmp -s "$version/fullchain.pem" "$dir/current/fullchain.pem" &&
+    cmp -s "$version/key.pem" "$dir/current/key.pem"; then return 0; fi
+  if [[ -f "$XRAY_NODES" ]] && jq -e --arg path "$dir/current/fullchain.pem" \
+    'any(.nodes[]; .enabled == true and .tls_cert == $path)' "$XRAY_NODES" >/dev/null; then used=true; fi
+  if $used && systemctl is-active --quiet xray; then active=true; fi
+  ln -s "$(basename "$version")" "$version/next" || return 1
+  switched=true
+  # GNU mv -T replaces the symlink itself, never follows it as a directory.
+  mv -Tf "$version/next" "$dir/current" || return 1
+  if $used; then validate_xray_config "$XRAY_CONF" "$check_log" || return 1; fi
+  if $active; then systemctl restart xray && systemctl is-active --quiet xray || return 1; fi
+  committed=true
+  rm -f "$check_log"
+  local old
+  for old in "$dir/"cert.*; do
+    [[ -d "$old" && ! -L "$old" && "$old" != "$version" && "$(basename "$old")" != "$previous" ]] || continue
+    rm -rf "$old"
+  done
+  ok "certificate deployed: $domain"
+)
+
+acme_process_domain() {
+  local domain="$1" action="$2" mode status=0
+  acme_domain_valid "$domain" || { err 'invalid ACME domain'; return 1; }
+  mode=$(acme_challenge_mode "$domain") || return 1
+  local -a challenge=(--standalone)
+  [[ "$mode" != webroot ]] || challenge=(--webroot "$ACME_WEBROOT")
+  open_port 80 tcp
+  if [[ "$action" == issue ]]; then
+    # Let\'s Encrypt accepts registration without contact; do not select ZeroSSL's EAB flow.
+    acme_exec --issue -d "$domain" --keylength ec-256 "${challenge[@]}" || status=$?
+  else
+    acme_exec --renew -d "$domain" --ecc "${challenge[@]}" || status=$?
+  fi
+  [[ "$status" == 0 || "$status" == 2 ]] || return "$status"
+  mkdir -p "$ACME_DIR/staging/$domain" || return 1
+  acme_exec --install-cert -d "$domain" --ecc \
+    --key-file "$ACME_DIR/staging/$domain/key.pem" \
+    --fullchain-file "$ACME_DIR/staging/$domain/fullchain.pem" || return 1
+  acme_deploy "$domain"
+}
+
+acme_issue() (
+  local domain="$1"
+  acme_domain_valid "$domain" || { err 'invalid ACME domain'; return 1; }
+  command -v flock >/dev/null 2>&1 && command -v ss >/dev/null 2>&1 || {
+    err 'automatic ACME requires flock and ss'; return 1;
+  }
+  acme_install || return 1
+  exec 9> "$ACME_DIR/operation.lock"
+  flock -n 9 || { err 'another certificate operation is running'; return 1; }
+  info "Let's Encrypt HTTP-01: DNS must point here; public TCP 80 must remain reachable for renewals."
+  info 'No email, account password, DNS API key or certificate path is required.'
+  acme_process_domain "$domain" issue
+)
+
+acme_renew_all() (
+  acme_owned || return 0
+  exec 9> "$ACME_DIR/operation.lock"
+  flock -n 9 || return 0
+  local file domain failed=0
+  shopt -s nullglob
+  for file in "$ACME_DIR/domains/"*.json; do
+    domain=$(basename "$file" .json)
+    acme_process_domain "$domain" renew || { err "certificate renewal/deployment failed: $domain"; failed=1; }
+  done
+  return "$failed"
+)
+
+acme_uninstall() {
+  acme_owned || return 0
+  confirm 'Remove OneVPS ACME account, certificates and renewal timer? External certificates are kept.' n || return 0
+  local meta domain file candidate
+  systemctl stop onevps-acme.timer onevps-acme.service && systemctl disable onevps-acme.timer || return 1
+  for meta in "$ACME_DIR/domains/"*.json; do
+    [[ -f "$meta" ]] || continue
+    domain=$(basename "$meta" .json)
+    acme_domain_valid "$domain" || return 1
+    file=$(jq -r '.caddy_file // ""' "$meta") || return 1
+    if [[ -n "$file" && -f "$file" ]]; then
+      cp -p "$file" "$ACME_DIR/caddy-uninstall.backup" || return 1
+      candidate=$(mktemp "$ACME_DIR/.caddy-remove.XXXXXXXX") || return 1
+      awk -v begin="# OneVPS-acme:$domain BEGIN" -v end="# OneVPS-acme:$domain END" '
+        $0 == begin {skip=1; next} $0 == end {skip=0; next} !skip {print}
+      ' "$file" > "$candidate" && cat "$candidate" > "$file" || return 1
+      rm -f "$candidate"
+      if ! caddy_reload "$file"; then
+        cp -p "$ACME_DIR/caddy-uninstall.backup" "$file"
+        caddy_reload "$file" || true
+        err 'ACME cleanup stopped; files retained'; return 1
+      fi
+    fi
+  done
+  rm -f "$ACME_UNIT_DIR/onevps-acme.timer" "$ACME_UNIT_DIR/onevps-acme.service" "$ACME_RUNNER"
+  rm -rf "$ACME_DIR" "$ACME_CERT_DIR" "$ACME_WEBROOT"
+  systemctl daemon-reload
+}
+
+certificate_menu() {
+  local choice domain file
+  while :; do
+    printf '\nCertificates (OneVPS ACME)\n1) Status / expiry\n2) Apply certificate (domain only)\n3) Check renewals / retry deployment\n4) Renewal logs\n0) Back\n'
+    choice=$(ask 'Select')
+    case "$choice" in
+      0|'') return ;;
+      1)
+        if acme_owned; then
+          systemctl --no-pager status onevps-acme.timer || true
+          for file in "$ACME_CERT_DIR/"*/current/fullchain.pem; do
+            [[ -f "$file" ]] || continue
+            printf '\n%s\n' "$file"; openssl x509 -in "$file" -noout -subject -dates || true
+          done
+        else info 'no OneVPS ACME installation'; fi ;;
+      2)
+        domain=$(normalize_domain "$(ask 'Domain')")
+        acme_issue "$domain" || err 'certificate was not deployed' ;;
+      3) acme_renew_all || err 'renewal failed; see logs' ;;
+      4) journalctl -u onevps-acme.service --no-pager -n 60 || true ;;
+      *) warn 'invalid selection' ;;
+    esac
+  done
+}
+
+require_hy2_core() {
+  local version minimum major minor patch
+  version=$("$XRAY_BIN" version 2>/dev/null | head -n 1) || return 1
+  if [[ "$version" =~ ^Xray[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]})); patch=$((10#${BASH_REMATCH[3]}))
+    minimum=$((26 * 10000 + 10 * 100 + 21))
+    (( major * 10000 + minor * 100 + patch >= minimum )) && return 0
+  fi
+  err "Hysteria2 requires tested Xray >= $HY2_MIN_VERSION; update Xray first"
+  return 1
+}
+
+validate_hy2_certificate() {
+  local domain="$1" cert="$2" key="$3" path
+  for path in "$cert" "$key"; do
+    [[ "$path" == /* && -f "$path" && -r "$path" ]] || { err 'certificate/key must be readable absolute file paths'; return 1; }
+    case "$path" in
+      /root/*|/home/*|/run/user/*|/tmp/*|/var/tmp/*)
+        err 'certificate/key path is hidden by the Xray systemd sandbox; use a persistent path under /etc'; return 1 ;;
+    esac
+    path=$(readlink -f -- "$path") || return 1
+    case "$path" in
+      /root/*|/home/*|/run/user/*|/tmp/*|/var/tmp/*)
+        err 'certificate/key path is hidden by the Xray systemd sandbox; use a persistent path under /etc'; return 1 ;;
+    esac
+    runuser -u nobody -- test -r "$path" || { err 'certificate/key must be readable by nobody (including parent directories)'; return 1; }
+  done
+  validate_hy2_pem "$domain" "$cert" "$key"
+}
+
+validate_hy2_pem() {
+  local domain="$1" cert="$2" key="$3" cert_pub key_pub
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 &&
+    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1 || {
+      err 'certificate is expired, invalid or does not match the domain'; return 1;
+    }
+  cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null) || return 1
+  key_pub=$(openssl pkey -in "$key" -passin pass: -pubout 2>/dev/null) || return 1
+  [[ "$cert_pub" == "$key_pub" ]] || { err 'certificate and unencrypted private key do not match'; return 1; }
+}
+
+build_hysteria_inbound() {
+  local n="$1" users
+  users=$(node_clients "$n") || return 1
+  jq -c --argjson users "$users" '{
+    tag,listen:"0.0.0.0",port,protocol:"hysteria",
+    settings:{version:2,users:$users},
+    streamSettings:{network:"hysteria",security:"tls",
+      tlsSettings:{serverName:.domain,alpn:["h3"],certificates:[{
+        usage:"encipherment",certificateFile:.tls_cert,keyFile:.tls_key}]},
+      hysteriaSettings:{version:2}}
+  }' <<<"$n"
+}
+
+# HY2 mutations use the existing validated configuration/service transaction.
+prepare_hy2_change() {
+  local source="$1" output="$2" id="$3" action="$4" value="${5:-null}"
+  validate_node_metadata "$source" || return 1
+  if [[ "$action" == add ]]; then
+    jq -e --arg id "$id" 'all(.nodes[]; .id != $id)' "$source" >/dev/null || return 1
+    jq -e --arg id "$id" '.id == $id and .type == "hysteria2"' <<<"$value" >/dev/null || return 1
+    jq --argjson node "$value" '.nodes += [$node]' "$source" > "$output" || return 1
+  else
+    jq -e --arg id "$id" 'any(.nodes[]; .id == $id and .type == "hysteria2")' "$source" >/dev/null || return 1
+    case "$action" in
+      port) jq --arg id "$id" --argjson port "$value" '(.nodes[]|select(.id==$id)).port=$port' "$source" > "$output" ;;
+      toggle) jq --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= not' "$source" > "$output" ;;
+      delete) jq --arg id "$id" 'del(.nodes[]|select(.id==$id))' "$source" > "$output" ;;
+      *) return 1 ;;
+    esac || return 1
+  fi
+  validate_node_metadata "$output" || return 1
+  jq -e '[.nodes[] | select(.type == "hysteria2") | .port] | length == (unique | length)' "$output" >/dev/null
+}
+
+add_hysteria_node() {
+  require_xray
+  require_hy2_core || { pause; return 0; }
+  command -v ss >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 || {
+    err 'Hysteria2 setup requires ss (iproute2) and runuser (util-linux)'; pause; return 0;
+  }
+  ensure_nodes_file
+  local name domain password cert key port id node certificate_mode
+  info 'Add Hysteria2 (native Xray, QUIC/UDP + TLS)'
+  warn 'Use a DNS-only domain pointing to this server. Automatic ACME requires public TCP 80.'
+  name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
+  domain=$(normalize_domain "$(ask 'TLS domain')")
+  is_valid_domain "$domain" || { err 'invalid domain'; pause; return 0; }
+  certificate_mode=$(ask 'Certificate: 1) Automatic ACME  2) Existing PEM' 1)
+  case "$certificate_mode" in
+    1)
+      acme_issue "$domain" || { err 'automatic certificate setup failed'; pause; return 0; }
+      cert="$ACME_CERT_DIR/$domain/current/fullchain.pem"
+      key="$ACME_CERT_DIR/$domain/current/key.pem" ;;
+    2)
+      cert=$(ask 'Absolute PEM certificate/full-chain path')
+      key=$(ask 'Absolute unencrypted PEM private-key path') ;;
+    *) err 'invalid certificate mode'; pause; return 0 ;;
+  esac
+  validate_hy2_certificate "$domain" "$cert" "$key" || { pause; return 0; }
+  while :; do
+    port=$(ask 'UDP listen port (Caddy HTTP/3 may already use UDP 443)' 443)
+    realm_valid_port "$port" || { warn 'invalid port'; continue; }
+    port=$((10#$port))
+    if port_taken_by_node "$port" udp || port_in_use "$port" udp; then
+      warn 'UDP port is already in use'; continue
+    fi
+    break
+  done
+  password=$(ask 'Password (Enter for random)' "$(rand_password)")
+  id=$(openssl rand -hex 4)
+  node=$(jq -nc --arg id "$id" --arg name "$name" --arg domain "$domain" \
+    --arg password "$password" --arg cert "$cert" --arg key "$key" --argjson port "$port" \
+    '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:$password,
+      port:$port,tls_cert:$cert,tls_key:$key,enabled:true}') || return 1
+  if apply_candidate_transaction prepare_hy2_change "$id" add "$node"; then
+    open_port "$port" udp
+    ok 'Hysteria2 node added; also allow this UDP port in your cloud firewall'
+    node_link "$node"
+  else
+    err 'Hysteria2 node not added'
+  fi
+  pause
 }
 
 build_reality_inbound() {
@@ -1554,6 +1997,12 @@ node_link() {
       "$(jq -r '.reality_target' <<<"$n")" "$(jq -r '.reality_target_port // 443' <<<"$n")" \
       "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
 
+  elif [[ "$type" == "hysteria2" ]]; then
+    pw=$(jq -r '.password' <<<"$n")
+    domain=$(jq -r '.domain' <<<"$n")
+    printf '\n%s-- %s (Hysteria2 + QUIC + TLS) --%s\n' "$c_grn" "$name" "$c_rst"
+    printf 'hysteria2://%s@%s:%s/?sni=%s#%s\n' \
+      "$(urlenc "$pw")" "$domain" "$port" "$(urlenc "$domain")" "$(urlenc "$name")"
   elif [[ "$type" == "trojan-ws" ]]; then
     pw=$(jq -r '.password' <<<"$n")
     domain=$(jq -r '.domain' <<<"$n")
@@ -1586,6 +2035,7 @@ list_nodes() {
     en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
     case "$(jq -r '.type' <<<"$n")" in
       trojan-ws) kind="trojan"; dest=$(jq -r '.domain' <<<"$n") ;;
+      hysteria2) kind="hy2"; dest=$(jq -r '.domain' <<<"$n") ;;
       *)         kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
     esac
     printf '  %d) %-18s %-8s port:%-6s %-26s %s\n' \
@@ -1619,7 +2069,19 @@ manage_nodes() {
   while :; do
     clear
     node_link "$n"
-    if [[ "$type" == "trojan-ws" ]]; then
+    if [[ "$type" == "hysteria2" ]]; then
+      printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
+      case "$(ask 'Select')" in
+        1) edit_port "$id" ;;
+        2) reset_trojan_password "$id" ;;
+        5) toggle_enabled "$id" ;;
+        6) del_node "$id"; return ;;
+        7) manage_node_users "$id" || true ;;
+        8) manage_outbound "$id" || true ;;
+        0|"") return ;;
+        *) continue ;;
+      esac
+    elif [[ "$type" == "trojan-ws" ]]; then
       cat <<EOF
 
   Connection settings:
@@ -1692,23 +2154,32 @@ EOF
 }
 
 edit_port() {
-  local id="$1" n newp oldp
+  local id="$1" n newp oldp proto=tcp
   n=$(node_by_id "$id")
+  [[ $(jq -r '.type' <<<"$n") != hysteria2 ]] || proto=udp
   while :; do
     newp=$(ask "New port" "$(jq -r '.port' <<<"$n")")
     [[ "$newp" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
     newp=$((10#$newp))
     (( newp >= 1 && newp <= 65535 )) || { warn "port out of range"; continue; }
-    if jq -e --argjson p "$newp" --arg id "$id" \
-        '.nodes[]|select(.port==$p and .id!=$id)' "$XRAY_NODES" >/dev/null 2>&1; then
+    if port_taken_by_node "$newp" "$proto" "$id"; then
       warn "port used by another node"; continue
     fi
-    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp"; then
+    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp" "$proto"; then
+      if [[ "$proto" == udp ]]; then warn 'UDP port is already in use'; continue; fi
       confirm "Port $newp appears to be in use. Use anyway?" n || continue
     fi
     break
   done
   oldp=$(jq -r '.port' <<<"$n")
+  if [[ "$proto" == udp ]]; then
+    if apply_candidate_transaction prepare_hy2_change "$id" port "$newp"; then
+      [[ "$newp" == "$oldp" ]] || close_port "$oldp" udp
+      open_port "$newp" udp
+      ok "port changed to $newp"
+    else err 'port unchanged'; fi
+    pause; return
+  fi
   jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p'
   if [[ "$newp" != "$oldp" ]]; then close_port "$oldp" tcp; fi
   open_port "$newp" tcp
@@ -1829,6 +2300,10 @@ rebuild_trojan_route() {
 
 toggle_enabled() {
   local id="$1"
+  if [[ $(node_by_id "$id" | jq -r '.type') == hysteria2 ]]; then
+    apply_candidate_transaction prepare_hy2_change "$id" toggle && ok 'enabled state toggled' || err 'apply failed'
+    pause; return
+  fi
   jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)'
   rebuild_config && ok "enabled state toggled" || err "apply failed"
   pause
@@ -1840,6 +2315,13 @@ del_node() {
   n=$(node_by_id "$id")
   port=$(jq -r '.port' <<<"$n")
   type=$(jq -r '.type' <<<"$n")
+  if [[ "$type" == hysteria2 ]]; then
+    if apply_candidate_transaction prepare_hy2_change "$id" delete; then
+      close_port "$port" udp
+      ok 'deleted; externally managed certificate files were kept'
+    else err 'delete failed'; fi
+    pause; return
+  fi
   jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
   if [[ "$type" == "trojan-ws" ]]; then
     cf=$(jq -r '.caddy_file' <<<"$n")
@@ -2031,6 +2513,7 @@ uninstall() {
   warn "Uninstall removes Xray binary, config, onevps nodes and logs"
   warn "(BBR/system tuning configs and the swap file are kept)"
   confirm "Confirm uninstall?" n || return
+  acme_uninstall || { err 'ACME cleanup failed; Xray uninstall cancelled'; return 1; }
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
   rm -f "$XRAY_SERVICE" /etc/systemd/system/xray@.service
@@ -2371,6 +2854,34 @@ status_line() {
   fi
 }
 
+node_menu() {
+  while :; do
+    printf '\nNodes / share links:\n1) Add VLESS Reality\n2) Add Trojan WS\n3) Add Hysteria2\n4) Manage nodes / users / outbound\n5) Show share links\n0) Back\n'
+    case "$(ask 'Select')" in
+      1) add_reality_node ;;
+      2) add_trojan_node ;;
+      3) add_hysteria_node ;;
+      4) manage_nodes ;;
+      5) show_links ;;
+      0|"") return ;;
+      *) warn 'invalid selection' ;;
+    esac
+  done
+}
+
+network_menu() {
+  while :; do
+    printf '\nService / network:\n1) Restart Xray service\n2) Enable BBR / show status\n3) TCP optimization\n0) Back\n'
+    case "$(ask 'Select')" in
+      1) restart_service ;;
+      2) enable_bbr || { err 'BBR configuration failed; some settings may already be applied'; pause; } ;;
+      3) optimize_system ;;
+      0|"") return ;;
+      *) warn 'invalid selection' ;;
+    esac
+  done
+}
+
 main_menu() {
   while :; do
     clear
@@ -2380,27 +2891,17 @@ main_menu() {
  ╚════════════════════════════════════════════════╝
 EOF
     status_line
-    cat <<EOF
+    cat <<'EOF'
 
-  Xray setup:
+  Setup / management:
    1) Install / update Xray-core
-
-  Nodes / share links:
-   2) Add node - VLESS + Reality + Vision + uTLS
-   3) Add node - Trojan + WS (behind Caddy)
-   4) Manage nodes / users / outbound
-   5) Show default node share links
-
-  Relay:
-  10) Manage Realm relay (independent of Xray)
-
-  Service / network:
-   6) Restart Xray service
-   7) Enable BBR / show status
-   8) TCP optimization
+   2) Nodes / users / outbound / share links
+   3) Certificates (automatic ACME)
+   4) Realm relay
+   5) Service / network
 
   Script:
-  11) Update script
+   6) Update script
 
   Danger zone:
    9) Uninstall Xray (keep Realm / Caddy)
@@ -2409,24 +2910,24 @@ EOF
 EOF
     case "$(ask 'Select')" in
       1) install_xray; pause ;;
-      2) add_reality_node ;;
-      3) add_trojan_node ;;
-      4) manage_nodes ;;
-      5) show_links ;;
-      6) restart_service ;;
-      7) enable_bbr || { err "BBR configuration failed; some settings may already be applied"; pause; } ;;
-      8) optimize_system ;;
+      2) node_menu ;;
+      3) certificate_menu ;;
+      4) realm_menu ;;
+      5) network_menu ;;
+      6) if update_script; then return 0; else pause; fi ;;
       9) uninstall ;;
-      10) realm_menu ;;
-      11) if update_script; then return 0; else pause; fi ;;
       0|"") exit 0 ;;
-      *) ;;
+      *) warn 'invalid selection' ;;
     esac
   done
 }
 
 main() {
   check_env
+  if [[ "${1:-}" == --acme-renew ]]; then
+    acme_renew_all
+    return
+  fi
   main_menu
 }
 
