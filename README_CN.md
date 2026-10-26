@@ -100,11 +100,18 @@ Service / network:
  7) Enable BBR / show status
  8) TCP optimization
 
+Script:
+11) Update script
+
 Danger zone:
  9) Uninstall Xray (keep Realm / Caddy)
 
  0) Exit
 ```
+
+菜单 `11`（**Update script**）确认后从仓库 `main` 分支下载 OneVPS，检查 Bash 语法并启动更新后的菜单，
+不显示脚本版本号。本地脚本通过校验后才替换；通过管道式便捷命令启动时，使用临时脚本更新当前会话。
+下载或校验失败不会修改当前脚本。更新脚本不会升级 Xray 或 Realm。
 
 ## 耗时操作反馈
 

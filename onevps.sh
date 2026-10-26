@@ -17,6 +17,8 @@ XRAY_CONF=$XRAY_DIR/config.json
 XRAY_NODES=$XRAY_DIR/onevps-nodes.json
 XRAY_SERVICE=/etc/systemd/system/xray.service
 XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+ONEVPS_UPDATE_URL=https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
+ONEVPS_SCRIPT_PATH=${BASH_SOURCE[0]}
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 BBR_CONF=/etc/sysctl.d/99-bbr.conf
 REALITY_PROBE_ROUNDS=3
@@ -2316,6 +2318,46 @@ realm_menu() {
 # ----------------------------------------------------------------------------
 # Main menu
 # ----------------------------------------------------------------------------
+update_script() (
+  local target="$ONEVPS_SCRIPT_PATH" tmp first_line=""
+  warn "This downloads and runs OneVPS from the repository main branch."
+  confirm "Update script now?" || return 1
+  ensure_deps || return 1
+  if [[ -f "$target" && ! -L "$target" ]]; then
+    tmp=$(mktemp -d "$(dirname -- "$target")/.onevps-update.XXXXXX") || return 1
+  elif [[ "$target" == /dev/fd/* || "$target" == /proc/self/fd/* ]]; then
+    target=""
+    tmp=$(mktemp -d) || return 1
+  else
+    err "script path is not a regular file; download onevps.sh again to update"
+    return 1
+  fi
+  trap 'rm -rf -- "$tmp"' EXIT
+  if [[ -n "$target" ]]; then
+    cp -p -- "$target" "$tmp/onevps.sh" || return 1
+  fi
+  if ! download_file --connect-timeout 15 --max-time 180 "$ONEVPS_UPDATE_URL" -o "$tmp/onevps.sh"; then
+    err "script download failed; current script unchanged"
+    return 1
+  fi
+  IFS= read -r first_line < "$tmp/onevps.sh" || true
+  if [[ "$first_line" != '#!/usr/bin/env bash' ]] || ! bash -n "$tmp/onevps.sh"; then
+    err "downloaded script is invalid; current script unchanged"
+    return 1
+  fi
+  if [[ -n "$target" ]]; then
+    if ! mv -f -- "$tmp/onevps.sh" "$target"; then
+      err "script replacement failed; current script unchanged"
+      return 1
+    fi
+    ok "script updated; starting the updated menu"
+    bash "$target"
+  else
+    ok "starting the updated script for this session (streamed launch)"
+    bash "$tmp/onevps.sh"
+  fi
+)
+
 status_line() {
   if [[ -x "$XRAY_BIN" ]]; then
     local v st bbr_cc
@@ -2357,6 +2399,9 @@ EOF
    7) Enable BBR / show status
    8) TCP optimization
 
+  Script:
+  11) Update script
+
   Danger zone:
    9) Uninstall Xray (keep Realm / Caddy)
 
@@ -2373,6 +2418,7 @@ EOF
       8) optimize_system ;;
       9) uninstall ;;
       10) realm_menu ;;
+      11) if update_script; then return 0; else pause; fi ;;
       0|"") exit 0 ;;
       *) ;;
     esac

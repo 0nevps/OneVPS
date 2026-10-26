@@ -109,11 +109,19 @@ Service / network:
  7) Enable BBR / show status
  8) TCP optimization
 
+Script:
+11) Update script
+
 Danger zone:
  9) Uninstall Xray (keep Realm / Caddy)
 
  0) Exit
 ```
+
+Option `11` (**Update script**) downloads OneVPS from the repository `main` branch after confirmation,
+checks Bash syntax, and starts the updated menu. No script version is displayed. A local script is replaced
+only after validation; a streamed launch uses a temporary script for the current session. Download or
+validation failures leave the current script unchanged. Updating the script does not update Xray or Realm.
 
 ## Long-running operations
 

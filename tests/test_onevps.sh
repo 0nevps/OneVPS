@@ -623,14 +623,72 @@ for node_id in a1b2c3d4 b2c3d4e5; do
        "$(command cat "$capture")" == "$selected all []"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
   ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
+# Script updates use local fixtures only; no download or host operation runs.
+(
+  ONEVPS_SCRIPT_PATH="$TEST_TMP/update-target.sh"
+  printf '#!/usr/bin/env bash\nprintf "old script\\n"\n' > "$ONEVPS_SCRIPT_PATH"
+  chmod 750 "$ONEVPS_SCRIPT_PATH"
+  cp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-before"
+  printf '#!/usr/bin/env bash\nprintf "updated script\\n"\n' > "$TEST_TMP/update-latest"
+  confirm() { return 0; }
+  ensure_deps() { :; }
+  download_file() {
+    [[ "$*" == *https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh* ]] || return 1
+    local destination="${!#}"
+    case "$update_mode" in
+      failed) printf 'partial download\n' > "$destination"; return 22 ;;
+      empty) : > "$destination" ;;
+      invalid) printf '#!/usr/bin/env bash\nif\n' > "$destination" ;;
+      html) printf '<html>Not a script</html>\n' > "$destination" ;;
+      *) cp "$TEST_TMP/update-latest" "$destination" ;;
+    esac
+  }
+  for update_mode in failed empty invalid html; do
+    if update_script; then exit 1; fi
+    cmp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-before" || exit 1
+  done
+  update_mode=ok
+  confirm() { return 1; }
+  if update_script; then exit 1; fi
+  cmp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-before" || exit 1
+  confirm() { return 0; }
+  mv() { return 1; }
+  if update_script; then exit 1; fi
+  cmp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-before" || exit 1
+  unset -f mv
+  output=$(update_script) || exit 1
+  [[ "$output" == *'updated script'* ]] || exit 1
+  cmp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-latest" || exit 1
+  [[ -x "$ONEVPS_SCRIPT_PATH" ]] || exit 1
+  ONEVPS_SCRIPT_PATH=/dev/fd/63
+  output=$(update_script) || exit 1
+  [[ "$output" == *'updated script'* ]] || exit 1
+  shopt -s nullglob
+  leftovers=("$TEST_TMP"/.onevps-update.*)
+  ((${#leftovers[@]} == 0)) || exit 1
+) || fail 'script update validates downloads, preserves files on failure and supports streamed launches'
+pass 'script update validates downloads, preserves files on failure and supports streamed launches'
+
 printf '11\n0\n' > "$TEST_TMP/menu-input"
-assert_true "main menu removes and ignores connection-user option 11" bash -c '
+assert_true "main menu exposes script update without a version and exits the old menu after success" bash -c '
   source "$1"; exec 3< "$2"
-  clear() { :; }; status_line() { :; }
+  clear() { :; }; status_line() { :; }; pause() { :; }
   ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
   manage_users() { printf "REMOVED_DISPATCH\n"; }
+  update_script() { printf "UPDATE_DISPATCH\n"; }
   output=$(main_menu)
-  [[ "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* ]]
+  [[ "$output" == *"Script:"*"11) Update script"*UPDATE_DISPATCH &&
+     "$output" != *"Manage connection users"* && "$output" != *REMOVED_DISPATCH* &&
+     "$output" != *"version"* ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
+printf '11\n0\n' > "$TEST_TMP/menu-input"
+assert_true "failed script update returns to the current menu" bash -c '
+  source "$1"; exec 3< "$2"
+  clear() { :; }; status_line() { :; }; pause() { printf "UPDATE_FAILED\n"; }
+  ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
+  update_script() { return 1; }
+  output=$(main_menu)
+  [[ "$output" == *UPDATE_FAILED*"Script:"*"11) Update script"* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input"
 for removed in manage_users show_user_links prepare_user_assignment apply_user_assignment validate_user_metadata; do
   assert_false "removed function $removed is absent" declare -F "$removed"
