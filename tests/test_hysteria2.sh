@@ -48,6 +48,24 @@ printf '#!/usr/bin/env bash\nprintf "Xray 26.10.21\\n"\n' > "$TEST_TMP/core"
 chmod +x "$TEST_TMP/core"
 XRAY_BIN="$TEST_TMP/core"
 check 'supported core version' require_hy2_core
+cat > "$TEST_TMP/core" <<'CORE'
+#!/usr/bin/env bash
+printf 'Xray 26.10.21\n'
+for ((i=0; i<10000; i++)); do
+  printf 'additional version output line %s\n' "$i"
+done
+CORE
+check 'large multiline version output does not trigger SIGPIPE' require_hy2_core
+printf '#!/usr/bin/env bash\nprintf "loader failure\\n" >&2\nexit 42\n' > "$TEST_TMP/core"
+reject 'version command failure rejected' require_hy2_core 2> "$TEST_TMP/version-error"
+check 'version command failure includes original diagnostic' grep -q 'loader failure' "$TEST_TMP/version-error"
+check 'version command failure includes exit status' grep -q 'exit 42' "$TEST_TMP/version-error"
+printf '#!/usr/bin/env bash\nprintf "unexpected version\\n"\n' > "$TEST_TMP/core"
+reject 'unrecognized version rejected' require_hy2_core 2> "$TEST_TMP/version-error"
+check 'unrecognized version has actionable diagnostic' grep -q 'Cannot parse Xray version: unexpected version' "$TEST_TMP/version-error"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_TMP/core"
+reject 'empty version rejected' require_hy2_core 2> "$TEST_TMP/version-error"
+check 'empty version has diagnostic' grep -q 'Cannot parse Xray version: <empty output>' "$TEST_TMP/version-error"
 printf '#!/usr/bin/env bash\nprintf "Xray 26.3.27\\n"\n' > "$TEST_TMP/core"
 reject 'older core rejected' require_hy2_core
 printf '#!/usr/bin/env bash\nprintf "Xray 26.10.21\\n"\n' > "$TEST_TMP/core"

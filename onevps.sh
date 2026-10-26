@@ -1526,12 +1526,22 @@ certificate_menu() {
 }
 
 require_hy2_core() {
-  local version minimum major minor patch
-  version=$("$XRAY_BIN" version 2>/dev/null | head -n 1) || return 1
+  local version minimum major minor patch status
+  if version=$("$XRAY_BIN" version); then
+    # Consume all output before selecting the first line to avoid SIGPIPE.
+    version=${version%%$'\n'*}
+  else
+    status=$?
+    err "Cannot read Xray version from $XRAY_BIN (exit $status); Hysteria2 setup aborted"
+    return 1
+  fi
   if [[ "$version" =~ ^Xray[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
     major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]})); patch=$((10#${BASH_REMATCH[3]}))
     minimum=$((26 * 10000 + 10 * 100 + 21))
     (( major * 10000 + minor * 100 + patch >= minimum )) && return 0
+  else
+    err "Cannot parse Xray version: ${version:-<empty output>}; Hysteria2 setup aborted"
+    return 1
   fi
   err "Hysteria2 requires tested Xray >= $HY2_MIN_VERSION; update Xray first"
   return 1
