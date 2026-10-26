@@ -57,20 +57,20 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 
 稳定版本 tag 通过 CI 验证后自动发布脚本和校验文件。补发已有版本见[发布流程](CONTRIBUTING.md#releases)。
 
-推荐使用带校验文件的正式版本：
+从仓库 `main` 分支下载脚本，审阅后运行：
 
 ```bash
-curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh
-curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/SHA256SUMS
-sha256sum --check SHA256SUMS
+curl -fLO https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 less onevps.sh
 sudo bash onevps.sh
 ```
 
+该地址跟随 `main` 分支更新，不是固定发布版本。Release 中的 `SHA256SUMS` 仅适用于对应发布资产，不能用于校验此仓库下载文件。
+
 已确认环境可信时，也可使用便捷命令：
 
 ```bash
-bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
 ```
 
 便捷命令需要在 root Shell 中运行。首次使用时先选择 `1` 安装或更新 Xray-core，再选择 `2` 添加 Reality 节点，

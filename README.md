@@ -65,20 +65,21 @@ script before running it, especially on an existing server.
 Stable version tags are published automatically after CI validation, with the script and checksum assets.
 See [release procedures](CONTRIBUTING.md#releases) for manual backfills.
 
-Recommended release installation with checksum verification:
+Download the script from the repository's `main` branch and review it before running:
 
 ```bash
-curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh
-curl -fLO https://github.com/0nevps/OneVPS/releases/latest/download/SHA256SUMS
-sha256sum --check SHA256SUMS
+curl -fLO https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 less onevps.sh
 sudo bash onevps.sh
 ```
 
+This URL tracks `main`, not a fixed release. Release `SHA256SUMS` files apply only to their matching release
+assets, not this repository download.
+
 Convenience command for an already trusted environment:
 
 ```bash
-bash <(curl -fsSL https://github.com/0nevps/OneVPS/releases/latest/download/onevps.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
 ```
 
 The convenience command must be run from a root shell. On first use, select `1` to install or update Xray-core,
