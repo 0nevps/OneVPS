@@ -80,6 +80,95 @@ assert_file_jq() {
   fi
 }
 
+# Progress stays on stderr and must not alter command data or exit status.
+progress_output=$(TERM=dumb run_with_progress 'test output' printf '%s\n' 'value with spaces' 2> "$TEST_TMP/progress-log")
+assert_eq 'progress preserves stdout and argument boundaries' 'value with spaces' "$progress_output"
+assert_contains 'non-terminal progress announces the operation' "$(cat "$TEST_TMP/progress-log")" 'test output'
+assert_contains 'non-terminal progress reports completion' "$(cat "$TEST_TMP/progress-log")" 'done'
+assert_false 'non-terminal progress has no animation or ANSI escapes' \
+  command grep -Eq $'\r|\033' "$TEST_TMP/progress-log"
+progress_status=0
+TERM=dumb run_with_progress 'test failure' bash -c 'printf "command error\n" >&2; exit 37' \
+  2> "$TEST_TMP/progress-log" || progress_status=$?
+assert_eq 'progress preserves the failing command exit code' 37 "$progress_status"
+assert_contains 'progress preserves command diagnostics' "$(cat "$TEST_TMP/progress-log")" 'command error'
+assert_contains 'progress reports failure without claiming completion' "$(cat "$TEST_TMP/progress-log")" 'failed (exit 37,'
+assert_false 'failed progress never reports done' command grep -q 'done' "$TEST_TMP/progress-log"
+assert_eq 'progress preserves command stdin' 'input data' \
+  "$(TERM=dumb run_with_progress 'test stdin' cat <<< 'input data' 2> "$TEST_TMP/progress-log")"
+if TERM=dumb bash -c 'source "$1"; run_with_progress "test errexit" false; printf "unreachable\n"' \
+  _ "$ROOT_DIR/onevps.sh" > "$TEST_TMP/progress-errexit" 2>&1; then
+  fail 'progress failure obeys errexit'
+fi
+assert_false 'direct progress failure stops the caller' command grep -q 'unreachable' "$TEST_TMP/progress-errexit"
+
+(
+  state=before
+  change_progress_state() { state=after; }
+  trap 'printf "kept\n"' USR1
+  saved_trap=$(trap -p USR1)
+  TERM=dumb run_with_progress 'test shell state' change_progress_state 2> "$TEST_TMP/progress-log" || exit 1
+  [[ "$state" == after && "$(trap -p USR1)" == "$saved_trap" ]] || exit 1
+) || fail 'progress preserves foreground shell state and caller traps'
+pass 'progress preserves foreground shell state and caller traps'
+(
+  curl() { printf '<%s>\n' "$@"; return 23; }
+  status=0
+  TERM=xterm download_file --max-time 8 'https://example.com/file with spaces' -o "$TEST_TMP/download" \
+    > "$TEST_TMP/download-args" 2> "$TEST_TMP/progress-log" || status=$?
+  [[ "$status" == 23 ]] || exit 1
+  command grep -qx '<-fsSL>' "$TEST_TMP/download-args" || exit 1
+  command grep -qx '<https://example.com/file with spaces>' "$TEST_TMP/download-args" || exit 1
+  if command grep -q 'progress-bar' "$TEST_TMP/download-args"; then exit 1; fi
+) || fail 'redirected downloads preserve curl options, arguments and failures'
+pass 'redirected downloads preserve curl options, arguments and failures'
+(
+  # No package manager runs on the host, including when testing failure paths.
+  apt-get() { printf '%s:%s\n' "${DEBIAN_FRONTEND:-}" "$*" >> "$TEST_TMP/package-calls"; return "$package_status"; }
+  package_status=0
+  # Consumed by pkg_install() in the sourced script.
+  # shellcheck disable=SC2034
+  PKG=apt
+  TERM=dumb pkg_install 'test-package' 2> "$TEST_TMP/progress-log" || exit 1
+  command grep -qx 'noninteractive:update -qq' "$TEST_TMP/package-calls" || exit 1
+  command grep -qx ':install -y -qq test-package' "$TEST_TMP/package-calls" || exit 1
+  : > "$TEST_TMP/package-calls"
+  package_status=42
+  status=0
+  TERM=dumb pkg_install 'test-package' 2> "$TEST_TMP/progress-log" || status=$?
+  [[ "$status" == 42 && $(wc -l < "$TEST_TMP/package-calls") -eq 1 ]] || exit 1
+) || fail 'package progress preserves apt environment and aborts after failed update'
+pass 'package progress preserves apt environment and aborts after failed update'
+(
+  XRAY_BIN="$BASH"
+  # Consumed by auto_pick_reality_target() in the sourced script.
+  # shellcheck disable=SC2034
+  REALITY_DESTS=(failed.example.com working.example.com)
+  # shellcheck disable=SC2034
+  REALITY_PROBE_ROUNDS=2
+  command() { if [[ "$*" == '-v timeout' ]]; then return 0; fi; builtin command "$@"; }
+  date() {
+    local tick
+    tick=$(< "$TEST_TMP/probe-clock")
+    printf '%s\n' "$((tick + 10))" > "$TEST_TMP/probe-clock"
+    printf '%s\n' "$tick"
+  }
+  probe_reality_once() { [[ "$1" == working.example.com ]]; }
+  printf '100\n' > "$TEST_TMP/probe-clock"
+  selected=$(TERM=dumb auto_pick_reality_target 2> "$TEST_TMP/probe-progress") || exit 1
+  [[ "$selected" == working.example.com ]] || exit 1
+  command grep -q 'Reality probe 1/4: failed.example.com (round 1/2)' "$TEST_TMP/probe-progress" || exit 1
+  command grep -q 'Reality progress: 1/4 (25%)' "$TEST_TMP/probe-progress" || exit 1
+  command grep -q 'Reality progress: 4/4 (100%)' "$TEST_TMP/probe-progress" || exit 1
+  command grep -q 'selected working.example.com (2/2, avg 10ms)' "$TEST_TMP/probe-progress" || exit 1
+  probe_reality_once() { return 1; }
+  selected=$(TERM=dumb auto_pick_reality_target 2> "$TEST_TMP/probe-progress") || exit 1
+  [[ "$selected" == failed.example.com ]] || exit 1
+  command grep -q 'all target probes failed' "$TEST_TMP/probe-progress" || exit 1
+  command grep -q 'Reality progress: 4/4 (100%)' "$TEST_TMP/probe-progress" || exit 1
+) || fail 'Reality progress counts completed rounds without changing ranking, latency or fallback'
+pass 'Reality progress counts completed rounds without changing ranking, latency or fallback'
+
 assert_true "accepts a canonical UUID" \
   is_valid_uuid "123e4567-e89b-12d3-a456-426614174000"
 assert_true "accepts uppercase UUID hex" \

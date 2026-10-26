@@ -114,6 +114,16 @@ Danger zone:
  0) Exit
 ```
 
+## Long-running operations
+
+- Downloads show curl's transfer progress bar in interactive terminals.
+- Package installation, Xray installation/updates, service start/reload/restart, public IP lookup, and
+  Reality probes show an activity indicator with elapsed seconds when stderr is a terminal.
+- Reality auto-selection reports the current target and round, plus completed probes and a percentage.
+  This percentage counts finished probes; it does not estimate remaining time or target success rate.
+- Progress goes to stderr, leaving command output unchanged. Redirected output and `TERM=dumb` use plain
+  start/result lines without animation. Existing command output and errors remain visible.
+
 ## Node outbounds
 
 Choose **Set node outbound** (`8`) from a node's management menu, select **All users** or

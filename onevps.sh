@@ -55,6 +55,48 @@ warn() { printf '%s[!]%s %s\n' "$c_ylw" "$c_rst" "$*"; }
 err()  { printf '%s[x]%s %s\n' "$c_red" "$c_rst" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
+# Keep the command in the foreground so stdin, shell state and caller traps survive.
+# Progress uses stderr only; command substitutions must still return clean data.
+run_with_progress() {
+  local label="$1" spinner="" status=0 started=$SECONDS owner
+  shift
+  printf '[*] %s...\n' "$label" >&2
+  if [[ -t 2 && "${TERM:-dumb}" != dumb ]]; then
+    owner=$(exec sh -c 'printf "%s" "$PPID"')
+    (
+      trap 'printf "\r\033[K" >&2' EXIT
+      trap 'exit 0' TERM
+      local frames='|/-\\' frame=0
+      while kill -0 "$owner" 2>/dev/null; do
+        printf '\r\033[K[%s] %s (%ds)' "${frames:frame%4:1}" "$label" "$((SECONDS - started))" >&2
+        frame=$((frame + 1))
+        command sleep 0.2
+      done
+    ) &
+    spinner=$!
+  fi
+  "$@" || status=$?
+  if [[ -n "$spinner" ]]; then
+    kill "$spinner" 2>/dev/null || true
+    wait "$spinner" 2>/dev/null || true
+  fi
+  if (( status == 0 )); then
+    printf '[+] %s: done (%ds)\n' "$label" "$((SECONDS - started))" >&2
+  else
+    printf '[!] %s: failed (exit %d, %ds)\n' "$label" "$status" "$((SECONDS - started))" >&2
+  fi
+  return "$status"
+}
+
+# Curl reports real transfer progress when a terminal is available.
+download_file() {
+  if [[ -t 2 && "${TERM:-dumb}" != dumb ]]; then
+    curl -fSL --progress-bar "$@"
+  else
+    run_with_progress 'Downloading file' curl -fsSL "$@"
+  fi
+}
+
 confirm() {
   local q="$1" def="${2:-n}" ans
   local hint="[y/N]"; [[ "$def" == y ]] && hint="[Y/n]"
@@ -117,8 +159,8 @@ rand_port() {
 
 pub_ip() {
   [[ -n "$PUBIP" ]] && { echo "$PUBIP"; return; }
-  PUBIP=$(curl -fsSL4 --max-time 8 https://api.ipify.org 2>/dev/null \
-       || curl -fsSL4 --max-time 8 https://ifconfig.me 2>/dev/null || true)
+  PUBIP=$(run_with_progress 'Looking up public IP (ipify)' curl -fsSL4 --max-time 8 https://api.ipify.org \
+       || run_with_progress 'Looking up public IP (ifconfig.me)' curl -fsSL4 --max-time 8 https://ifconfig.me || true)
   echo "$PUBIP"
 }
 
@@ -180,10 +222,13 @@ check_env() {
 
 pkg_install() {
   case "$PKG" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq "$@" ;;
-    dnf) dnf install -y -q "$@" ;;
-    yum) yum install -y -q "$@" ;;
-    zypper) zypper install -y --no-recommends "$@" ;;
+    apt)
+      DEBIAN_FRONTEND=noninteractive run_with_progress 'Refreshing apt package index' apt-get update -qq &&
+        run_with_progress "Installing packages: $*" apt-get install -y -qq "$@"
+      ;;
+    dnf) run_with_progress "Installing packages: $*" dnf install -y -q "$@" ;;
+    yum) run_with_progress "Installing packages: $*" yum install -y -q "$@" ;;
+    zypper) run_with_progress "Installing packages: $*" zypper install -y --no-recommends "$@" ;;
   esac
 }
 
@@ -254,9 +299,9 @@ install_xray() {
   local tmp
   tmp=$(mktemp)
   info "downloading official Xray installer..."
-  curl -fsSL "$XRAY_INSTALL_URL" -o "$tmp" || { rm -f "$tmp"; die "download failed"; }
-  info "installing/updating Xray-core and geodata..."
-  bash "$tmp" install || { rm -f "$tmp"; die "Xray install failed"; }
+  download_file "$XRAY_INSTALL_URL" -o "$tmp" || { rm -f "$tmp"; die "download failed"; }
+  run_with_progress 'Installing/updating Xray-core and geodata' bash "$tmp" install \
+    || { rm -f "$tmp"; die "Xray install failed"; }
   rm -f "$tmp"
 
   mkdir -p "$XRAY_DIR"
@@ -319,14 +364,13 @@ caddy_install_repo() {
       mkdir -p /usr/share/keyrings
       # umask 077 (set script-wide) would make these root-only; apt reads the
       # keyring and sources list as the unprivileged _apt user, so force 0644.
-      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+      download_file -1 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
         | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || return 1
       chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+      download_file -1 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
         > /etc/apt/sources.list.d/caddy-stable.list || return 1
       chmod 0644 /etc/apt/sources.list.d/caddy-stable.list
-      if DEBIAN_FRONTEND=noninteractive apt-get update -qq \
-         && apt-get install -y -qq caddy; then
+      if pkg_install caddy; then
         return 0
       fi
       # Don't leave a broken/unsigned repo poisoning future apt runs.
@@ -334,14 +378,14 @@ caddy_install_repo() {
       return 1
       ;;
     dnf)
-      dnf install -y -q 'dnf-command(copr)' || return 1
-      dnf copr enable -y @caddy/caddy || return 1
-      dnf install -y -q caddy
+      pkg_install 'dnf-command(copr)' || return 1
+      run_with_progress 'Enabling Caddy repository' dnf copr enable -y @caddy/caddy || return 1
+      pkg_install caddy
       ;;
     yum)
-      yum install -y -q yum-plugin-copr || return 1
-      yum copr enable -y @caddy/caddy || return 1
-      yum install -y -q caddy
+      pkg_install yum-plugin-copr || return 1
+      run_with_progress 'Enabling Caddy repository' yum copr enable -y @caddy/caddy || return 1
+      pkg_install caddy
       ;;
     *) return 1 ;;
   esac
@@ -360,14 +404,14 @@ caddy_install_binary() {
   esac
   td=$(mktemp -d)
 
-  ver=$(curl -fsSL --connect-timeout 10 --max-time 30 \
-          https://api.github.com/repos/caddyserver/caddy/releases/latest 2>/dev/null \
+  ver=$(run_with_progress 'Checking latest Caddy release' curl -fsSL --connect-timeout 10 --max-time 30 \
+          https://api.github.com/repos/caddyserver/caddy/releases/latest \
         | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
 
   if [[ -n "$ver" ]] && command -v tar >/dev/null 2>&1; then
     url="https://github.com/caddyserver/caddy/releases/download/v${ver}/caddy_${ver}_linux_${gh_arch}.tar.gz"
     info "downloading Caddy ${ver} (${gh_arch}) from GitHub..."
-    if curl -fL --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$td/caddy.tar.gz" \
+    if download_file --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$td/caddy.tar.gz" \
        && tar -xzf "$td/caddy.tar.gz" -C "$td" caddy 2>/dev/null; then
       install -m 0755 "$td/caddy" /usr/local/bin/caddy || true
     fi
@@ -376,7 +420,7 @@ caddy_install_binary() {
   if ! caddy_present; then
     local carch="$gh_arch"; [[ "$gh_arch" == armv7 ]] && carch="arm&arm=7"
     info "trying caddyserver.com download API..."
-    if curl -fL --connect-timeout 15 --max-time 180 \
+    if download_file --connect-timeout 15 --max-time 180 \
         "https://caddyserver.com/api/download?os=linux&arch=${carch}" -o "$td/caddy"; then
       install -m 0755 "$td/caddy" /usr/local/bin/caddy || true
     fi
@@ -444,7 +488,7 @@ EOF
 
   systemctl enable caddy >/dev/null 2>&1 || true
   if ! systemctl is-active caddy >/dev/null 2>&1; then
-    systemctl start caddy >/dev/null 2>&1 || true
+    run_with_progress 'Starting Caddy service' systemctl start caddy >/dev/null || true
   fi
   return 0
 }
@@ -471,10 +515,10 @@ caddy_reload() {
     fi
   fi
   if systemctl is-active caddy >/dev/null 2>&1; then
-    systemctl reload caddy >/dev/null 2>&1 && return 0
+    run_with_progress 'Reloading Caddy service' systemctl reload caddy >/dev/null && return 0
   fi
   if caddy_present; then
-    caddy reload --adapter caddyfile --config "$file" >/dev/null 2>&1 && return 0
+    run_with_progress 'Reloading Caddy configuration' caddy reload --adapter caddyfile --config "$file" >/dev/null && return 0
   fi
   err "failed to reload Caddy"
   return 1
@@ -896,7 +940,7 @@ rebuild_config() {
   mv "$tmp_conf" "$XRAY_CONF"
   secure_xray_files
   if [[ -x "$XRAY_BIN" ]]; then
-    systemctl restart xray 2>/dev/null || true
+    run_with_progress 'Restarting Xray service' systemctl restart xray || true
   fi
 }
 
@@ -961,7 +1005,7 @@ apply_candidate_transaction() (
       cp -p "$tx/nodes.backup" "$XRAY_NODES" || failed=true
       cp -p "$tx/config.backup" "$XRAY_CONF" || failed=true
       if $active; then
-        systemctl restart xray && systemctl is-active --quiet xray || failed=true
+        run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || failed=true
       else
         systemctl stop xray || failed=true
         if systemctl is-active --quiet xray; then failed=true; fi
@@ -995,7 +1039,7 @@ apply_candidate_transaction() (
   touched=true
   mv -f "$tx/nodes.next" "$XRAY_NODES" || return 1
   mv -f "$tx/config.next" "$XRAY_CONF" || return 1
-  systemctl restart xray && systemctl is-active --quiet xray || return 1
+  run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || return 1
   committed=true
 )
 
@@ -1234,9 +1278,7 @@ probe_reality_target() {
   local domain="$1"
   [[ -x "$XRAY_BIN" ]] || return 0
   command -v timeout >/dev/null 2>&1 || return 0
-  info "probing target with: xray tls ping $domain"
-  if timeout 12 "$XRAY_BIN" tls ping "$domain" >/dev/null 2>&1 \
-     || timeout 12 "$XRAY_BIN" tls ping "$domain:443" >/dev/null 2>&1; then
+  if run_with_progress "Probing Reality target $domain" probe_reality_once "$domain" 12; then
     ok "target probe OK"
   else
     warn "target probe failed or timed out; continue only if this domain supports TLS 1.3/H2 and has stable SNI"
@@ -1244,9 +1286,19 @@ probe_reality_target() {
 }
 
 probe_reality_once() {
-  local domain="$1"
-  timeout 10 "$XRAY_BIN" tls ping "$domain" >/dev/null 2>&1 \
-    || timeout 10 "$XRAY_BIN" tls ping "$domain:443" >/dev/null 2>&1
+  local domain="$1" timeout_seconds="${2:-10}"
+  timeout "$timeout_seconds" "$XRAY_BIN" tls ping "$domain" >/dev/null 2>&1 \
+    || timeout "$timeout_seconds" "$XRAY_BIN" tls ping "$domain:443" >/dev/null 2>&1
+}
+
+# Assign elapsed in the caller, excluding progress rendering and cleanup time.
+time_reality_probe() {
+  local domain="$1" start end status=0
+  start=$(date +%s%3N)
+  probe_reality_once "$domain" || status=$?
+  end=$(date +%s%3N)
+  elapsed=$((end - start))
+  return "$status"
 }
 
 auto_pick_reality_target() {
@@ -1257,21 +1309,22 @@ auto_pick_reality_target() {
     return
   fi
 
-  local d i start end elapsed ok total avg
+  local d i elapsed ok total avg completed=0 steps
   local best="" best_ok=-1 best_avg=999999999
+  steps=$((${#REALITY_DESTS[@]} * REALITY_PROBE_ROUNDS))
 
   info "auto-testing Reality targets (${REALITY_PROBE_ROUNDS} rounds each)..." >&2
   for d in "${REALITY_DESTS[@]}"; do
     ok=0
     total=0
     for ((i=1; i<=REALITY_PROBE_ROUNDS; i++)); do
-      start=$(date +%s%3N)
-      if probe_reality_once "$d"; then
-        end=$(date +%s%3N)
-        elapsed=$((end - start))
+      if run_with_progress "Reality probe $((completed + 1))/$steps: $d (round $i/$REALITY_PROBE_ROUNDS)" \
+        time_reality_probe "$d"; then
         ok=$((ok + 1))
         total=$((total + elapsed))
       fi
+      completed=$((completed + 1))
+      printf '[*] Reality progress: %d/%d (%d%%)\n' "$completed" "$steps" "$((completed * 100 / steps))" >&2
     done
     avg=999999
     (( ok > 0 )) && avg=$((total / ok))
@@ -1967,7 +2020,7 @@ optimize_system() {
 restart_service() {
   require_xray
   rebuild_config
-  systemctl restart xray && ok "restarted" || err "restart failed"
+  run_with_progress 'Restarting Xray service' systemctl restart xray && ok "restarted" || err "restart failed"
   systemctl --no-pager -l status xray 2>/dev/null | head -n 8 || true
   pause
 }
@@ -2095,7 +2148,7 @@ realm_install() {
   tmp=$(mktemp -d) || return 1
   asset="realm-$target.tar.gz"
   info "downloading official realm $REALM_VERSION ($target)"
-  if ! curl -fsSL --connect-timeout 15 --max-time 60 \
+  if ! run_with_progress "Checking Realm $REALM_VERSION release" curl -fsSL --connect-timeout 15 --max-time 60 \
     "https://api.github.com/repos/zhboner/realm/releases/tags/$REALM_VERSION" > "$tmp/release.json"; then
     rm -rf "$tmp"; return 1
   fi
@@ -2105,7 +2158,7 @@ realm_install() {
         ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     err "missing official asset or SHA-256 digest"; rm -rf "$tmp"; return 1
   fi
-  if ! curl -fsSL --connect-timeout 15 --max-time 180 "$url" -o "$tmp/archive.tar.gz"; then
+  if ! download_file --connect-timeout 15 --max-time 180 "$url" -o "$tmp/archive.tar.gz"; then
     rm -rf "$tmp"; return 1
   fi
   actual=$(openssl dgst -sha256 "$tmp/archive.tar.gz")
@@ -2135,8 +2188,8 @@ realm_install() {
 
 realm_restart() {
   local pid port udp sockets
-  systemctl restart onevps-realm || return 1
-  sleep 2
+  run_with_progress 'Restarting Realm service' systemctl restart onevps-realm || return 1
+  run_with_progress 'Waiting for Realm listeners' sleep 2
   systemctl is-active --quiet onevps-realm || return 1
   pid=$(systemctl show -p MainPID --value onevps-realm) || return 1
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
