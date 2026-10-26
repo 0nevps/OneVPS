@@ -518,17 +518,19 @@ assert_true "cancelled outbound menu uses visible input and preserves files" bas
 
 # Both node menus expose local user management and outbound settings.
 for node_id in a1b2c3d4 b2c3d4e5; do
-  printf '8\n1\n2\n0\n' > "$TEST_TMP/menu-input"
-  assert_true "node menu $node_id keeps outbound 8 and local users 7" bash -c '
+  printf '7\n8\n1\n2\n0\n' > "$TEST_TMP/menu-input"
+  assert_true "node menu $node_id groups actions and keeps outbound 8 and local users 7" bash -c '
     source "$1"; XRAY_NODES="$2"; selected="$3"; capture="$5"
     exec 3< "$4"
     ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
     require_xray() { :; }; ensure_nodes_file() { :; }; clear() { :; }; node_link() { :; }
     pick_node() { printf "%s\n" "$selected"; }; confirm() { return 0; }
+    manage_node_users() { printf "users:%s\n" "$1"; }
     apply_outbound_assignment() { printf "%s\n" "$*" > "$capture"; command cat >> "$capture"; }
     before=$(cksum "$2")
     output=$(manage_nodes)
-    [[ "$output" == *"8) Set node outbound"* && "$output" != *"Connection users"* &&
+    [[ "$output" == *"Connection settings:"*"Users / outbound:"*"7) Manage node users"*"8) Set node outbound"*"Node status:"*"5) Enable/disable node"*"Danger zone:"*"6) Delete node"*"0) Back"* &&
+       "$output" == *"users:$selected"* && "$output" != *"Connection users"* &&
        "$(command cat "$capture")" == "$selected all []"$'"'"'\n'"'"''"'"'{"mode":"direct"}'"'"' && "$before" == "$(cksum "$2")" ]]
   ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
@@ -544,6 +546,66 @@ assert_true "main menu removes and ignores connection-user option 11" bash -c '
 for removed in manage_users show_user_links prepare_user_assignment apply_user_assignment validate_user_metadata; do
   assert_false "removed function $removed is absent" declare -F "$removed"
 done
+
+assert_true "main menu title aligns with both right borders" bash -c '
+  source "$1"
+  clear() { :; }; status_line() { :; }
+  ask() { printf "0\n"; }
+  output=$(main_menu)
+  { IFS= read -r top; IFS= read -r title; IFS= read -r bottom; } <<< "$output"
+  [[ "$top" == " ╔"*"╗" && "$title" == " ║"*"║" && "$bottom" == " ╚"*"╝" ]] || exit 1
+  top=${top# ╔}; top=${top%╗}; top=${top//═/ }
+  title=${title# ║}; title=${title%║}
+  bottom=${bottom# ╚}; bottom=${bottom%╝}; bottom=${bottom//═/ }
+  [[ ${#top} -eq ${#title} && ${#title} -eq ${#bottom} ]]
+' _ "$ROOT_DIR/onevps.sh"
+
+# Exercise every main-menu entry without invoking host operations.
+printf '99\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n0\n' > "$TEST_TMP/menu-input"
+assert_true "main menu groups all actions and preserves every dispatch number" bash -c '
+  source "$1"; exec 3< "$2"; capture="$3"
+  : > "$capture"
+  clear() { :; }; status_line() { :; }; pause() { :; }
+  ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
+  install_xray() { printf "1\n" >> "$capture"; }
+  add_reality_node() { printf "2\n" >> "$capture"; }
+  add_trojan_node() { printf "3\n" >> "$capture"; }
+  manage_nodes() { printf "4\n" >> "$capture"; }
+  show_links() { printf "5\n" >> "$capture"; }
+  restart_service() { printf "6\n" >> "$capture"; }
+  enable_bbr() { printf "7\n" >> "$capture"; }
+  optimize_system() { printf "8\n" >> "$capture"; }
+  uninstall() { printf "9\n" >> "$capture"; }
+  realm_menu() { printf "10\n" >> "$capture"; }
+  output=$(main_menu)
+  [[ "$output" == *"Xray setup:"*"Nodes / share links:"*"4) Manage nodes / users / outbound"*"Relay:"*"10) Manage Realm relay (independent of Xray)"*"Service / network:"*"6) Restart Xray service"*"Danger zone:"*"9) Uninstall Xray (keep Realm / Caddy)"*"0) Exit"* &&
+     "$(command cat "$capture")" == "$(printf "%s\n" 1 2 3 4 5 6 7 8 9 10)" ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input" "$TEST_TMP/main-dispatch"
+
+printf '1\n2\n3\n4\n5\n0\n' > "$TEST_TMP/menu-input"
+assert_true "realm menu separates destructive actions and preserves every dispatch number" bash -c '
+  source "$1"; exec 3< "$2"; capture="$3"
+  : > "$capture"
+  ask() { local answer; IFS= read -r answer <&3 || return 1; printf "%s\n" "$answer"; }
+  ensure_deps() { :; }; realm_owned() { return 0; }; systemctl() { :; }
+  realm_add() { printf "1\n" >> "$capture"; }
+  realm_list() { printf "2\n" >> "$capture"; }
+  realm_delete() { printf "3\n" >> "$capture"; }
+  realm_restart() { printf "4\n" >> "$capture"; }
+  realm_uninstall() { printf "5\n" >> "$capture"; }
+  output=$(realm_menu)
+  [[ "$output" == *"Relay rules:"*"1) Install realm / add relay rule"*"2) Show relay rules / service status"*"Service:"*"4) Restart realm service"*"Danger zone:"*"3) Delete relay rule"*"5) Uninstall realm"*"0) Back"* &&
+     "$(command cat "$capture")" == "$(printf "%s\n" 1 2 3 4 5)" ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input" "$TEST_TMP/realm-dispatch"
+
+assert_true "user menu separates deletion without changing node data" bash -c '
+  source "$1"; XRAY_NODES="$2"
+  ask() { printf "0\n"; }
+  before=$(cksum "$2")
+  output=$(manage_node_users a1b2c3d4)
+  [[ "$output" == *"User actions:"*"1) Add user"*"3) Show user share link"*"Danger zone:"*"2) Delete user"*"0) Back"* &&
+     "$before" == "$(cksum "$2")" ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
 MOCK_SERVICE_MODE=inactive
 printf 'inactive\n' > "$SERVICE_STATE"

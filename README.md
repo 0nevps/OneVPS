@@ -86,18 +86,32 @@ then select `2` for a Reality node or `3` for a Trojan + WS node.
 
 ## Menu
 
+Menus are grouped by task. Existing option numbers are preserved, including in submenus.
+Node users and outbounds are under `4`, then select a node and choose `7` or `8`.
+Destructive actions are separated under **Danger zone** and retain their confirmation prompts.
+
 ```text
-1) Install / update Xray-core
-2) Add node - VLESS + Reality + Vision + uTLS
-3) Add node - Trojan + WS (behind Caddy)
-4) Manage nodes
-5) Show default node share links
-6) Restart service
-7) BBR acceleration
-8) TCP optimization
-9) Uninstall
-10) Realm relay
-0) Exit
+Xray setup:
+ 1) Install / update Xray-core
+
+Nodes / share links:
+ 2) Add node - VLESS + Reality + Vision + uTLS
+ 3) Add node - Trojan + WS (behind Caddy)
+ 4) Manage nodes / users / outbound
+ 5) Show default node share links
+
+Relay:
+10) Manage Realm relay (independent of Xray)
+
+Service / network:
+ 6) Restart Xray service
+ 7) Enable BBR / show status
+ 8) TCP optimization
+
+Danger zone:
+ 9) Uninstall Xray (keep Realm / Caddy)
+
+ 0) Exit
 ```
 
 ## Node outbounds
@@ -303,25 +317,45 @@ trojan://PASSWORD@SUBDOMAIN:443?security=tls&sni=SUBDOMAIN&type=ws&host=SUBDOMAI
 Reality node actions:
 
 ```text
+Connection settings:
 1) Change port
-2) Reset UUID
+2) Reset default UUID
 3) Rotate Reality keypair / shortId
 4) Change Reality handshake target
-5) Enable/disable
-6) Delete node
+
+Users / outbound:
+7) Manage node users
 8) Set node outbound
+
+Node status:
+5) Enable/disable node
+
+Danger zone:
+6) Delete node
+
+0) Back
 ```
 
 Trojan node actions:
 
 ```text
-1) Reset password
+Connection settings:
+1) Reset default password
 2) Change domain
 3) Change WS path
 4) Rebuild Caddy route
-5) Enable/disable
-6) Delete node
+
+Users / outbound:
+7) Manage node users
 8) Set node outbound
+
+Node status:
+5) Enable/disable node
+
+Danger zone:
+6) Delete node
+
+0) Back
 ```
 
 `Rebuild Caddy route` regenerates the managed Caddy block without changing the node password, path, or port.

@@ -1101,7 +1101,7 @@ manage_node_users() {
     n=$(node_by_id "$id") || return 1
     printf '\nUsers:\n'
     list_node_users "$n"
-    printf '\nActions:\n1) Add user\n2) Delete user\n3) User share link\n0) Back\n'
+    printf '\nUser actions:\n1) Add user\n3) Show user share link\n\nDanger zone:\n2) Delete user\n\n0) Back\n'
     action=$(ask 'Select')
     case "$action" in
       1)
@@ -1567,15 +1567,22 @@ manage_nodes() {
     if [[ "$type" == "trojan-ws" ]]; then
       cat <<EOF
 
-  Node actions:
+  Connection settings:
    1) Reset default password
    2) Change domain
    3) Change WS path
    4) Rebuild Caddy route
-   5) Enable/disable
-   6) Delete node
+
+  Users / outbound:
    7) Manage node users
    8) Set node outbound
+
+  Node status:
+   5) Enable/disable node
+
+  Danger zone:
+   6) Delete node
+
    0) Back
 EOF
       case "$(ask 'Select')" in
@@ -1593,15 +1600,22 @@ EOF
     else
       cat <<EOF
 
-  Node actions:
+  Connection settings:
    1) Change port
    2) Reset default UUID
    3) Rotate Reality keypair / shortId
    4) Change Reality handshake target
-   5) Enable/disable
-   6) Delete node
+
+  Users / outbound:
    7) Manage node users
    8) Set node outbound
+
+  Node status:
+   5) Enable/disable node
+
+  Danger zone:
+   6) Delete node
+
    0) Back
 EOF
       case "$(ask 'Select')" in
@@ -2227,7 +2241,7 @@ realm_uninstall() {
 realm_menu() {
   ensure_deps
   while :; do
-    printf '\nRealm relay\n1) Install and add relay\n2) List rules / status\n3) Delete rule\n4) Restart\n5) Uninstall realm\n0) Back\n'
+    printf '\nRealm relay\n\nRelay rules:\n1) Install realm / add relay rule\n2) Show relay rules / service status\n\nService:\n4) Restart realm service\n\nDanger zone:\n3) Delete relay rule\n5) Uninstall realm\n\n0) Back\n'
     local choice
     choice=$(ask 'Select')
     case "$choice" in
@@ -2267,23 +2281,33 @@ main_menu() {
     clear
     cat <<'EOF'
  ╔════════════════════════════════════════════════╗
- ║   OneVPS - Xray Reality / Vision / uTLS       ║
+ ║   OneVPS - Xray nodes / Realm relay            ║
  ╚════════════════════════════════════════════════╝
 EOF
     status_line
     cat <<EOF
 
-  1) Install / update Xray-core
-  2) Add node - VLESS + Reality + Vision + uTLS
-  3) Add node - Trojan + WS (behind Caddy)
-  4) Manage nodes
-  5) Show default node share links
-  6) Restart service
-  7) BBR acceleration
-  8) TCP optimization
-  9) Uninstall
-  10) Realm relay
-  0) Exit
+  Xray setup:
+   1) Install / update Xray-core
+
+  Nodes / share links:
+   2) Add node - VLESS + Reality + Vision + uTLS
+   3) Add node - Trojan + WS (behind Caddy)
+   4) Manage nodes / users / outbound
+   5) Show default node share links
+
+  Relay:
+  10) Manage Realm relay (independent of Xray)
+
+  Service / network:
+   6) Restart Xray service
+   7) Enable BBR / show status
+   8) TCP optimization
+
+  Danger zone:
+   9) Uninstall Xray (keep Realm / Caddy)
+
+   0) Exit
 EOF
     case "$(ask 'Select')" in
       1) install_xray; pause ;;
