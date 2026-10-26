@@ -122,22 +122,30 @@ pass 'progress preserves foreground shell state and caller traps'
   if command grep -q 'progress-bar' "$TEST_TMP/download-args"; then exit 1; fi
 ) || fail 'redirected downloads preserve curl options, arguments and failures'
 pass 'redirected downloads preserve curl options, arguments and failures'
-(
-  # No package manager runs on the host, including when testing failure paths.
-  apt-get() { printf '%s:%s\n' "${DEBIAN_FRONTEND:-}" "$*" >> "$TEST_TMP/package-calls"; return "$package_status"; }
-  package_status=0
-  # Consumed by pkg_install() in the sourced script.
-  # shellcheck disable=SC2034
-  PKG=apt
-  TERM=dumb pkg_install 'test-package' 2> "$TEST_TMP/progress-log" || exit 1
-  command grep -qx 'noninteractive:update -qq' "$TEST_TMP/package-calls" || exit 1
-  command grep -qx ':install -y -qq test-package' "$TEST_TMP/package-calls" || exit 1
-  : > "$TEST_TMP/package-calls"
-  package_status=42
-  status=0
-  TERM=dumb pkg_install 'test-package' 2> "$TEST_TMP/progress-log" || status=$?
-  [[ "$status" == 42 && $(wc -l < "$TEST_TMP/package-calls") -eq 1 ]] || exit 1
-) || fail 'package progress preserves apt environment and aborts after failed update'
+for package_frontend in '' noninteractive readline; do
+  (
+    # Isolate the caller's environment and cover both unset and inherited values.
+    unset DEBIAN_FRONTEND
+    if [[ -n "$package_frontend" ]]; then export DEBIAN_FRONTEND="$package_frontend"; fi
+    # No package manager runs on the host, including when testing failure paths.
+    apt-get() { printf '%s:%s\n' "${DEBIAN_FRONTEND:-}" "$*" >> "$TEST_TMP/package-calls"; return "$package_status"; }
+    : > "$TEST_TMP/package-calls"
+    package_status=0
+    # Consumed by pkg_install() in the sourced script.
+    # shellcheck disable=SC2034
+    PKG=apt
+    TERM=dumb pkg_install 'test-package' 2> "$TEST_TMP/progress-log" || exit 1
+    command grep -qx 'noninteractive:update -qq' "$TEST_TMP/package-calls" || exit 1
+    command grep -qx "$package_frontend:install -y -qq test-package" "$TEST_TMP/package-calls" || exit 1
+    [[ "${DEBIAN_FRONTEND-}" == "$package_frontend" ]] || exit 1
+    : > "$TEST_TMP/package-calls"
+    package_status=42
+    status=0
+    TERM=dumb pkg_install 'test-package' 2> "$TEST_TMP/progress-log" || status=$?
+    [[ "$status" == 42 && $(wc -l < "$TEST_TMP/package-calls") -eq 1 ]] || exit 1
+  ) || fail 'package progress preserves apt environment and aborts after failed update' \
+    "DEBIAN_FRONTEND=${package_frontend:-<unset>}"
+done
 pass 'package progress preserves apt environment and aborts after failed update'
 (
   XRAY_BIN="$BASH"
