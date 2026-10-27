@@ -73,9 +73,17 @@ CADDYFILE="$TMP/Caddyfile"
 mkdir -p "$TMP/storage"
 check 'initialize owned Caddy state' caddy_state_init
 caddy_storage_root() { echo "$TMP/storage"; }
+caddy_site_root() { echo "$TMP/sites/$1"; }
 caddy_reload() { return "${RELOAD_STATUS:-0}"; }
 printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
 check 'HY2-first domain created' caddy_domain_ensure example.com "$CADDYFILE"
+check 'domain error page generated' test -s "$TMP/sites/example.com/index.html"
+check 'domain-specific page root' grep -qF "root * $TMP/sites/example.com" "$CADDYFILE"
+check 'ordinary requests raise 403' grep -q 'error 403' "$CADDYFILE"
+check 'error handler serves index internally' grep -q 'rewrite \* /index.html' "$CADDYFILE"
+mkdir -p "$TMP/sites/other.example.com"
+printf 'custom forbidden page\n' > "$TMP/sites/other.example.com/index.html"
+cp "$TMP/sites/other.example.com/index.html" "$TMP/custom-index"
 check 'Trojan reuses HY2 domain' caddy_add_route abcd example.com /secret 12345 "$CADDYFILE"
 check 'only one domain site' test "$(grep -c '^example.com {' "$CADDYFILE")" = 1
 check 'Trojan path fragment exists' grep -q 'reverse_proxy' "$CADDY_STATE/routes/example.com/abcd.caddy"
@@ -83,6 +91,7 @@ caddy_remove_route abcd "$CADDYFILE"
 check 'deleting Trojan preserves certificate site' grep -q '^example.com {' "$CADDYFILE"
 reject 'deleting Trojan removes only fragment' test -f "$CADDY_STATE/routes/example.com/abcd.caddy"
 check 'Trojan-first domain created' caddy_add_route bcde other.example.com /other 12346 "$CADDYFILE"
+check 'existing custom index preserved' cmp "$TMP/custom-index" "$TMP/sites/other.example.com/index.html"
 check 'HY2 reuses Trojan domain' caddy_domain_ensure other.example.com "$CADDYFILE"
 check 'Trojan-first site remains unique' test "$(grep -c '^other.example.com {' "$CADDYFILE")" = 1
 printf '\nexternal.example.com {\n respond 200\n}\n' >> "$CADDYFILE"

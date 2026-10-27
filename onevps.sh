@@ -535,7 +535,7 @@ caddy_reload() {
   return 1
 }
 
-# Web root served for non-WS traffic on a Trojan subdomain.
+# Error-page root for ordinary requests to a managed domain.
 caddy_site_root() { echo "/var/lib/onevps/sites/$1"; }
 
 # Drop a small static landing page so casual probes see a site, not a 404.
@@ -543,7 +543,7 @@ caddy_site_root() { echo "/var/lib/onevps/sites/$1"; }
 ensure_site_content() {
   local domain="$1" root
   root=$(caddy_site_root "$domain")
-  mkdir -p "$root"
+  mkdir -p "$root" || return 1
   if [[ ! -f "$root/index.html" ]]; then
     cat > "$root/index.html" <<'HTML'
 <!DOCTYPE html>
@@ -592,7 +592,8 @@ html,body{height:100%}
 </html>
 HTML
   fi
-  chmod -R a+rX /var/lib/onevps 2>/dev/null || true
+  chmod a+rx "$(dirname "$(dirname "$root")")" "$(dirname "$root")" "$root" &&
+    chmod a+r "$root/index.html"
 }
 
 # Append a marked site block routing a secret WS path to a local Xray inbound.
@@ -1291,7 +1292,7 @@ caddy_tcp_https() {
 }
 
 caddy_domain_ensure() {
-  local domain="$1" file="$2" backup root
+  local domain="$1" file="$2" backup root site_root
   acme_domain_valid "$domain" || return 1
   if [[ -f "$CADDY_STATE/domains/$domain.json" ]]; then
     jq -e --arg file "$file" '.caddy_file == $file' "$CADDY_STATE/domains/$domain.json" >/dev/null &&
@@ -1302,6 +1303,8 @@ caddy_domain_ensure() {
   fi
   if grep -qiF "$domain" "$file"; then err "unmanaged domain already appears in Caddyfile: $domain"; return 1; fi
   root=$(caddy_storage_root "$file") || return 1
+  site_root=$(caddy_site_root "$domain")
+  ensure_site_content "$domain" || return 1
   backup=$(mktemp "$CADDY_STATE/.domain.XXXXXXXX") || return 1
   cp -p "$file" "$backup" || return 1
   mkdir -p "$CADDY_STATE/routes/$domain" && chmod 755 "$CADDY_STATE/routes/$domain" || return 1
@@ -1309,9 +1312,14 @@ caddy_domain_ensure() {
 
 # OneVPS-domain:$domain BEGIN
 $domain {
+    root * $site_root
     import $CADDY_STATE/routes/$domain/*.caddy
     handle {
-        respond 403
+        error 403
+    }
+    handle_errors {
+        rewrite * /index.html
+        file_server
     }
 }
 # OneVPS-domain:$domain END
