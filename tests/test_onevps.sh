@@ -729,7 +729,7 @@ assert_true "main menu dispatches categories" bash -c '
   network_menu() { printf "5\n" >> "$capture"; }
   uninstall() { printf "9\n" >> "$capture"; }
   output=$(main_menu)
-  [[ "$output" == *"3) Certificates (automatic ACME)"*"Danger zone:"* &&
+  [[ "$output" == *"3) Certificates (Caddy-managed)"*"Danger zone:"* &&
      "$(command cat "$capture")" == "$(printf "%s\n" 1 2 3 4 5 9)" ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/menu-input" "$TEST_TMP/main-dispatch"
 

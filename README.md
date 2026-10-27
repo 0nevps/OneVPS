@@ -16,7 +16,7 @@ Three deployment modes are supported:
   or certificate.
 - **Trojan + WebSocket behind Caddy** — a deployment that shares Caddy's `:443` listener and certificates
   with other Caddy-managed services.
-- **Hysteria2 + QUIC + TLS** — a native Xray inbound with automatic ACME certificates or existing PEM files.
+- **Hysteria2 + QUIC + TLS** — a native Xray inbound with Caddy-managed certificates.
 
 OneVPS deliberately focuses on Xray-based deployments. It is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
@@ -28,33 +28,34 @@ Update Xray using menu **1**, then choose **2 → 3** to add a HY2 node. OneVPS 
 No separate Hysteria binary or service is installed. Existing VLESS/Trojan-only
 configurations do not acquire this version requirement.
 
-Automatic ACME is the default. Certificate application only needs the domain; optional
-email, account credentials, CA selection, key type and output paths are not requested.
-OneVPS pins acme.sh 3.1.6 (SHA-256 verified), explicitly uses Let's Encrypt and EC-256,
-and isolates account/order state under `/etc/onevps-acme`. Issuance agrees to the CA terms.
-HTTP-01 requires correct public DNS and inbound TCP 80, including on future renewals.
-With a free TCP 80 it uses standalone mode; with active Caddy it adds a marked HTTP-only
-challenge vhost for a dedicated domain, without stopping existing websites. An existing
-Caddyfile entry for that domain or a non-Caddy listener is rejected rather than overwritten.
-A saved standalone order still requires free TCP 80 for renewal; it will not silently switch modes.
-DNS-01 automation is not included.
+Caddy is required for both Trojan and HY2 and is the sole certificate issuer/renewer.
+Create either node first: the domain has one persistent HTTPS site, and Trojan routes
+are imported from `/etc/onevps-caddy/routes/<domain>/`. Deleting a node keeps the domain
+and its certificate automation, so the other protocol continues working.
+Use DNS-only records pointing at the server and allow inbound TCP 80/443. Caddy's
+configured issuer and terms apply; OneVPS no longer installs or invokes acme.sh.
 
-The systemd timer `onevps-acme.timer` checks twice daily with randomized delay. Certificates
-are installed under `/etc/onevps-certs/<domain>/current/` with restricted group access for
-`nobody`. A complete key/certificate pair is switched atomically; validation or restart
-failure restores the previous pair. Failed deployment is retried even if renewal is not due.
-Menu **3** provides status, domain-only application, renewal checks and journal logs.
-No fake email is registered and no DNS API secret is needed.
+OneVPS asks before configuring the shared `:443` listener for HTTP/1.1 and HTTP/2 only,
+reserving UDP 443 for HY2. This also disables HTTP/3 for other sites sharing that listener.
+Conflicting global configuration, unsupported storage, and unknown existing domain sites
+are rejected rather than silently overwritten. Local filesystem storage is required;
+its root is resolved from Caddy configuration or the running service environment.
 
-Manual PEM mode remains available. It checks expiry, hostname, matching key and readability
-by `nobody`, including parent directory permissions. Use a persistent path under `/etc`, not
-systemd-hidden home/temp directories. Manual files are never chmodded, renewed or deleted.
-Deleting a node retains managed certificates for reuse; Xray uninstall separately offers
-removal of OneVPS-owned ACME resources and marked Caddy routes, never external certificates.
-TCP 80 firewall allowances are retained to avoid disrupting other services.
+`onevps-caddy-sync.timer` checks every minute. It copies only the requested domain's
+certificate/key, validates them, and atomically deploys them under
+`/etc/onevps-certs/<domain>/current/` with restricted access for Xray's `nobody` user.
+Changed certificates restart Xray; validation/restart failures restore the previous pair.
+Caddy alone decides when to renew. Menu **3** provides status, domain setup, sync retries,
+and Caddy/sync logs. Initial issuance waits up to about one minute; retry if still pending.
 
-HY2 listens on IPv4 UDP. A TCP listener can share the same port number, but another UDP
-listener cannot. Caddy HTTP/3 often occupies UDP 443: choose another UDP port in that case.
+This workflow targets new deployments. It does not migrate old certificate configuration,
+change old ACME timers, or adopt unknown existing domain sites. New nodes use Caddy only.
+Existing externally managed PEM files remain the external owner's responsibility.
+Uninstalling Xray disables certificate synchronization but retains Caddy, domain sites
+and certificates. Remove unused domains manually only after checking all consumers.
+Firewall allowances are retained to avoid disrupting other services.
+
+HY2 listens on IPv4 UDP and can share port 443 with Caddy's TCP listener.
 Allow the chosen UDP port in your provider security group as well as the host firewall.
 Do not publish an AAAA record for an IPv4-only endpoint. BBR/TCP tuning is not QUIC tuning.
 
@@ -157,7 +158,7 @@ Destructive actions are separated under **Danger zone** and retain their confirm
 Setup / management:
  1) Install / update Xray-core
  2) Nodes / users / outbound / share links
- 3) Certificates (automatic ACME)
+ 3) Certificates (Caddy-managed)
  4) Realm relay
  5) Service / network
 

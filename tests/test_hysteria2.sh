@@ -101,16 +101,14 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
   "$(jq -c '.nodes[0] | .id="another" | .tag="hy2-another"' "$XRAY_NODES")"
 (
   secure_xray_files() { :; }
+  caddy_certificate_issue() { return 0; }
   validate_hy2_certificate() { return 0; }
   ss() { :; }
   runuser() { :; }
   ask() {
     case "$1" in
       'Node name') printf 'Created from menu\n' ;;
-      'Certificate:'*) printf '2\n' ;;
       'TLS domain') printf 'node.example.com\n' ;;
-      'Absolute PEM certificate/full-chain path') printf '/etc/hy2/cert.pem\n' ;;
-      'Absolute unencrypted PEM private-key path') printf '/etc/hy2/key.pem\n' ;;
       'UDP listen port'*) printf '24445\n' ;;
       'Password'*) printf 'new-menu-password\n' ;;
       *) return 1 ;;
@@ -120,11 +118,10 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
   check 'created HY2 retained alongside existing node' jq -e '.nodes | length == 2' "$XRAY_NODES"
   check 'creation opens UDP only' grep -qx 'open 24445 udp' "$TEST_TMP/firewall"
   cp "$TEST_TMP/before.json" "$XRAY_NODES"
-  acme_issue() { printf '%s\n' "$1" > "$TEST_TMP/acme-domain"; }
+  caddy_certificate_issue() { printf '%s\n' "$1" > "$TEST_TMP/acme-domain"; }
   ask() {
     case "$1" in
       'Node name') printf 'Automatic HY2\n' ;;
-      'Certificate:'*) printf '%s\n' "$2" ;;
       'TLS domain') printf 'node.example.com\n' ;;
       'UDP listen port'*) printf '24445\n' ;;
       'Password'*) printf 'auto-password\n' ;;

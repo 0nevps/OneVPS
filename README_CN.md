@@ -13,7 +13,7 @@ OneVPS 是一个开源的 Linux VPS Xray 节点部署与运维自动化工具。
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS**：独立部署，无需域名或证书。
 - **Trojan + WebSocket（Caddy 后端）**：复用 Caddy 的 `:443` 监听与证书，可与其他 Caddy 服务共存。
-- **Hysteria2 + QUIC + TLS**：原生 Xray 入站，默认自动 ACME，也可使用已有 PEM 证书与私钥。
+- **Hysteria2 + QUIC + TLS**：原生 Xray 入站，统一使用 Caddy 管理的证书。
 
 OneVPS 专注于基于 Xray 的部署，不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
 
@@ -23,27 +23,25 @@ OneVPS 专注于基于 Xray 的部署，不是通用 VPS 控制面板，也不�
 这是本功能的测试基线，不代表 HY2 首次受支持的版本。不安装独立 Hysteria 核心或服务；
 仅有 VLESS/Trojan 的配置不受该版本门槛影响。
 
-证书默认自动 ACME，申请时只填写域名。不询问可省略的邮箱、账户密码、CA、密钥类型和保存路径，
-也不生成虚假邮箱。固定使用经过 SHA-256 校验的 acme.sh 3.1.6、Let's Encrypt 和 EC-256；
-申请即同意 CA 服务条款。账户与订单独立存放在 `/etc/onevps-acme`，不修改用户已有 ACME 配置。
-HTTP-01 要求域名正确解析，公网 TCP 80 在首次签发和后续续期时均可达。
-80 空闲时使用 standalone；已有 Caddy 时为专用域名追加带标记的 HTTP 挑战站点，不停止网站。
-域名已存在于 Caddyfile 或 80 被其他服务占用时拒绝覆盖，提示使用专用域名或手动证书。
-已创建的 standalone 订单续期仍要求 TCP 80 空闲，不会静默切换验证方式。
-本轮不包含 DNS-01 API 自动化。
+Trojan 与 HY2 统一依赖 Caddy，由 Caddy 唯一负责申请和续期证书，不再安装或调用 acme.sh。
+两种节点的创建顺序无关：域名有一个独立、持久的 HTTPS 站点，Trojan 路由从
+`/etc/onevps-caddy/routes/<域名>/` 导入。删除任一节点不会删除域名站点或中断另一节点续期。
+域名使用仅 DNS 解析指向服务器，公网 TCP 80/443 必须可达；签发机构及条款由 Caddy 配置决定。
 
-`onevps-acme.timer` 每天检查两次，附带随机延迟。证书放在 `/etc/onevps-certs/<域名>/current/`，
-仅通过受限组权限允许 `nobody` 读取。完整证书/私钥对以符号链接原子切换；配置校验或重启失败时回退，
-即使证书未到续期时间也会重试未完成的部署。主菜单 **3** 提供状态、申请、续期检查与日志。
+脚本会询问是否将共享 `:443` 监听限定为 HTTP/1.1、HTTP/2，为 HY2 保留 UDP 443。
+这也会关闭共享该监听的其他站点的 HTTP/3。全局配置冲突、未知域名站点或不支持的存储
+会被拒绝，不会静默覆盖。证书存储须为本地文件系统，路径从 Caddy 配置或运行进程环境解析。
 
-保留手动 PEM 模式，检查有效期、域名、密钥匹配和 `nobody` 的读取权限（含父目录）。
-应使用 `/etc` 下的持久目录，不能使用被 systemd 隐藏的用户目录或临时目录。
-手动证书不会被更改权限、自动续期或删除。
-删除节点保留托管证书供复用；卸载 Xray 时另外询问是否清理 OneVPS 的 ACME 资源和 Caddy 标记块，
-不会删除外部证书。为避免影响其他服务，已放行的 TCP 80 防火墙规则保留。
+`onevps-caddy-sync.timer` 每分钟检查一次，只复制目标域名的证书和私钥，校验后以受限权限
+原子部署至 `/etc/onevps-certs/<域名>/current/`，供 Xray 的 `nobody` 用户读取。
+证书变化后重启 Xray，校验或重启失败时恢复旧证书；续期时机完全由 Caddy 决定。
+菜单 **3** 提供状态、域名设置、同步重试及日志。首次申请等待约一分钟，尚未完成时可稍后重试。
 
-HY2 监听 IPv4 UDP，可与 TCP 共用端口号，但不能与其他 UDP 监听冲突。
-Caddy HTTP/3 可能占用 UDP 443，此时请选择其他 UDP 端口。
+本流程面向新部署，不迁移旧证书配置、不管理旧 ACME 定时器，也不接管未知的已有域名站点。
+新节点只使用 Caddy；已有外部 PEM 仍由外部流程负责续期。卸载 Xray 会停用证书同步，保留
+Caddy、域名站点和证书。清理不用的域名前须人工确认没有其他消费者，防火墙规则也会保留。
+
+HY2 监听 IPv4 UDP，可与 Caddy 的 TCP 443 共用端口号。
 除主机防火墙外，还需在云安全组放行该端口。IPv4-only 端点不要配置 AAAA 记录。
 现有 BBR/TCP 优化不等于 QUIC 调优。
 
@@ -136,7 +134,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 Setup / management:
  1) Install / update Xray-core
  2) Nodes / users / outbound / share links
- 3) Certificates (automatic ACME)
+ 3) Certificates (Caddy-managed)
  4) Realm relay
  5) Service / network
 

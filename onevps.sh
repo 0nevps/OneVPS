@@ -28,13 +28,8 @@ REALM_BIN=/usr/local/bin/onevps-realm
 REALM_SERVICE=/etc/systemd/system/onevps-realm.service
 REALM_VERSION=v2.9.6
 HY2_MIN_VERSION=26.10.21
-ACME_DIR=/etc/onevps-acme
 ACME_CERT_DIR=/etc/onevps-certs
-ACME_WEBROOT=/var/lib/onevps-acme
-ACME_RUNNER=/usr/local/lib/onevps/acme-runner.sh
 ACME_UNIT_DIR=/etc/systemd/system
-ACME_VERSION=3.1.6
-ACME_ARCHIVE_SHA256=0d3f9000ac44a6331314742a88c475f79134e24fc991997883652adc59efc486
 
 REALITY_DESTS=(
   "www.cloudflare.com"
@@ -606,43 +601,30 @@ HTML
 # page, so the rest of the subdomain looks like a locked-down site.
 # Reverts the append if Caddy reload fails. Returns non-zero on failure.
 caddy_add_route() {
-  local id="$1" domain="$2" path="$3" port="$4" file="$5" root
-  root=$(caddy_site_root "$domain")
-  ensure_site_content "$domain"
-  cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
-  {
-    printf '\n# OneVPS-trojan:%s BEGIN\n' "$id"
-    printf '%s {\n' "$domain"
-    printf '\tencode zstd gzip\n'
-    printf '\troot * %s\n' "$root"
-    printf '\thandle %s {\n' "$path"
-    printf '\t\treverse_proxy 127.0.0.1:%s\n' "$port"
-    printf '\t}\n'
-    printf '\thandle {\n'
-    printf '\t\terror 403\n'
-    printf '\t}\n'
-    printf '\thandle_errors {\n'
-    printf '\t\trewrite * /index.html\n'
-    printf '\t\tfile_server\n'
-    printf '\t}\n'
-    printf '}\n'
-    printf '# OneVPS-trojan:%s END\n' "$id"
-  } >> "$file"
+  local id="$1" domain="$2" path="$3" port="$4" file="$5" route backup
+  [[ "$id" =~ ^[a-f0-9]+$ && "$path" =~ ^/[a-zA-Z0-9_/-]+$ && "$port" =~ ^[0-9]+$ ]] || return 1
+  caddy_domain_ensure "$domain" "$file" || return 1
+  route="$CADDY_STATE/routes/$domain/$id.caddy"
+  backup=$(mktemp "$CADDY_STATE/.route.XXXXXXXX") || return 1
+  [[ ! -f "$route" ]] || cp -p "$route" "$backup" || return 1
+  printf 'handle %s {\n    reverse_proxy 127.0.0.1:%s\n}\n' "$path" "$port" > "$route" || return 1
+  chmod 644 "$route" || return 1
   if ! caddy_reload "$file"; then
-    err "reverting Caddyfile change"
-    caddy_remove_route "$id" "$file"
+    if [[ -s "$backup" ]]; then cp -p "$backup" "$route"; else rm -f "$route"; fi
     caddy_reload "$file" || true
-    return 1
+    rm -f "$backup"; return 1
   fi
-  return 0
+  rm -f "$backup"
 }
 
-# Remove the marked block for a node id (does not reload; caller reloads).
+# Removing a node never removes the domain's certificate automation.
 caddy_remove_route() {
-  local id="$1" file="$2"
-  [[ -f "$file" ]] || return 0
-  cp -f "$file" "$file.onevps.bak" 2>/dev/null || true
-  sed -i "/# OneVPS-trojan:$id BEGIN/,/# OneVPS-trojan:$id END/d" "$file"
+  local id="$1" route
+  [[ "$id" =~ ^[a-f0-9]+$ ]] || return 1
+  for route in "$CADDY_STATE/routes/"*/"$id.caddy"; do
+    [[ ! -f "$route" ]] || rm -f "$route" || return 1
+  done
+
 }
 
 # ----------------------------------------------------------------------------
@@ -1234,9 +1216,8 @@ manage_outbound() {
 }
 
 # ----------------------------------------------------------------------------
-# OneVPS-owned ACME: isolated account, public challenge root, private deployment.
+# Caddy certificate ownership and private Xray deployment.
 # ----------------------------------------------------------------------------
-acme_owned() { [[ -f "$ACME_DIR/.onevps-owned" && ! -L "$ACME_DIR" ]]; }
 
 acme_domain_valid() {
   [[ ${#1} -le 253 && "$1" == *.* && "$1" != *..* && "$1" != *[!a-z0-9.-]* ]] || return 1
@@ -1249,129 +1230,219 @@ acme_domain_valid() {
   done
 }
 
-acme_exec() {
-  "$ACME_DIR/client/acme.sh" --home "$ACME_DIR/client" --config-home "$ACME_DIR/account" \
-    --cert-home "$ACME_DIR/orders" --server letsencrypt "$@"
+# Caddy owns issuance/renewal; OneVPS only deploys validated pairs to Xray.
+CADDY_STATE=/etc/onevps-caddy
+CADDY_SYNC_RUNNER=/usr/local/lib/onevps/caddy-sync.sh
+
+caddy_state_init() {
+  if [[ ! -f "$CADDY_STATE/.onevps-owned" ]]; then
+    [[ ! -e "$CADDY_STATE" && ! -L "$CADDY_STATE" ]] || { err 'unmanaged Caddy state directory'; return 1; }
+    mkdir -p "$CADDY_STATE" && touch "$CADDY_STATE/.onevps-owned" || return 1
+  fi
+  [[ ! -L "$CADDY_STATE" ]] || return 1
+  mkdir -p "$CADDY_STATE/domains" "$CADDY_STATE/routes" "$CADDY_STATE/staging" "$ACME_CERT_DIR" || return 1
+  chmod 755 "$CADDY_STATE" "$CADDY_STATE/routes" || return 1
+  chmod 700 "$CADDY_STATE/domains" || return 1
+  chmod 750 "$ACME_CERT_DIR" && chown root:"$(id -gn nobody)" "$ACME_CERT_DIR" || return 1
 }
 
-acme_install() {
-  ensure_deps
-  local tmp actual
-  if ! acme_owned; then
-    for tmp in "$ACME_DIR" "$ACME_CERT_DIR" "$ACME_WEBROOT" "$ACME_RUNNER" \
-      "$ACME_UNIT_DIR/onevps-acme.service" "$ACME_UNIT_DIR/onevps-acme.timer"; do
-      [[ ! -e "$tmp" && ! -L "$tmp" ]] || { err "refusing unmanaged ACME path: $tmp"; return 1; }
-    done
-    mkdir -p "$ACME_DIR" || return 1
-    chmod 700 "$ACME_DIR" || return 1
-    touch "$ACME_DIR/.onevps-owned" || return 1
+# Read the configured storage, or the actual running service's environment.
+# Refuse non-filesystem storage rather than guessing where private keys live.
+caddy_storage_root() {
+  local file="$1" config root pid home xdg entry
+  config=$(caddy adapt --adapter caddyfile --config "$file" 2>/dev/null) || return 1
+  if jq -e '.storage != null' <<< "$config" >/dev/null; then
+    root=$(jq -er 'select(.storage.module == "file_system") | .storage.root | select(startswith("/"))' <<< "$config") || {
+      err 'certificate sync requires local Caddy file_system storage with an absolute root'; return 1;
+    }
+  else
+    pid=$(systemctl show caddy -p MainPID --value) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]] || { err 'cannot inspect running Caddy storage environment'; return 1; }
+    home='' xdg=''
+    while IFS= read -r -d '' entry; do
+      case "$entry" in HOME=*) home=${entry#HOME=};; XDG_DATA_HOME=*) xdg=${entry#XDG_DATA_HOME=};; esac
+    done < "/proc/$pid/environ"
+    if [[ -n "$xdg" ]]; then root="$xdg/caddy"; else root="$home/.local/share/caddy"; fi
+    [[ "$root" == /* && -n "${xdg:-$home}" ]] || return 1
   fi
-  if [[ ! -x "$ACME_DIR/client/acme.sh" ]]; then
-    tmp=$(mktemp -d "$ACME_DIR/.install.XXXXXXXX") || return 1
-    if ! download_file --connect-timeout 15 --max-time 180 \
-      "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tags/$ACME_VERSION" -o "$tmp/client.tar.gz"; then
-      rm -rf "$tmp"; return 1
-    fi
-    actual=$(openssl dgst -sha256 "$tmp/client.tar.gz") || { rm -rf "$tmp"; return 1; }
-    [[ "${actual##* }" == "$ACME_ARCHIVE_SHA256" ]] || { err 'ACME archive checksum mismatch'; rm -rf "$tmp"; return 1; }
-    tar -xzf "$tmp/client.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
-    mv "$tmp/acme.sh-$ACME_VERSION" "$ACME_DIR/client" || { rm -rf "$tmp"; return 1; }
-    rm -rf "$tmp"
-  fi
-  # No installer: no user profile changes, default cron jobs or account email prompts.
-  mkdir -p "$ACME_DIR/account" "$ACME_DIR/orders" "$ACME_DIR/domains" "$ACME_DIR/staging" \
-    "$ACME_CERT_DIR" "$ACME_WEBROOT/.well-known/acme-challenge" "$(dirname "$ACME_RUNNER")" || return 1
-  chmod 755 "$ACME_WEBROOT" "$ACME_WEBROOT/.well-known" "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
-  chmod 750 "$ACME_CERT_DIR" || return 1
-  chown root:"$(id -gn nobody)" "$ACME_CERT_DIR" || return 1
-  tmp=$(mktemp "${ACME_RUNNER}.XXXXXXXX") || return 1
-  if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! bash -n "$tmp"; then rm -f "$tmp"; return 1; fi
-  chmod 700 "$tmp" && mv -f "$tmp" "$ACME_RUNNER" || return 1
-  cat > "$ACME_UNIT_DIR/onevps-acme.service" <<EOF_SERVICE
-[Unit]
-Description=Renew OneVPS ACME certificates
-Wants=network-online.target
-After=network-online.target
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $ACME_RUNNER --acme-renew
-UMask=0077
-TimeoutStartSec=30min
-EOF_SERVICE
-  cat > "$ACME_UNIT_DIR/onevps-acme.timer" <<'EOF_TIMER'
-[Unit]
-Description=Check OneVPS certificate renewal twice daily
-[Timer]
-OnCalendar=*-*-* 00,12:00:00
-RandomizedDelaySec=1h
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOF_TIMER
-  systemctl daemon-reload && systemctl enable --now onevps-acme.timer
+  [[ "$root" != *'{'* && "$root" != *$'\n'* && -d "$root" ]] || return 1
+  printf '%s\n' "$root"
 }
 
-# Append an explicit HTTP-only vhost; never stop Caddy or edit existing site blocks.
-acme_caddy_route() {
-  local domain="$1" file="$2" backup
-  grep -qF "# OneVPS-acme:$domain BEGIN" "$file" && return 0
-  if grep -qiF "$domain" "$file"; then
-    err 'domain already exists in Caddyfile; use a dedicated HY2 domain or manual certificate'; return 1
+# OneVPS deliberately reserves UDP 443 for HY2 on the shared HTTPS listener.
+caddy_tcp_https() {
+  local file="$1" tmp
+  grep -qx '# OneVPS TCP-only HTTPS' "$file" && return 0
+  warn 'Caddy shares :443 with existing sites. HTTP/3 on this listener will be disabled; HTTP/1.1 and HTTP/2 remain enabled.'
+  confirm 'Reserve UDP 443 for HY2 on this Caddy listener?' n || return 1
+  tmp=$(mktemp) || return 1
+  awk '
+    function settings() {print "# OneVPS TCP-only HTTPS\n    servers :443 {\n        protocols h1 h2\n    }"}
+    !seen && /^[[:space:]]*(#.*)?$/ {print; next}
+    !seen {seen=1; if ($0 ~ /^[[:space:]]*\{[[:space:]]*$/) {print; settings(); next}
+      print "{"; settings(); print "}"}
+    {print}
+    END {if (!seen) {print "{"; settings(); print "}"}}
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! caddy adapt --adapter caddyfile --config "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; err 'existing Caddy global options conflict; configuration was not changed'; return 1
   fi
-  backup=$(mktemp "$ACME_DIR/.caddy.XXXXXXXX") || return 1
+  cat "$tmp" > "$file"; rm -f "$tmp"
+}
+
+caddy_domain_ensure() {
+  local domain="$1" file="$2" backup root
+  acme_domain_valid "$domain" || return 1
+  if [[ -f "$CADDY_STATE/domains/$domain.json" ]]; then
+    jq -e --arg file "$file" '.caddy_file == $file' "$CADDY_STATE/domains/$domain.json" >/dev/null &&
+      [[ $(grep -cxF "# OneVPS-domain:$domain BEGIN" "$file") == 1 ]] &&
+      [[ $(grep -cxF "# OneVPS-domain:$domain END" "$file") == 1 ]] &&
+      grep -qxF "    import $CADDY_STATE/routes/$domain/*.caddy" "$file" || return 1
+    return 0
+  fi
+  if grep -qiF "$domain" "$file"; then err "unmanaged domain already appears in Caddyfile: $domain"; return 1; fi
+  root=$(caddy_storage_root "$file") || return 1
+  backup=$(mktemp "$CADDY_STATE/.domain.XXXXXXXX") || return 1
   cp -p "$file" "$backup" || return 1
-  cat >> "$file" <<EOF_ROUTE
+  mkdir -p "$CADDY_STATE/routes/$domain" && chmod 755 "$CADDY_STATE/routes/$domain" || return 1
+  cat >> "$file" <<EOF_SITE
 
-# OneVPS-acme:$domain BEGIN
-http://$domain {
-    handle /.well-known/acme-challenge/* {
-        root * $ACME_WEBROOT
-        file_server
-    }
+# OneVPS-domain:$domain BEGIN
+$domain {
+    import $CADDY_STATE/routes/$domain/*.caddy
     handle {
-        respond 404
+        respond 403
     }
 }
-# OneVPS-acme:$domain END
-EOF_ROUTE
+# OneVPS-domain:$domain END
+EOF_SITE
   if ! caddy_reload "$file"; then
-    cp -p "$backup" "$file" && caddy_reload "$file" || err "Caddy restore failed; backup: $backup"
-    return 1
+    cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup"; return 1
+  fi
+  if ! jq -n --arg file "$file" --arg root "$root" '{caddy_file:$file,storage_root:$root}' > "$CADDY_STATE/domains/$domain.json"; then
+    cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup" "$CADDY_STATE/domains/$domain.json"; return 1
   fi
   rm -f "$backup"
 }
 
-acme_challenge_mode() {
-  local domain="$1" meta="$ACME_DIR/domains/$1.json" file mode
-  if [[ -f "$meta" ]]; then
-    mode=$(jq -er '.mode' "$meta") || return 1
-    if [[ "$mode" == webroot ]]; then
-      file=$(jq -er '.caddy_file' "$meta") || return 1
-      systemctl is-active --quiet caddy && acme_caddy_route "$domain" "$file" >&2 || return 1
-      echo webroot; return
-    fi
-    if [[ "$mode" == standalone ]] && port_in_use 80 tcp; then
-      err 'standalone renewal requires free TCP 80; refusing to stop the listener or silently change the saved ACME mode'
-      return 1
-    fi
-  fi
-  if port_in_use 80 tcp; then
-    systemctl is-active --quiet caddy || { err 'TCP 80 is occupied by a non-Caddy service; refusing to interrupt it'; return 1; }
-    file=$(find_caddyfile)
-    [[ -n "$file" && -f "$file" ]] || { err 'Caddyfile not found'; return 1; }
-    acme_caddy_route "$domain" "$file" >&2 || return 1
-    mode=webroot
-  else
-    mode=standalone; file=''
-    command -v socat >/dev/null 2>&1 || pkg_install socat >&2 || return 1
-  fi
-  jq -n --arg mode "$mode" --arg file "$file" '{mode:$mode,caddy_file:$file}' > "$meta" || return 1
-  echo "$mode"
+caddy_sync_domain() {
+  local domain="$1" file root cert key found=false stage="$CADDY_STATE/staging/$1"
+  acme_domain_valid "$domain" || return 1
+  file=$(jq -er '.caddy_file' "$CADDY_STATE/domains/$domain.json") || return 1
+  root=$(caddy_storage_root "$file") || return 1
+  mkdir -p "$stage" || return 1
+  # Check all issuers; never hardcode Let's Encrypt or copy Caddy's whole store.
+  for cert in "$root/certificates/"*/"$domain/$domain.crt"; do
+    [[ -f "$cert" && ! -L "$cert" ]] || continue
+    key="${cert%.crt}.key"
+    [[ -f "$key" && ! -L "$key" ]] || continue
+    cp "$cert" "$stage/fullchain.pem" && cp "$key" "$stage/key.pem" || return 1
+    chmod 600 "$stage/fullchain.pem" "$stage/key.pem" || return 1
+    if validate_hy2_pem "$domain" "$stage/fullchain.pem" "$stage/key.pem"; then found=true; break; fi
+  done
+  $found || { err "Caddy certificate not ready for $domain; check DNS, TCP 80/443 and Caddy logs"; return 1; }
+  acme_deploy "$domain"
 }
+
+caddy_sync_all() (
+  [[ -f "$CADDY_STATE/.onevps-owned" ]] || return 0
+  exec 9> "$CADDY_STATE/operation.lock"
+  flock -n 9 || return 0
+  local meta failed=0
+  for meta in "$CADDY_STATE/domains/"*.json; do
+    [[ -f "$meta" ]] || continue
+    caddy_sync_domain "$(basename "$meta" .json)" || failed=1
+  done
+  return "$failed"
+)
+
+caddy_sync_install() {
+  local tmp
+  mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
+  tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
+  cat "$ONEVPS_SCRIPT_PATH" > "$tmp" && bash -n "$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || return 1
+  cat > "$ACME_UNIT_DIR/onevps-caddy-sync.service" <<EOF_SERVICE
+[Unit]
+Description=Deploy Caddy certificates to OneVPS Xray
+After=caddy.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $CADDY_SYNC_RUNNER --caddy-sync
+UMask=0077
+EOF_SERVICE
+  cat > "$ACME_UNIT_DIR/onevps-caddy-sync.timer" <<'EOF_TIMER'
+[Unit]
+Description=Check Caddy certificate deployment every minute
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  systemctl daemon-reload && systemctl enable --now onevps-caddy-sync.timer
+}
+
+caddy_certificate_issue() (
+  local domain="$1" file i
+  acme_domain_valid "$domain" || return 1
+  prepare_caddy_for_trojan || return 1
+  exec 9> "$CADDY_STATE/operation.lock"
+  flock -n 9 || { err 'another Caddy certificate operation is running'; return 1; }
+  file=$(find_caddyfile)
+  caddy_domain_ensure "$domain" "$file" || return 1
+  open_port 80 tcp; open_port 443 tcp
+  for ((i=0; i<30; i++)); do
+    if caddy_sync_domain "$domain"; then return 0; fi
+    sleep 2
+  done
+  err 'Caddy issuance is still pending; retry from Certificates after checking Caddy logs'
+  return 1
+)
+
+# Configure Caddy for new deployments without inspecting or migrating old resources.
+prepare_caddy_for_trojan() (
+  local file backup active=false enabled=false committed=false sync_enabled=false
+  caddy_state_init || return 1
+  exec 8> "$CADDY_STATE/operation.lock"
+  flock -n 8 || { err 'another Caddy operation is running'; return 1; }
+  file=$(find_caddyfile)
+  backup=$(mktemp -d "$CADDY_STATE/backup.XXXXXXXX") || return 1
+  [[ -z "$file" ]] || cp -p "$file" "$backup/Caddyfile" || return 1
+  systemctl is-active --quiet caddy && active=true
+  systemctl is-enabled --quiet caddy && enabled=true
+  systemctl is-enabled --quiet onevps-caddy-sync.timer && sync_enabled=true
+  rollback_caddy_setup() {
+    local status=$? failed=false current
+    trap - EXIT INT TERM HUP
+    if ! $committed; then
+      status=1
+      if ! $sync_enabled; then systemctl disable --now onevps-caddy-sync.timer || failed=true; fi
+      current=$(find_caddyfile)
+      if [[ -f "$backup/Caddyfile" ]]; then cp -p "$backup/Caddyfile" "$file" || failed=true
+      elif [[ -n "$current" ]]; then rm -f "$current" || failed=true; fi
+      if $active; then caddy_reload "$file" || failed=true
+      else systemctl stop caddy || failed=true; fi
+      if ! $enabled; then systemctl disable caddy || failed=true; fi
+      err "Caddy setup failed; backup retained: $backup"
+    else rm -rf "$backup"; fi
+    if $failed; then err 'rollback incomplete; inspect retained backup'; exit 1; fi
+    exit "$status"
+  }
+  trap rollback_caddy_setup EXIT
+  trap 'exit 1' INT TERM HUP
+  ensure_caddy || return 1
+  file=$(find_caddyfile)
+  [[ -n "$file" && ! -L "$file" ]] || return 1
+  caddy_tcp_https "$file" || return 1
+  caddy_reload "$file" || return 1
+  caddy_sync_install || return 1
+  committed=true
+)
 
 # Switch a symlink to a complete key/cert pair, retaining the previous pair on failure.
 acme_deploy() (
-  local domain="$1" stage="$ACME_DIR/staging/$1" dir="$ACME_CERT_DIR/$1"
+  local domain="$1" stage="$CADDY_STATE/staging/$1" dir="$ACME_CERT_DIR/$1"
   local version previous='' active=false switched=false committed=false used=false check_log ng
   acme_domain_valid "$domain" || return 1
   validate_hy2_pem "$domain" "$stage/fullchain.pem" "$stage/key.pem" || return 1
@@ -1423,103 +1494,26 @@ acme_deploy() (
   ok "certificate deployed: $domain"
 )
 
-acme_process_domain() {
-  local domain="$1" action="$2" mode status=0
-  acme_domain_valid "$domain" || { err 'invalid ACME domain'; return 1; }
-  mode=$(acme_challenge_mode "$domain") || return 1
-  local -a challenge=(--standalone)
-  [[ "$mode" != webroot ]] || challenge=(--webroot "$ACME_WEBROOT")
-  open_port 80 tcp
-  if [[ "$action" == issue ]]; then
-    # Let\'s Encrypt accepts registration without contact; do not select ZeroSSL's EAB flow.
-    acme_exec --issue -d "$domain" --keylength ec-256 "${challenge[@]}" || status=$?
-  else
-    acme_exec --renew -d "$domain" --ecc "${challenge[@]}" || status=$?
-  fi
-  [[ "$status" == 0 || "$status" == 2 ]] || return "$status"
-  mkdir -p "$ACME_DIR/staging/$domain" || return 1
-  acme_exec --install-cert -d "$domain" --ecc \
-    --key-file "$ACME_DIR/staging/$domain/key.pem" \
-    --fullchain-file "$ACME_DIR/staging/$domain/fullchain.pem" || return 1
-  acme_deploy "$domain"
-}
-
-acme_issue() (
-  local domain="$1"
-  acme_domain_valid "$domain" || { err 'invalid ACME domain'; return 1; }
-  command -v flock >/dev/null 2>&1 && command -v ss >/dev/null 2>&1 || {
-    err 'automatic ACME requires flock and ss'; return 1;
-  }
-  acme_install || return 1
-  exec 9> "$ACME_DIR/operation.lock"
-  flock -n 9 || { err 'another certificate operation is running'; return 1; }
-  info "Let's Encrypt HTTP-01: DNS must point here; public TCP 80 must remain reachable for renewals."
-  info 'No email, account password, DNS API key or certificate path is required.'
-  acme_process_domain "$domain" issue
-)
-
-acme_renew_all() (
-  acme_owned || return 0
-  exec 9> "$ACME_DIR/operation.lock"
-  flock -n 9 || return 0
-  local file domain failed=0
-  shopt -s nullglob
-  for file in "$ACME_DIR/domains/"*.json; do
-    domain=$(basename "$file" .json)
-    acme_process_domain "$domain" renew || { err "certificate renewal/deployment failed: $domain"; failed=1; }
-  done
-  return "$failed"
-)
-
-acme_uninstall() {
-  acme_owned || return 0
-  confirm 'Remove OneVPS ACME account, certificates and renewal timer? External certificates are kept.' n || return 0
-  local meta domain file candidate
-  systemctl stop onevps-acme.timer onevps-acme.service && systemctl disable onevps-acme.timer || return 1
-  for meta in "$ACME_DIR/domains/"*.json; do
-    [[ -f "$meta" ]] || continue
-    domain=$(basename "$meta" .json)
-    acme_domain_valid "$domain" || return 1
-    file=$(jq -r '.caddy_file // ""' "$meta") || return 1
-    if [[ -n "$file" && -f "$file" ]]; then
-      cp -p "$file" "$ACME_DIR/caddy-uninstall.backup" || return 1
-      candidate=$(mktemp "$ACME_DIR/.caddy-remove.XXXXXXXX") || return 1
-      awk -v begin="# OneVPS-acme:$domain BEGIN" -v end="# OneVPS-acme:$domain END" '
-        $0 == begin {skip=1; next} $0 == end {skip=0; next} !skip {print}
-      ' "$file" > "$candidate" && cat "$candidate" > "$file" || return 1
-      rm -f "$candidate"
-      if ! caddy_reload "$file"; then
-        cp -p "$ACME_DIR/caddy-uninstall.backup" "$file"
-        caddy_reload "$file" || true
-        err 'ACME cleanup stopped; files retained'; return 1
-      fi
-    fi
-  done
-  rm -f "$ACME_UNIT_DIR/onevps-acme.timer" "$ACME_UNIT_DIR/onevps-acme.service" "$ACME_RUNNER"
-  rm -rf "$ACME_DIR" "$ACME_CERT_DIR" "$ACME_WEBROOT"
-  systemctl daemon-reload
-}
-
 certificate_menu() {
   local choice domain file
   while :; do
-    printf '\nCertificates (OneVPS ACME)\n1) Status / expiry\n2) Apply certificate (domain only)\n3) Check renewals / retry deployment\n4) Renewal logs\n0) Back\n'
+    printf '\nCertificates (Caddy-managed)\n1) Status / expiry\n2) Apply certificate (domain only)\n3) Check renewals / retry deployment\n4) Renewal logs\n0) Back\n'
     choice=$(ask 'Select')
     case "$choice" in
       0|'') return ;;
       1)
-        if acme_owned; then
-          systemctl --no-pager status onevps-acme.timer || true
+        if [[ -f "$CADDY_STATE/.onevps-owned" ]]; then
+          systemctl --no-pager status onevps-caddy-sync.timer || true
           for file in "$ACME_CERT_DIR/"*/current/fullchain.pem; do
             [[ -f "$file" ]] || continue
             printf '\n%s\n' "$file"; openssl x509 -in "$file" -noout -subject -dates || true
           done
-        else info 'no OneVPS ACME installation'; fi ;;
+        else info 'no OneVPS Caddy certificate setup'; fi ;;
       2)
         domain=$(normalize_domain "$(ask 'Domain')")
-        acme_issue "$domain" || err 'certificate was not deployed' ;;
-      3) acme_renew_all || err 'renewal failed; see logs' ;;
-      4) journalctl -u onevps-acme.service --no-pager -n 60 || true ;;
+        caddy_certificate_issue "$domain" || err 'certificate was not deployed' ;;
+      3) caddy_sync_all || err 'renewal failed; see logs' ;;
+      4) journalctl -u caddy -u onevps-caddy-sync.service --no-pager -n 60 || true ;;
       *) warn 'invalid selection' ;;
     esac
   done
@@ -1617,23 +1611,15 @@ add_hysteria_node() {
     err 'Hysteria2 setup requires ss (iproute2) and runuser (util-linux)'; pause; return 0;
   }
   ensure_nodes_file
-  local name domain password cert key port id node certificate_mode
+  local name domain password cert key port id node
   info 'Add Hysteria2 (native Xray, QUIC/UDP + TLS)'
-  warn 'Use a DNS-only domain pointing to this server. Automatic ACME requires public TCP 80.'
+  warn 'Use a DNS-only domain pointing to this server. Caddy manages TLS; public TCP 80/443 must be reachable.'
   name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
   domain=$(normalize_domain "$(ask 'TLS domain')")
   is_valid_domain "$domain" || { err 'invalid domain'; pause; return 0; }
-  certificate_mode=$(ask 'Certificate: 1) Automatic ACME  2) Existing PEM' 1)
-  case "$certificate_mode" in
-    1)
-      acme_issue "$domain" || { err 'automatic certificate setup failed'; pause; return 0; }
-      cert="$ACME_CERT_DIR/$domain/current/fullchain.pem"
-      key="$ACME_CERT_DIR/$domain/current/key.pem" ;;
-    2)
-      cert=$(ask 'Absolute PEM certificate/full-chain path')
-      key=$(ask 'Absolute unencrypted PEM private-key path') ;;
-    *) err 'invalid certificate mode'; pause; return 0 ;;
-  esac
+  caddy_certificate_issue "$domain" || { err 'Caddy certificate setup failed'; pause; return 0; }
+  cert="$ACME_CERT_DIR/$domain/current/fullchain.pem"
+  key="$ACME_CERT_DIR/$domain/current/key.pem"
   validate_hy2_certificate "$domain" "$cert" "$key" || { pause; return 0; }
   while :; do
     port=$(ask 'UDP listen port (Caddy HTTP/3 may already use UDP 443)' 443)
@@ -1913,7 +1899,7 @@ add_trojan_node() {
   ensure_nodes_file
   echo; info "Add node - Trojan + WebSocket (behind Caddy)"
 
-  if ! ensure_caddy; then
+  if ! prepare_caddy_for_trojan; then
     err "Caddy required for Trojan nodes but could not be installed"
     pause; return
   fi
@@ -1933,7 +1919,7 @@ add_trojan_node() {
     warn "invalid domain"
     domain=$(normalize_domain "$(ask "Trojan subdomain")")
   done
-  if grep -qiF "$domain" "$cfile" 2>/dev/null; then
+  if grep -qiF "$domain" "$cfile" 2>/dev/null && [[ ! -f "$CADDY_STATE/domains/$domain.json" ]]; then
     err "$domain already appears in $cfile; pick another subdomain or remove the existing block first"
     pause; return
   fi
@@ -2250,7 +2236,7 @@ edit_trojan_domain() {
 
   # Drop our old block first so the collision check ignores it.
   caddy_remove_route "$id" "$cf"
-  if grep -qiF "$newdom" "$cf" 2>/dev/null; then
+  if grep -qiF "$newdom" "$cf" 2>/dev/null && [[ ! -f "$CADDY_STATE/domains/$newdom.json" ]]; then
     err "$newdom already appears in $cf; restoring old route"
     caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
     pause; return
@@ -2523,7 +2509,16 @@ uninstall() {
   warn "Uninstall removes Xray binary, config, onevps nodes and logs"
   warn "(BBR/system tuning configs and the swap file are kept)"
   confirm "Confirm uninstall?" n || return
-  acme_uninstall || { err 'ACME cleanup failed; Xray uninstall cancelled'; return 1; }
+  local node route_id route_file
+  while IFS= read -r node; do
+    route_id=$(jq -r '.id' <<< "$node")
+    route_file=$(jq -r '.caddy_file' <<< "$node")
+    caddy_remove_route "$route_id" "$route_file" && caddy_reload "$route_file" || {
+      err 'Caddy route cleanup failed; Xray uninstall cancelled'; return 1;
+    }
+  done < <(jq -c '.nodes[] | select(.type == "trojan-ws")' "$XRAY_NODES")
+  systemctl disable --now onevps-caddy-sync.timer 2>/dev/null || true
+  warn 'Caddy domain sites and certificates are retained; certificate sync to Xray is disabled.'
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
   rm -f "$XRAY_SERVICE" /etc/systemd/system/xray@.service
@@ -2906,7 +2901,7 @@ EOF
   Setup / management:
    1) Install / update Xray-core
    2) Nodes / users / outbound / share links
-   3) Certificates (automatic ACME)
+   3) Certificates (Caddy-managed)
    4) Realm relay
    5) Service / network
 
@@ -2934,8 +2929,8 @@ EOF
 
 main() {
   check_env
-  if [[ "${1:-}" == --acme-renew ]]; then
-    acme_renew_all
+  if [[ "${1:-}" == --caddy-sync ]]; then
+    caddy_sync_all
     return
   fi
   main_menu
