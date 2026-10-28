@@ -91,6 +91,24 @@ jq '.nodes[2].port = .nodes[0].port' "$work/all-nodes.json" > "$work/conflicting
 reject sing_render "$work/conflicting-ports.json" "$work/reject.json"
 jq '.nodes += .nodes' "$work/trojan-nodes.json" > "$work/two-trojan.json"
 reject sing_render "$work/two-trojan.json" "$work/reject.json"
+jq -n '{nodes:[{id:"f1e2d3c4",name:"VMess WS",tag:"vmess-f1e2d3c4",type:"vmess-ws",
+  domain:"vmess.example.com",uuid:"123e4567-e89b-12d3-a456-426614174004",port:24888,
+  ws_path:"/test-vmess",caddy_file:"/etc/caddy/Caddyfile",enabled:true}]}' > "$work/vmess-nodes.json"
+sing_render "$work/vmess-nodes.json" "$work/vmess-config.json" || fail 'VMess WS render'
+jq -e '.inbounds[0] | .type == "vmess" and .listen == "127.0.0.1" and
+  .listen_port == 24888 and .transport == {type:"ws",path:"/test-vmess"} and
+  .users == [{name:"default",uuid:"123e4567-e89b-12d3-a456-426614174004",alterId:0}] and
+  (has("tls") | not)' "$work/vmess-config.json" >/dev/null || fail 'loopback-only VMess AEAD WS config'
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  "$SING_TEST_BIN" check -c "$work/vmess-config.json" || fail 'VMess WS real core check'
+fi
+jq -s '{nodes:(.[0].nodes + .[1].nodes)}' "$work/all-nodes.json" "$work/vmess-nodes.json" > "$work/four-nodes.json"
+sing_render "$work/four-nodes.json" "$work/four-config.json" || fail 'four-inbound render'
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  "$SING_TEST_BIN" check -c "$work/four-config.json" || fail 'four-inbound real core check'
+fi
+jq '.nodes += .nodes' "$work/vmess-nodes.json" > "$work/two-vmess.json"
+reject sing_render "$work/two-vmess.json" "$work/reject.json"
 jq '.nodes += .nodes' "$SING_NODES" > "$work/two.json"
 reject sing_render "$work/two.json" "$work/reject.json"
 jq '.nodes += .nodes' "$work/hy2-nodes.json" > "$work/two-hy2.json"
@@ -187,14 +205,14 @@ grep -q '^vless://' "$work/link" || fail 'share link'
       *) return 1 ;;
     esac
   }
-  sing_add_trojan_ws > "$work/trojan-link" || fail 'Trojan WS node transaction'
+  sing_add_ws trojan-ws > "$work/trojan-link" || fail 'Trojan WS node transaction'
   jq -e '(.nodes|length == 3) and .nodes[2].type == "trojan-ws"' "$SING_NODES" >/dev/null || fail 'Trojan WS stored with REALITY and HY2'
   id=$(jq -r '.nodes[2].id' "$SING_NODES")
   route="$CADDY_STATE/routes/ws.example.com/$id.caddy"
   test -f "$route" || fail 'Caddy WS route missing'
   grep -q 'reverse_proxy 127.0.0.1:24777' "$route" || fail 'Caddy WS backend'
   grep -q '^trojan://' "$work/trojan-link" || fail 'Trojan WS share link'
-  reject sing_add_trojan_ws
+  reject sing_add_ws trojan-ws
   cp "$work/trojan-before-nodes.json" "$SING_NODES"
   cp "$work/trojan-before-config.json" "$SING_CONF"
   caddy_remove_route "$id"
@@ -205,17 +223,70 @@ grep -q '^vless://' "$work/link" || fail 'share link'
       (( restart_count > 1 ))
     else return 0; fi
   }
-  reject sing_add_trojan_ws
+  reject sing_add_ws trojan-ws
   cmp "$SING_NODES" "$work/trojan-before-nodes.json" || fail 'service failure restored Trojan metadata'
   cmp "$SING_CONF" "$work/trojan-before-config.json" || fail 'service failure restored Trojan config'
   test ! -e "$CADDY_STATE/routes/ws.example.com/$id.caddy" || fail 'service failure retained Caddy route'
 
   systemctl() { return 0; }
   RELOAD_FAIL=1
-  reject sing_add_trojan_ws
+  reject sing_add_ws trojan-ws
   cmp "$SING_NODES" "$work/trojan-before-nodes.json" || fail 'route failure restored Trojan metadata'
   cmp "$SING_CONF" "$work/trojan-before-config.json" || fail 'route failure restored Trojan config'
   test -z "$(find "$CADDY_STATE/routes" -name '*.caddy' -print)" || fail 'route failure retained a Caddy route'
+)
+
+# VMess uses the same Caddy transaction, while preserving the existing Trojan route.
+(
+  test_root="$work"
+  CADDY_STATE="$work/vmess-caddy"
+  mkdir -p "$CADDY_STATE/routes/ws.example.com"
+  printf ':80 { respond "existing" }\n' > "$work/vmess-Caddyfile"
+  cp "$work/trojan-nodes.json" "$work/vmess-source.json"
+  jq --arg file "$work/vmess-Caddyfile" '.nodes[0].caddy_file=$file' "$work/vmess-source.json" > "$SING_NODES"
+  printf '{"old":true}\n' > "$SING_CONF"
+  printf 'handle /old { reverse_proxy 127.0.0.1:24777 }\n' > "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy"
+  prepare_caddy_for_trojan() { :; }
+  find_caddyfile() { printf '%s\n' "$test_root/vmess-Caddyfile"; }
+  caddy_domain_ensure() { mkdir -p "$CADDY_STATE/routes/$1"; }
+  caddy_reload() { [[ "${RELOAD_FAIL:-0}" == 0 ]]; }
+  ask() {
+    case "$1" in
+      'Node name') echo 'VMess WS' ;;
+      'TLS domain') echo vmess.example.com ;;
+      'Loopback TCP port') echo 24888 ;;
+      'UUID (Enter for random)') echo 123e4567-e89b-12d3-a456-426614174004 ;;
+      *) return 1 ;;
+    esac
+  }
+  sing_add_ws vmess-ws > "$work/vmess-link" || fail 'VMess WS node transaction'
+  jq -e '(.nodes|length == 2) and .nodes[1].type == "vmess-ws"' "$SING_NODES" >/dev/null || fail 'VMess stored with Trojan'
+  id=$(jq -r '.nodes[1].id' "$SING_NODES")
+  route="$CADDY_STATE/routes/vmess.example.com/$id.caddy"
+  test -f "$route" || fail 'VMess Caddy WS route missing'
+  test -f "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" || fail 'VMess touched Trojan route'
+  link=$(grep '^vmess://' "$work/vmess-link")
+  encoded=${link#vmess://}
+  printf '%s' "$encoded" | openssl base64 -d -A | jq -e '.aid == "0" and .scy == "auto" and .path != ""' >/dev/null || fail 'VMess AEAD share link'
+  reject sing_add_ws vmess-ws
+  cp "$work/vmess-source.json" "$SING_NODES"
+  printf '{"old":true}\n' > "$SING_CONF"
+  caddy_remove_route "$id"
+  restart_count=0
+  systemctl() {
+    if [[ "$1" == restart ]]; then restart_count=$((restart_count+1)); (( restart_count > 1 ))
+    else return 0; fi
+  }
+  reject sing_add_ws vmess-ws
+  cmp "$SING_NODES" "$work/vmess-source.json" || fail 'VMess service rollback metadata'
+  jq -e '.old == true' "$SING_CONF" >/dev/null || fail 'VMess service rollback config'
+  test -f "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" || fail 'VMess rollback touched Trojan route'
+  systemctl() { return 0; }
+  RELOAD_FAIL=1
+  reject sing_add_ws vmess-ws
+  cmp "$SING_NODES" "$work/vmess-source.json" || fail 'VMess route rollback metadata'
+  jq -e '.old == true' "$SING_CONF" >/dev/null || fail 'VMess route rollback config'
+  test -z "$(find "$CADDY_STATE/routes/vmess.example.com" -name '*.caddy' -print)" || fail 'VMess route rollback retained route'
 )
 
 # Uninstall removes the owned WS route but keeps the Caddy domain and certificate state.
@@ -224,15 +295,20 @@ grep -q '^vless://' "$work/link" || fail 'share link'
   CADDY_STATE="$work/uninstall-caddy"
   mkdir -p "$CADDY_STATE/routes/ws.example.com"
   printf ':80 { respond "existing" }\n' > "$work/uninstall-Caddyfile"
-  cp "$work/trojan-nodes.json" "$work/uninstall-nodes.json"
-  jq --arg file "$work/uninstall-Caddyfile" '.nodes[0].caddy_file=$file' \
-    "$work/uninstall-nodes.json" > "$SING_NODES"
+  jq --arg file "$work/uninstall-Caddyfile" \
+    '.nodes[0].caddy_file=$file' "$work/trojan-nodes.json" > "$work/uninstall-trojan.json"
+  jq --arg file "$work/uninstall-Caddyfile" \
+    '.nodes[0].caddy_file=$file' "$work/vmess-nodes.json" > "$work/uninstall-vmess.json"
+  jq -s '{nodes:(.[0].nodes + .[1].nodes)}' "$work/uninstall-trojan.json" "$work/uninstall-vmess.json" > "$SING_NODES"
   printf 'handle /test-ws { reverse_proxy 127.0.0.1:24777 }\n' > "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy"
+  mkdir -p "$CADDY_STATE/routes/vmess.example.com"
+  printf 'handle /test-vmess { reverse_proxy 127.0.0.1:24888 }\n' > "$CADDY_STATE/routes/vmess.example.com/f1e2d3c4.caddy"
   confirm() { return 0; }
   systemctl() { return 0; }
   caddy_reload() { [[ "$1" == "$test_root/uninstall-Caddyfile" ]]; }
   sing_uninstall > "$work/trojan-uninstall" || fail 'Trojan WS uninstall'
   test ! -e "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" || fail 'uninstall retained Trojan route'
+  test ! -e "$CADDY_STATE/routes/vmess.example.com/f1e2d3c4.caddy" || fail 'uninstall retained VMess route'
   test -f "$work/uninstall-Caddyfile" || fail 'uninstall removed Caddy site'
   test -d "$CADDY_STATE" || fail 'uninstall removed Caddy state'
 )

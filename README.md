@@ -20,7 +20,7 @@ Four deployment modes are supported:
 - **VMess AEAD + WebSocket behind Caddy** — UUID authentication with Caddy-managed TLS.
 
 Xray remains the full-featured mode; sing-box currently supports one node each for VLESS + REALITY + Vision,
-Hysteria2 and Trojan + WebSocket.
+Hysteria2, Trojan + WebSocket and VMess AEAD + WebSocket.
 Core installations are exclusive: this release does not migrate or run Xray and sing-box together.
 OneVPS is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
@@ -28,16 +28,17 @@ replacement for infrastructure-as-code, firewall management, monitoring, or back
 ## Sing-box preview
 
 On a fresh host, select **7 → 1** to install the pinned sing-box 1.14.4 release, then **2** in the
-sing-box menu to add one VLESS + REALITY + Vision node. Select **6** for Hysteria2 or **7** for
-Trojan + WebSocket behind Caddy.
+sing-box menu to add one VLESS + REALITY + Vision node. Select **6** for Hysteria2, **7** for
+Trojan + WebSocket, or **8** for VMess AEAD + WebSocket behind Caddy.
 The release archive is verified with its
 SHA-256 digest before installation. Existing Xray installations or node data prevent switching;
 back up and migrate manually on a separate host rather than deleting data to bypass this check.
-Sing-box node management, user-specific outbounds and VMess (including VMess over WS) are not supported yet.
+Sing-box node management and user-specific outbounds are not supported yet.
 The sing-box menu can display links, restart its service, update the script, and uninstall its own files.
-For Trojan + WS, Caddy owns public TLS and proxies the generated path to a loopback-only sing-box
+For Trojan or VMess over WS, Caddy owns public TLS and proxies the generated path to a loopback-only sing-box
 inbound without TLS. A failed node creation or Caddy route update restores the previous node configuration
 and route; the domain site and certificate remain managed by Caddy.
+VMess uses `alterId=0` (AEAD) and the existing v2rayN v2 share-link format.
 
 Sing-box [supports native ACME certificate issuance](https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/)
 through the certificate provider introduced in 1.14.0. The official 1.14.4 build includes `with_acme`,
