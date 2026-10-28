@@ -372,6 +372,90 @@ grep -q '^vless://' "$work/link" || fail 'share link'
   test -f "$work/lifecycle-Caddyfile" || fail 'Caddy site removed on node deletion'
 )
 
+# Authenticated users and their routes use the same validated sing-box transaction.
+(
+  users_root="$work"
+  cp "$work/four-nodes.json" "$SING_NODES"
+  sing_render "$SING_NODES" "$SING_CONF" || fail 'user test initial render'
+  sing_check() { [[ ! -f "$users_root/fail-user-check" ]] && { [[ -z "${SING_TEST_BIN:-}" ]] || "$SING_TEST_BIN" check -c "$1"; }; }
+  systemctl() {
+    if [[ "$1" == restart && -f "$users_root/fail-user-restart" ]]; then
+      command rm "$users_root/fail-user-restart"; return 1
+    fi
+    return 0
+  }
+  sing_secure() { :; }
+  for id in a1b2c3d4 abc12345 cdef1234 f1e2d3c4; do
+    if [[ "$id" == a1b2c3d4 || "$id" == f1e2d3c4 ]]; then
+      credential=uuid; secret=123e4567-e89b-12d3-a456-426614174087
+    else
+      credential=password; secret="secret-$id"
+    fi
+    payload=$(jq -nc --arg id alice --arg name Alice --arg credential "$credential" --arg secret "$secret" \
+      '{id:$id,name:$name} + {($credential):$secret}')
+    printf '%s\n' "$payload" | sing_change_user_or_outbound sing_prepare_user "$id" add || fail "add user $id"
+    jq -e --arg id "$id" --arg key "$credential" --arg secret "$secret" '
+      .nodes[] | select(.id == $id) | .users[0][$key] == $secret' "$SING_NODES" >/dev/null || fail "stored user $id"
+    jq -e --arg id "$id" '.inbounds[] | select(.tag | endswith($id)) | (.users|length) == 2' \
+      "$SING_CONF" >/dev/null || fail "rendered two users $id"
+    link=$(node_user_link "$(jq -c --arg id "$id" '.nodes[] | select(.id==$id)' "$SING_NODES")" alice)
+    [[ "$link" == *"$secret"* || "$link" == *vmess://* ]] || fail "user link $id"
+    printf '%s\n' "$payload" | reject sing_change_user_or_outbound sing_prepare_user "$id" add
+  done
+  printf '%s\n' '{"id":"bob","name":"Bob","uuid":"123e4567-e89b-12d3-a456-426614174087"}' |
+    reject sing_change_user_or_outbound sing_prepare_user a1b2c3d4 add
+  cp "$SING_NODES" "$work/users-before-nodes.json"
+  cp "$SING_CONF" "$work/users-before-config.json"
+  touch "$work/fail-user-restart"
+  reject sing_change_user_or_outbound sing_prepare_user a1b2c3d4 delete alice
+  cmp "$SING_NODES" "$work/users-before-nodes.json" || fail 'user restart rollback metadata'
+  cmp "$SING_CONF" "$work/users-before-config.json" || fail 'user restart rollback config'
+  touch "$work/fail-user-check"
+  reject sing_change_user_or_outbound sing_prepare_user a1b2c3d4 delete alice
+  command rm "$work/fail-user-check"
+  cmp "$SING_NODES" "$work/users-before-nodes.json" || fail 'user check rollback metadata'
+  outbound='{"mode":"proxy","protocol":"socks","server":"127.0.0.1","port":1080}'
+  printf '%s\n' "$outbound" | sing_change_user_or_outbound sing_prepare_outbound a1b2c3d4 selected '["alice"]' || fail 'user SOCKS outbound'
+  jq -e '.route.rules[0].action == "resolve" and .route.rules[1].action == "reject" and
+    any(.route.rules[]; .auth_user == ["alice"] and .inbound == ["reality-a1b2c3d4"] and
+      .outbound == "out-reality-a1b2c3d4-alice")' "$SING_CONF" >/dev/null || fail 'user routing priority'
+  jq -e 'any(.outbounds[]; .tag == "out-reality-a1b2c3d4-alice" and .type == "socks")' "$SING_CONF" >/dev/null || fail 'SOCKS outbound generated'
+  for kind in shadowsocks vless vmess; do
+    case "$kind" in
+      shadowsocks)
+        outbound='{"mode":"proxy","protocol":"shadowsocks","server":"127.0.0.1","port":1081,"method":"aes-128-gcm","password":"proxy-secret"}' ;;
+      vless)
+        outbound='{"mode":"proxy","protocol":"vless","server":"example.com","port":443,"uuid":"123e4567-e89b-12d3-a456-426614174001","params":{"encryption":"none","type":"tcp","security":"tls","flow":""}}' ;;
+      vmess)
+        outbound='{"mode":"proxy","protocol":"vmess","server":"example.com","port":443,"uuid":"123e4567-e89b-12d3-a456-426614174001","method":"auto","params":{"encryption":"none","type":"ws","security":"tls","flow":"","path":"/upstream"}}' ;;
+    esac
+    printf '%s\n' "$outbound" | sing_change_user_or_outbound sing_prepare_outbound a1b2c3d4 selected '["alice"]' || fail "$kind proxy assignment"
+    jq -e --arg kind "$kind" 'any(.outbounds[]; .tag == "out-reality-a1b2c3d4-alice" and .type == $kind)' "$SING_CONF" >/dev/null || fail "$kind proxy render"
+  done
+  unsupported='{"mode":"proxy","protocol":"vless","server":"example.com","port":443,"uuid":"123e4567-e89b-12d3-a456-426614174001","params":{"encryption":"none","type":"grpc","security":"tls","flow":"","serviceName":"upstream"}}'
+  cp "$SING_NODES" "$work/unsupported-before-nodes.json"
+  printf '%s\n' "$unsupported" | reject sing_change_user_or_outbound sing_prepare_outbound a1b2c3d4 selected '["alice"]'
+  cmp "$SING_NODES" "$work/unsupported-before-nodes.json" || fail 'unsupported outbound changed metadata'
+  printf '%s\n' '{"mode":"direct"}' | sing_change_user_or_outbound sing_prepare_outbound a1b2c3d4 selected '["default"]' || fail 'default direct override'
+  jq -e 'any(.route.rules[]; .auth_user == ["default"] and .outbound == "direct")' "$SING_CONF" >/dev/null || fail 'default route override'
+  printf '%s\n' '"inherit"' | sing_change_user_or_outbound sing_prepare_outbound a1b2c3d4 selected '["alice"]' || fail 'restore user inheritance'
+  jq -e '[.route.rules[] | select(.auth_user? == ["alice"])] | length == 0' "$SING_CONF" >/dev/null || fail 'user inheritance route removal'
+  for id in a1b2c3d4 abc12345 cdef1234 f1e2d3c4; do
+    sing_change_user_or_outbound sing_prepare_user "$id" delete alice || fail "delete user $id"
+  done
+  jq -e 'all(.nodes[]; (.users|length) == 0)' "$SING_NODES" >/dev/null || fail 'users deleted'
+)
+
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  jq -n '{nodes:[{id:"f1e2d3c4",name:"VMess runtime",tag:"vmess-f1e2d3c4",type:"vmess-ws",
+    domain:"vmess.example.com",uuid:"123e4567-e89b-12d3-a456-426614174004",port:24888,
+    ws_path:"/test-vmess",caddy_file:"/etc/caddy/Caddyfile",enabled:true,
+    users:[{id:"alice",name:"Alice",uuid:"123e4567-e89b-12d3-a456-426614174005",
+      outbound:{mode:"proxy",protocol:"socks",server:"127.0.0.1",port:1080}}]}]}' > "$work/runtime-nodes.json"
+  sing_render "$work/runtime-nodes.json" "$work/runtime-server.json" || fail 'runtime server render'
+  python3 "$root/tests/sing_box_runtime.py" "$SING_TEST_BIN" "$work/runtime-server.json" "$work" || fail 'runtime authentication and routing'
+fi
+
 # Uninstall removes the owned WS route but keeps the Caddy domain and certificate state.
 (
   test_root="$work"

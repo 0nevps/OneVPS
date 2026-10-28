@@ -16,8 +16,103 @@ sing_asset() {
   esac
 }
 
+sing_validate_users() {
+  local source="$1" outbound
+  jq -e '
+    def uuid: type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$");
+    all(.nodes[]; . as $n | (.users // []) as $users |
+      ($users|type == "array") and
+      ([$users[].id]|length == (unique|length)) and
+      ([$users[].name]|length == (unique|length)) and
+      all($users[];
+        (.id|type == "string" and test("^[A-Za-z0-9_-]+$") and . != "default") and
+        (.name|type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]")|not)) and
+        (if $n.type == "vless-reality" or $n.type == "vmess-ws" then (.uuid|uuid)
+         else (.password|type == "string" and length > 0) end)) and
+      (if $n.type == "vless-reality" or $n.type == "vmess-ws" then
+        ([ $n.uuid, $users[].uuid ] | map(ascii_downcase) | length == (unique|length))
+       else ([ $n.password, $users[].password ] | length == (unique|length)) end))
+  ' "$source" >/dev/null 2>&1 || return 1
+  local outbounds
+  outbounds=$(jq -c '.nodes[] | (select(has("outbound")) | .outbound),
+    (select(has("default_outbound")) | .default_outbound),
+    ((.users // [])[] | select(has("outbound")) | .outbound)' "$source") || return 1
+  while IFS= read -r outbound; do
+    [[ -n "$outbound" ]] || continue
+    printf '%s\n' "$outbound" | validate_outbound || return 1
+    sing_outbound_supported "$outbound" || return 1
+  done <<<"$outbounds"
+}
+
+# Reject link features that have no equivalent in the pinned core.
+sing_outbound_supported() {
+  jq -e 'if .mode == "direct" then true
+    elif .protocol == "socks" or .protocol == "shadowsocks" then true
+    elif .protocol == "vmess" or .protocol == "vless" then
+      (.params.type == "tcp" or .params.type == "ws") and
+      ((.params.spx // "/") == "/") and
+      ((.params.mode // "gun") == "gun")
+    else false end' <<<"$1" >/dev/null 2>&1
+}
+
+sing_proxy_outbound() {
+  local tag="$1" value="$2"
+  jq -c --arg tag "$tag" '
+    . as $v |
+    {tag:$tag,type:$v.protocol,server:$v.server,server_port:$v.port} +
+    if $v.protocol == "socks" then
+      {version:"5"} + (if $v|has("username") then {username:$v.username,password:$v.password} else {} end)
+    elif $v.protocol == "shadowsocks" then {method:$v.method,password:$v.password}
+    elif $v.protocol == "vmess" or $v.protocol == "vless" then
+      $v.params as $p |
+      (if $v.protocol == "vmess" then {uuid:$v.uuid,security:$v.method,alter_id:0}
+       else {uuid:$v.uuid} + (if ($p.flow // "") != "" then {flow:$p.flow} else {} end) end) +
+      {tls:({enabled:true} +
+        (if $p|has("sni") then {server_name:$p.sni} else {} end) +
+        (if $p|has("alpn") then {alpn:($p.alpn|split(","))} else {} end) +
+        (if $p|has("fp") then {utls:{enabled:true,fingerprint:$p.fp}} else {} end) +
+        (if $p.security == "reality" then
+          {reality:{enabled:true,public_key:$p.pbk,short_id:$p.sid}} else {} end))} +
+      (if $p.type == "ws" then
+        {transport:({type:"ws",path:($p.path // "/")} +
+          (if $p|has("host") then {headers:{Host:$p.host}} else {} end))}
+       else {} end)
+    else error("unsupported sing-box outbound") end' <<<"$value"
+}
+
+sing_routes() {
+  local source="$1" node user value tag auth outbound inherited
+  local proxies='[]' rules='[]'
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    while IFS= read -r user; do
+      [[ -n "$user" ]] || continue
+      inherited=$(jq -c '.outbound // empty' <<<"$node") || return 1
+      value=$(jq -c '.outbound // empty' <<<"$user") || return 1
+      if [[ -z "$value" && $(jq -r '.id' <<<"$user") == default ]]; then
+        value=$(jq -c '.default_outbound // empty' <<<"$node") || return 1
+      fi
+      [[ -n "$value" ]] || value=$inherited
+      [[ -n "$value" ]] || continue
+      tag=$(jq -r '.tag' <<<"$node")-$(jq -r '.id' <<<"$user")
+      auth=$(jq -r '.id' <<<"$user")
+      outbound=direct
+      if [[ $(jq -r '.mode' <<<"$value") == proxy ]]; then
+        outbound="out-$tag"
+        local proxy
+        proxy=$(sing_proxy_outbound "$outbound" "$value") || return 1
+        proxies=$(printf '%s\n%s\n' "$proxies" "$proxy" | jq -sc '.[0] + [.[1]]') || return 1
+      fi
+      rules=$(jq -c --arg inbound "$(jq -r '.tag' <<<"$node")" --arg auth "$auth" --arg outbound "$outbound" \
+        '. + [{inbound:[$inbound],auth_user:[$auth],action:"route",outbound:$outbound}]' <<<"$rules") || return 1
+    done < <(jq -c '[{id:"default"}] + (.users // []) | .[]' <<<"$node")
+  done < <(jq -c '.nodes[] | select(.enabled)' "$source")
+  jq -nc --argjson outbounds "$proxies" --argjson rules "$rules" '{outbounds:$outbounds,rules:$rules}'
+}
+
 sing_render() {
   local source="$1" output="$2"
+  local routes
   jq -e '(.nodes | type == "array") and
     ([.nodes[].id] | length == (unique | length)) and
     ([.nodes[] | select(.type == "vless-reality")] | length <= 1) and
@@ -53,36 +148,42 @@ sing_render() {
         (.caddy_file|type == "string" and startswith("/"))
       else false end))' \
     "$source" >/dev/null || return 1
-  jq '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local"}]},
+  sing_validate_users "$source" || return 1
+  routes=$(sing_routes "$source") || return 1
+  jq --slurpfile extra <(printf '%s\n' "$routes") '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local"}]},
     inbounds:[.nodes[] | select(.enabled) | if .type == "vless-reality" then
       {type:"vless",tag:.tag,listen:"0.0.0.0",listen_port:.port,
-        users:[{name:"default",uuid:.uuid,flow:"xtls-rprx-vision"}],
+        users:([{name:"default",uuid:.uuid,flow:"xtls-rprx-vision"}] +
+          [(.users // [])[] | {name:.id,uuid:.uuid,flow:"xtls-rprx-vision"}]),
         tls:{enabled:true,server_name:.reality_sni,
           reality:{enabled:true,handshake:{server:.reality_target,server_port:.reality_target_port},
             private_key:.reality_private_key,short_id:[.reality_short_id]}}}
       elif .type == "hysteria2" then
         {type:"hysteria2",tag:.tag,listen:"0.0.0.0",listen_port:.port,
-          users:[{name:"default",password:.password}],
+          users:([{name:"default",password:.password}] +
+            [(.users // [])[] | {name:.id,password:.password}]),
           tls:{enabled:true,server_name:.domain,alpn:["h3"],
             certificate_path:.tls_cert,key_path:.tls_key}}
       elif .type == "trojan-ws" then
         {type:"trojan",tag:.tag,listen:"127.0.0.1",listen_port:.port,
-          users:[{name:"default",password:.password}],
+          users:([{name:"default",password:.password}] +
+            [(.users // [])[] | {name:.id,password:.password}]),
           transport:{type:"ws",path:.ws_path}}
       else
         {type:"vmess",tag:.tag,listen:"127.0.0.1",listen_port:.port,
-          users:[{name:"default",uuid:.uuid,alterId:0}],
+          users:([{name:"default",uuid:.uuid,alterId:0}] +
+            [(.users // [])[] | {name:.id,uuid:.uuid,alterId:0}]),
           transport:{type:"ws",path:.ws_path}}
       end],
-    outbounds:[{type:"direct",tag:"direct"}],
-    route:{rules:[
+    outbounds:([{type:"direct",tag:"direct"}] + $extra[0].outbounds),
+    route:{rules:([
       {action:"resolve",server:"local"},
       {ip_cidr:["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8",
         "169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.0.2.0/24",
         "192.168.0.0/16","198.18.0.0/15","198.51.100.0/24","203.0.113.0/24",
         "::1/128","fc00::/7","fe80::/10"],action:"reject"},
       {action:"sniff"},{protocol:"bittorrent",action:"reject"}
-    ],final:"direct"}}' "$source" > "$output"
+    ] + $extra[0].rules),final:"direct"}}' "$source" > "$output"
 }
 
 sing_check() { "$SING_BIN" check -c "$1" >"$2" 2>&1; }
@@ -491,6 +592,156 @@ sing_change_node() (
   fi
 )
 
+# Reuse the sing-box candidate transaction without changing the Xray transaction.
+sing_change_user_or_outbound() (
+  local prepare="$1" id="$2" action="$3" work active=false touched=false committed=false preserve=false
+  shift 3
+  sing_require || return 1
+  [[ -f "$SING_NODES" && -f "$SING_CONF" ]] || return 1
+  work=$(mktemp -d "$SING_DIR/.candidate.XXXXXXXX") || return 1
+  sing_user_cleanup() {
+    local status=$? failed=false
+    trap - EXIT INT TERM HUP
+    if $touched && ! $committed; then
+      cp -p "$work/old-nodes.json" "$SING_NODES" &&
+        cp -p "$work/old-config.json" "$SING_CONF" || failed=true
+      if $active; then
+        systemctl restart sing-box && systemctl is-active --quiet sing-box || failed=true
+      else systemctl stop sing-box || failed=true; fi
+      if $failed; then preserve=true; err "ROLLBACK FAILED; backup retained at $work"
+      else err 'Change failed; old sing-box configuration restored'; fi
+      status=1
+    fi
+    if ! $preserve; then rm -rf "$work"; fi
+    exit "$status"
+  }
+  trap sing_user_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  "$prepare" "$SING_NODES" "$work/nodes.json" "$id" "$action" "$@" || return 1
+  sing_render "$work/nodes.json" "$work/config.json" && sing_check "$work/config.json" "$work/check.log" || {
+    err 'Candidate sing-box configuration rejected'; return 1;
+  }
+  cp -p "$SING_NODES" "$work/old-nodes.json" && cp -p "$SING_CONF" "$work/old-config.json" || return 1
+  if systemctl is-active --quiet sing-box; then active=true; fi
+  touched=true
+  install -m 640 "$work/nodes.json" "$SING_NODES" && install -m 640 "$work/config.json" "$SING_CONF" &&
+    sing_secure && systemctl restart sing-box && systemctl is-active --quiet sing-box || return 1
+  committed=true
+)
+
+sing_prepare_user() {
+  local source="$1" output="$2" id="$3" action="$4" uid="${5:-}" payload
+  [[ "$action" == add || "$action" == delete ]] || return 1
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id)' "$source" >/dev/null || return 1
+  if [[ "$action" == add ]]; then
+    payload=$(jq -cse 'select(length == 1) | .[0]') || return 1
+    jq --slurpfile source "$source" --arg id "$id" \
+      '. as $user | $source[0] | (.nodes[] | select(.id == $id)).users += [$user]' \
+      <<<"$payload" > "$output" || return 1
+  else
+    [[ "$uid" != default ]] || return 1
+    jq -e --arg id "$id" --arg uid "$uid" 'any(.nodes[] | select(.id == $id) | (.users // [])[]; .id == $uid)' \
+      "$source" >/dev/null || return 1
+    jq --arg id "$id" --arg uid "$uid" '(.nodes[] | select(.id == $id)).users |= map(select(.id != $uid))' \
+      "$source" > "$output" || return 1
+  fi
+}
+
+sing_prepare_outbound() {
+  local source="$1" output="$2" id="$3" scope="$4" selected="${5:-[]}" value
+  [[ "$scope" == all || "$scope" == selected ]] || return 1
+  value=$(jq -cse 'select(length == 1) | .[0]') || return 1
+  [[ "$value" == '"inherit"' ]] || {
+    printf '%s\n' "$value" | validate_outbound && sing_outbound_supported "$value" || return 1
+  }
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id)' "$source" >/dev/null || return 1
+  if [[ "$scope" == selected ]]; then validate_node_selection "$source" "$id" "$selected" || return 1; fi
+  jq --slurpfile source "$source" --arg id "$id" --arg scope "$scope" --argjson selected "$selected" '
+    . as $value | $source[0] | (.nodes[] | select(.id == $id)) |=
+      if $scope == "all" then
+        (del(.default_outbound) | if has("users") then .users |= map(del(.outbound)) else . end |
+          if $value == "inherit" then del(.outbound) else .outbound=$value end)
+      else
+        (if $selected | index("default") then
+          if $value == "inherit" then del(.default_outbound) else .default_outbound=$value end
+        else . end |
+        if has("users") then .users |= map(.id as $uid | if $selected | index($uid) then
+          if $value == "inherit" then del(.outbound) else .outbound=$value end
+        else . end) else . end)
+      end' <<<"$value" > "$output"
+}
+
+sing_manage_users() {
+  local id="$1" node choice name uid credential payload selected
+  while :; do
+    node=$(jq -ce --arg id "$id" '.nodes[] | select(.id == $id)' "$SING_NODES") || return 1
+    [[ -n "$node" ]] || return
+    printf '\nUsers:\n'
+    list_node_users "$node"
+    printf '1) Add user\n2) Delete user\n3) Show user share link\n0) Back\n'
+    choice=$(ask 'Select')
+    case "$choice" in
+      1)
+        name=$(ask 'User name (Enter to cancel)')
+        [[ -n "$name" ]] || continue
+        uid=$(openssl rand -hex 8) || return 1
+        if jq -e '.type == "vless-reality" or .type == "vmess-ws"' <<<"$node" >/dev/null; then
+          credential=$(rand_uuid) || return 1
+          payload=$(jq -nc --arg id "$uid" --arg name "$name" --arg uuid "$credential" '{id:$id,name:$name,uuid:$uuid}') || return 1
+        else
+          credential=$(rand_password) || return 1
+          payload=$(jq -nc --arg id "$uid" --arg name "$name" --arg password "$credential" '{id:$id,name:$name,password:$password}') || return 1
+        fi
+        printf '%s\n' "$payload" | sing_change_user_or_outbound sing_prepare_user "$id" add || {
+          err 'User not added'; continue;
+        }
+        ok 'User added'; node_user_link "$(jq -c --arg id "$id" '.nodes[] | select(.id == $id)' "$SING_NODES")" "$uid" ;;
+      2|3)
+        selected=$(pick_node_users "$node") || continue
+        [[ $(jq length <<<"$selected") == 1 ]] || { warn 'Select exactly one user'; continue; }
+        uid=$(jq -r '.[0]' <<<"$selected")
+        if [[ "$choice" == 3 ]]; then node_user_link "$node" "$uid"; pause; continue; fi
+        [[ "$uid" != default ]] || { warn 'Default user cannot be deleted'; continue; }
+        confirm "Delete user $uid?" n || continue
+        sing_change_user_or_outbound sing_prepare_user "$id" delete "$uid" || err 'User not deleted' ;;
+      0|'') return ;;
+      *) warn 'Invalid selection' ;;
+    esac
+  done
+}
+
+sing_manage_outbound() {
+  local id="$1" node scope selected='[]' choice value link=''
+  node=$(jq -ce --arg id "$id" '.nodes[] | select(.id == $id)' "$SING_NODES") || return 1
+  printf '1) All users\n2) Selected users\n0) Cancel\n'
+  case "$(ask 'Scope')" in
+    1) scope=all ;;
+    2) scope=selected; selected=$(pick_node_users "$node") || return 0 ;;
+    *) return 0 ;;
+  esac
+  info 'Selected users inherit the node route when reset; all users reset to direct.'
+  printf '1) Restore default\n2) Explicit direct\n3) Proxy link\n0) Cancel\n'
+  choice=$(ask 'Select')
+  case "$choice" in
+    1) value='"inherit"' ;;
+    2) value='{"mode":"direct"}' ;;
+    3)
+      printf 'Proxy link (Enter to cancel): ' >&2
+      IFS= read -r link || return 1
+      [[ -n "$link" ]] || return 0
+      value=$(printf '%s\n' "$link" | parse_outbound_link) || { err 'Invalid proxy link'; return 1; }
+      sing_outbound_supported "$value" || { err 'Unsupported sing-box outbound'; return 1; } ;;
+    *) return 0 ;;
+  esac
+  confirm 'Apply outbound setting?' n || return 0
+  printf '%s\n' "$value" | sing_change_user_or_outbound sing_prepare_outbound "$id" "$scope" "$selected" || {
+    err 'Outbound unchanged'; return 1;
+  }
+  ok 'Outbound updated'
+}
+
 sing_manage_nodes() {
   sing_require || return 1
   local index id node type action value
@@ -504,7 +755,7 @@ sing_manage_nodes() {
     [[ -n "$node" ]] || { warn 'Invalid node number'; continue; }
     id=$(jq -r .id <<<"$node")
     type=$(jq -r .type <<<"$node")
-    printf '1) Change port\n2) Reset default credential\n3) Enable/disable\n4) Show share link\n5) Delete node\n0) Back\n'
+    printf '1) Change port\n2) Reset default credential\n3) Enable/disable\n4) Show share link\n5) Delete node\n6) Manage users\n7) Set outbound\n0) Back\n'
     action=$(ask 'Select')
     case "$action" in
       1)
@@ -520,6 +771,8 @@ sing_manage_nodes() {
       5) if confirm "Delete node $(jq -r .name <<<"$node")?" n; then
            sing_change_node "$id" delete || warn 'Node not deleted'
          fi ;;
+      6) sing_manage_users "$id" ;;
+      7) sing_manage_outbound "$id" ;;
       0|'') return ;;
       *) warn 'Invalid selection' ;;
     esac

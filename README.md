@@ -34,7 +34,10 @@ The release archive is verified with its
 SHA-256 digest before installation. Existing Xray installations or node data prevent switching;
 back up and migrate manually on a separate host rather than deleting data to bypass this check.
 Sing-box menu **10** manages nodes: change the listen port or default credential, enable/disable,
-show the share link, or delete a node. User accounts and user-specific outbounds are not supported yet.
+show the share link, delete a node, add/delete individual users, or set per-user outbounds.
+Each user has an independent credential and share link. Supported upstream links are the existing strict
+SOCKS5, Shadowsocks, VLESS TCP/WS and VMess AEAD TCP/WS subset; unsupported options are rejected.
+The sing-box renderer keeps private-address blocking ahead of user routing and validates changes before restart.
 WS nodes remove only their own Caddy routes when disabled or deleted; Caddy domain sites and certificates remain.
 The menu can also display all links, restart the service, update the script, and uninstall its own files.
 For Trojan or VMess over WS, Caddy owns public TLS and proxies the generated path to a loopback-only sing-box
