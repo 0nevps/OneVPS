@@ -66,6 +66,49 @@ validate_xray_config() { return 0; }
 check 'renewal deploys new pair' acme_deploy example.com
 reject 'new certificate becomes current' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
 
+# The same Caddy-owned certificate transaction must target only the selected core.
+SING_DIR="$TMP/sing"
+SING_BIN="$TMP/sing-box"
+SING_NODES="$SING_DIR/onevps-nodes.json"
+SING_CONF="$SING_DIR/config.json"
+mkdir -p "$SING_DIR"
+printf '#!/usr/bin/env bash\n' > "$SING_BIN"
+chmod 755 "$SING_BIN"
+touch "$SING_DIR/.onevps-managed"
+jq -n --arg cert "$ACME_CERT_DIR/example.com/current/fullchain.pem" \
+  '{nodes:[{type:"hysteria2",enabled:true,tls_cert:$cert}]}' > "$SING_NODES"
+printf '{}\n' > "$SING_CONF"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
+  -days 4 -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
+cp "$TMP/cert.pem" "$CADDY_STATE/staging/example.com/fullchain.pem"
+cp "$TMP/key.pem" "$CADDY_STATE/staging/example.com/key.pem"
+sing_check() { return 0; }
+validate_xray_config() { return 1; }
+systemctl() { printf '%s\n' "$*" >> "$TMP/sing-services"; return 0; }
+check 'renewal validates sing-box instead of Xray' acme_deploy example.com
+check 'renewal restarts only sing-box' grep -qx 'restart sing-box' "$TMP/sing-services"
+reject 'renewal does not restart Xray' grep -qx 'restart xray' "$TMP/sing-services"
+previous=$(readlink "$ACME_CERT_DIR/example.com/current")
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
+  -days 5 -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
+cp "$TMP/cert.pem" "$CADDY_STATE/staging/example.com/fullchain.pem"
+cp "$TMP/key.pem" "$CADDY_STATE/staging/example.com/key.pem"
+restarts=0
+systemctl() {
+  if [[ "$1" == restart ]]; then restarts=$((restarts+1)); (( restarts > 1 )) && return 0; return 1; fi
+  return 0
+}
+reject 'sing-box restart failure rolls certificate back' acme_deploy example.com
+check 'sing-box rollback retains previous certificate' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
+systemctl() { return 0; }
+sing_check() { return 1; }
+reject 'sing-box check failure rolls certificate back' acme_deploy example.com
+check 'sing-box check failure retains previous certificate' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
+sing_check() { return 0; }
+check 'sing-box renewal commits valid certificate' acme_deploy example.com
+reject 'sing-box renewal changes current certificate' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
+SING_DIR="$TMP/no-sing"
+
 # Domain ownership is independent of node order; all services are mocked.
 CADDY_STATE="$TMP/caddy-state"
 CADDY_SYNC_RUNNER="$TMP/caddy-sync.sh"

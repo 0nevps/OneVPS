@@ -52,8 +52,29 @@ jq -e '.inbounds[0] | .type == "vless" and .tls.reality.enabled and .users[0].fl
 jq -e '.route.rules[0].action == "resolve" and .route.rules[1].action == "reject" and
   .route.rules[2].action == "sniff" and .route.final == "direct"' "$SING_CONF" >/dev/null || fail 'route safety'
 if [[ -n "${SING_TEST_BIN:-}" ]]; then "$SING_TEST_BIN" check -c "$SING_CONF" || fail 'real core check'; fi
+
+# Hysteria2 uses the Caddy-deployed PEM pair, not a second ACME provider.
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/hy2-key.pem" -out "$work/hy2-cert.pem" \
+  -days 2 -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
+jq -n --arg cert "$work/hy2-cert.pem" --arg key "$work/hy2-key.pem" \
+  '{nodes:[{id:"abc12345",name:"HY2",tag:"hy2-abc12345",type:"hysteria2",domain:"example.com",
+    password:"strong-password",port:24321,tls_cert:$cert,tls_key:$key,enabled:true}]}' > "$work/hy2-nodes.json"
+sing_render "$work/hy2-nodes.json" "$work/hy2-config.json" || fail 'HY2 render'
+jq -e '.certificate_providers == null and (.inbounds[0] | .type == "hysteria2" and
+  .tls.certificate_path != null and .tls.key_path != null and .tls.alpn == ["h3"])' \
+  "$work/hy2-config.json" >/dev/null || fail 'Caddy-owned HY2 TLS config'
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  "$SING_TEST_BIN" check -c "$work/hy2-config.json" || fail 'HY2 real core check'
+fi
+jq -s '{nodes: (.[0].nodes + .[1].nodes)}' "$SING_NODES" "$work/hy2-nodes.json" > "$work/both-nodes.json"
+sing_render "$work/both-nodes.json" "$work/both-config.json" || fail 'Reality and HY2 render'
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  "$SING_TEST_BIN" check -c "$work/both-config.json" || fail 'multi-inbound real core check'
+fi
 jq '.nodes += .nodes' "$SING_NODES" > "$work/two.json"
 reject sing_render "$work/two.json" "$work/reject.json"
+jq '.nodes += .nodes' "$work/hy2-nodes.json" > "$work/two-hy2.json"
+reject sing_render "$work/two-hy2.json" "$work/reject.json"
 jq '.nodes[0].type = "trojan-ws"' "$SING_NODES" > "$work/wrong.json"
 reject sing_render "$work/wrong.json" "$work/reject.json"
 [[ $(sing_asset) == 'linux-amd64 699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' ]] || fail 'release digest'
@@ -72,6 +93,58 @@ printf '{}\n' > "$SING_CONF"
 sing_add_reality > "$work/link" || fail 'node transaction'
 jq -e '.nodes|length == 1' "$SING_NODES" >/dev/null || fail 'node persisted'
 grep -q '^vless://' "$work/link" || fail 'share link'
+
+# Exercise HY2 node creation with a test-owned certificate and mocked host operations.
+(
+  cp "$work/hy2-cert.pem" "$work/caddy-cert.pem"
+  cp "$work/hy2-key.pem" "$work/caddy-key.pem"
+  ACME_CERT_DIR="$work/certs"
+  mkdir -p "$ACME_CERT_DIR/example.com/current"
+  cp "$work/caddy-cert.pem" "$ACME_CERT_DIR/example.com/current/fullchain.pem"
+  cp "$work/caddy-key.pem" "$ACME_CERT_DIR/example.com/current/key.pem"
+  caddy_certificate_issue() { [[ "$1" == example.com ]]; }
+  validate_hy2_certificate() { validate_hy2_pem "$@"; }
+  command() { if [[ "$1" == -v && ( "$2" == ss || "$2" == runuser ) ]]; then return 0; fi; builtin command "$@"; }
+  ask() {
+    case "$1" in
+      'TLS domain') echo example.com ;;
+      'UDP listen port') echo 24321 ;;
+      'Node name') echo 'HY2 test' ;;
+      'Password (Enter for random)') echo strong-password ;;
+      *) return 1 ;;
+    esac
+  }
+  sing_add_hysteria > "$work/hy2-link" || fail 'HY2 node transaction'
+  jq -e '(.nodes|length == 2) and .nodes[1].type == "hysteria2"' "$SING_NODES" >/dev/null || fail 'HY2 stored with REALITY'
+  grep -q '^hysteria2://' "$work/hy2-link" || fail 'HY2 link'
+)
+(
+  ACME_CERT_DIR="$work/certs"
+  caddy_certificate_issue() { [[ "$1" == example.com ]]; }
+  validate_hy2_certificate() { validate_hy2_pem "$@"; }
+  command() { if [[ "$1" == -v && ( "$2" == ss || "$2" == runuser ) ]]; then return 0; fi; builtin command "$@"; }
+  ask() {
+    case "$1" in
+      'TLS domain') echo example.com ;;
+      'UDP listen port') echo 24321 ;;
+      'Node name') echo 'HY2 test' ;;
+      'Password (Enter for random)') echo strong-password ;;
+      *) return 1 ;;
+    esac
+  }
+  cp "$SING_NODES" "$work/hy2-before-nodes.json"
+  cp "$SING_CONF" "$work/hy2-before-config.json"
+  restart_count=0
+  systemctl() {
+    if [[ "$1" == restart ]]; then
+      restart_count=$((restart_count+1))
+      (( restart_count > 1 ))
+    else return 0; fi
+  }
+  reject sing_add_hysteria
+  cmp "$SING_NODES" "$work/hy2-before-nodes.json" || fail 'HY2 metadata rollback'
+  cmp "$SING_CONF" "$work/hy2-before-config.json" || fail 'HY2 config rollback'
+)
 
 # A failed service restart must restore both metadata and the generated config.
 printf '{"nodes":[]}\n' > "$SING_NODES"

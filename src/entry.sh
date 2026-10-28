@@ -1080,7 +1080,7 @@ manage_outbound() {
 }
 
 # ----------------------------------------------------------------------------
-# Caddy certificate ownership and private Xray deployment.
+# Caddy certificate ownership and private core deployment.
 # ----------------------------------------------------------------------------
 
 acme_domain_valid() {
@@ -1094,7 +1094,7 @@ acme_domain_valid() {
   done
 }
 
-# Caddy owns issuance/renewal; OneVPS only deploys validated pairs to Xray.
+# Caddy owns issuance/renewal; OneVPS deploys validated pairs to the active core.
 CADDY_STATE=/etc/onevps-caddy
 CADDY_SYNC_RUNNER=/usr/local/lib/onevps/caddy-sync.sh
 
@@ -1228,13 +1228,14 @@ caddy_sync_all() (
 )
 
 caddy_sync_install() {
-  local tmp
+  local tmp core=Xray
+  if sing_owned; then core=sing-box; fi
   mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
   tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
   cat "$ONEVPS_SCRIPT_PATH" > "$tmp" && bash -n "$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || return 1
   cat > "$ACME_UNIT_DIR/onevps-caddy-sync.service" <<EOF_SERVICE
 [Unit]
-Description=Deploy Caddy certificates to OneVPS Xray
+Description=Deploy Caddy certificates to OneVPS $core
 After=caddy.service
 [Service]
 Type=oneshot
@@ -1315,6 +1316,8 @@ prepare_caddy_for_trojan() (
 acme_deploy() (
   local domain="$1" stage="$CADDY_STATE/staging/$1" dir="$ACME_CERT_DIR/$1"
   local version previous='' active=false switched=false committed=false used=false check_log ng
+  local service=xray nodes="$XRAY_NODES" conf="$XRAY_CONF"
+  if sing_owned; then service=sing-box; nodes="$SING_NODES"; conf="$SING_CONF"; fi
   acme_domain_valid "$domain" || return 1
   validate_hy2_pem "$domain" "$stage/fullchain.pem" "$stage/key.pem" || return 1
   ng=$(id -gn nobody) || return 1
@@ -1331,7 +1334,7 @@ acme_deploy() (
       if [[ -n "$previous" ]]; then
         ln -s "$previous" "$version/rollback" && mv -Tf "$version/rollback" "$dir/current" || failed=true
       else rm -f "$dir/current" || failed=true; fi
-      if $active; then systemctl restart xray && systemctl is-active --quiet xray || failed=true; fi
+      if $active; then systemctl restart "$service" && systemctl is-active --quiet "$service" || failed=true; fi
       if $failed; then err "certificate rollback failed; retained $version"; exit 1; fi
     fi
     if ! $committed; then rm -rf "$version"; fi
@@ -1346,15 +1349,18 @@ acme_deploy() (
   chown -R root:"$ng" "$version" && chmod 750 "$version" || return 1
   if [[ -n "$previous" ]] && cmp -s "$version/fullchain.pem" "$dir/current/fullchain.pem" &&
     cmp -s "$version/key.pem" "$dir/current/key.pem"; then return 0; fi
-  if [[ -f "$XRAY_NODES" ]] && jq -e --arg path "$dir/current/fullchain.pem" \
-    'any(.nodes[]; .enabled == true and .tls_cert == $path)' "$XRAY_NODES" >/dev/null; then used=true; fi
-  if $used && systemctl is-active --quiet xray; then active=true; fi
+  if [[ -f "$nodes" ]] && jq -e --arg path "$dir/current/fullchain.pem" \
+    'any(.nodes[]; .enabled == true and .tls_cert == $path)' "$nodes" >/dev/null; then used=true; fi
+  if $used && systemctl is-active --quiet "$service"; then active=true; fi
   ln -s "$(basename "$version")" "$version/next" || return 1
   switched=true
   # GNU mv -T replaces the symlink itself, never follows it as a directory.
   mv -Tf "$version/next" "$dir/current" || return 1
-  if $used; then validate_xray_config "$XRAY_CONF" "$check_log" || return 1; fi
-  if $active; then systemctl restart xray && systemctl is-active --quiet xray || return 1; fi
+  if $used; then
+    if [[ "$service" == xray ]]; then validate_xray_config "$conf" "$check_log" || return 1
+    else sing_check "$conf" "$check_log" || return 1; fi
+  fi
+  if $active; then systemctl restart "$service" && systemctl is-active --quiet "$service" || return 1; fi
   committed=true
   rm -f "$check_log"
   local old

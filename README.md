@@ -19,7 +19,8 @@ Four deployment modes are supported:
 - **Hysteria2 + QUIC + TLS** — a native Xray inbound with Caddy-managed certificates.
 - **VMess AEAD + WebSocket behind Caddy** — UUID authentication with Caddy-managed TLS.
 
-Xray remains the full-featured mode; sing-box is currently limited to one VLESS + REALITY + Vision node.
+Xray remains the full-featured mode; sing-box currently supports one VLESS + REALITY + Vision node
+and one Hysteria2 node.
 Core installations are exclusive: this release does not migrate or run Xray and sing-box together.
 OneVPS is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
@@ -27,17 +28,22 @@ replacement for infrastructure-as-code, firewall management, monitoring, or back
 ## Sing-box preview
 
 On a fresh host, select **7 → 1** to install the pinned sing-box 1.14.4 release, then **2** in the
-sing-box menu to add one VLESS + REALITY + Vision node. The release archive is verified with its
+sing-box menu to add one VLESS + REALITY + Vision node. Select **6** to add one Hysteria2 node.
+The release archive is verified with its
 SHA-256 digest before installation. Existing Xray installations or node data prevent switching;
 back up and migrate manually on a separate host rather than deleting data to bypass this check.
-Sing-box node management, user-specific outbounds, Trojan/VMess/WS and Hysteria2 are not supported yet.
-The sing-box menu can display a link, restart its service, update the script, and uninstall its own files.
+Sing-box node management, user-specific outbounds and Trojan/VMess/WS are not supported yet.
+The sing-box menu can display links, restart its service, update the script, and uninstall its own files.
 
 Sing-box [supports native ACME certificate issuance](https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/)
 through the certificate provider introduced in 1.14.0. The official 1.14.4 build includes `with_acme`,
-but **this preview does not use it**: REALITY needs no certificate. Xray's Caddy-owned TLS/certificate
-flow is unchanged. A later WS or Hysteria2 implementation must choose one certificate owner rather
-than silently letting both Caddy and sing-box issue for the same domain.
+but **this preview does not use it**: REALITY needs no certificate, and Hysteria2 uses the
+existing Caddy-managed certificate deployment. Caddy remains the sole issuer and renewer.
+Sing-box's HY2 inbound reads the deployed PEM paths; certificate updates are validated against
+the active core and rolled back if validation or service restart fails. Caddy must have access to
+public TCP 80/443, and the HY2 UDP port must be permitted by the host and cloud firewalls.
+On shared Caddy `:443` listeners, reserving UDP 443 for HY2 disables Caddy HTTP/3 after confirmation.
+The Xray certificate flow is unchanged.
 
 For source changes, edit `src/entry.sh` or `src/cores/*.sh`, then run
 `bash scripts/build.sh --write` and `bash tests/test_build.sh`. The committed `onevps.sh` remains

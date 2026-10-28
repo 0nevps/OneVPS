@@ -1080,7 +1080,7 @@ manage_outbound() {
 }
 
 # ----------------------------------------------------------------------------
-# Caddy certificate ownership and private Xray deployment.
+# Caddy certificate ownership and private core deployment.
 # ----------------------------------------------------------------------------
 
 acme_domain_valid() {
@@ -1094,7 +1094,7 @@ acme_domain_valid() {
   done
 }
 
-# Caddy owns issuance/renewal; OneVPS only deploys validated pairs to Xray.
+# Caddy owns issuance/renewal; OneVPS deploys validated pairs to the active core.
 CADDY_STATE=/etc/onevps-caddy
 CADDY_SYNC_RUNNER=/usr/local/lib/onevps/caddy-sync.sh
 
@@ -1228,13 +1228,14 @@ caddy_sync_all() (
 )
 
 caddy_sync_install() {
-  local tmp
+  local tmp core=Xray
+  if sing_owned; then core=sing-box; fi
   mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
   tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
   cat "$ONEVPS_SCRIPT_PATH" > "$tmp" && bash -n "$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || return 1
   cat > "$ACME_UNIT_DIR/onevps-caddy-sync.service" <<EOF_SERVICE
 [Unit]
-Description=Deploy Caddy certificates to OneVPS Xray
+Description=Deploy Caddy certificates to OneVPS $core
 After=caddy.service
 [Service]
 Type=oneshot
@@ -1315,6 +1316,8 @@ prepare_caddy_for_trojan() (
 acme_deploy() (
   local domain="$1" stage="$CADDY_STATE/staging/$1" dir="$ACME_CERT_DIR/$1"
   local version previous='' active=false switched=false committed=false used=false check_log ng
+  local service=xray nodes="$XRAY_NODES" conf="$XRAY_CONF"
+  if sing_owned; then service=sing-box; nodes="$SING_NODES"; conf="$SING_CONF"; fi
   acme_domain_valid "$domain" || return 1
   validate_hy2_pem "$domain" "$stage/fullchain.pem" "$stage/key.pem" || return 1
   ng=$(id -gn nobody) || return 1
@@ -1331,7 +1334,7 @@ acme_deploy() (
       if [[ -n "$previous" ]]; then
         ln -s "$previous" "$version/rollback" && mv -Tf "$version/rollback" "$dir/current" || failed=true
       else rm -f "$dir/current" || failed=true; fi
-      if $active; then systemctl restart xray && systemctl is-active --quiet xray || failed=true; fi
+      if $active; then systemctl restart "$service" && systemctl is-active --quiet "$service" || failed=true; fi
       if $failed; then err "certificate rollback failed; retained $version"; exit 1; fi
     fi
     if ! $committed; then rm -rf "$version"; fi
@@ -1346,15 +1349,18 @@ acme_deploy() (
   chown -R root:"$ng" "$version" && chmod 750 "$version" || return 1
   if [[ -n "$previous" ]] && cmp -s "$version/fullchain.pem" "$dir/current/fullchain.pem" &&
     cmp -s "$version/key.pem" "$dir/current/key.pem"; then return 0; fi
-  if [[ -f "$XRAY_NODES" ]] && jq -e --arg path "$dir/current/fullchain.pem" \
-    'any(.nodes[]; .enabled == true and .tls_cert == $path)' "$XRAY_NODES" >/dev/null; then used=true; fi
-  if $used && systemctl is-active --quiet xray; then active=true; fi
+  if [[ -f "$nodes" ]] && jq -e --arg path "$dir/current/fullchain.pem" \
+    'any(.nodes[]; .enabled == true and .tls_cert == $path)' "$nodes" >/dev/null; then used=true; fi
+  if $used && systemctl is-active --quiet "$service"; then active=true; fi
   ln -s "$(basename "$version")" "$version/next" || return 1
   switched=true
   # GNU mv -T replaces the symlink itself, never follows it as a directory.
   mv -Tf "$version/next" "$dir/current" || return 1
-  if $used; then validate_xray_config "$XRAY_CONF" "$check_log" || return 1; fi
-  if $active; then systemctl restart xray && systemctl is-active --quiet xray || return 1; fi
+  if $used; then
+    if [[ "$service" == xray ]]; then validate_xray_config "$conf" "$check_log" || return 1
+    else sing_check "$conf" "$check_log" || return 1; fi
+  fi
+  if $active; then systemctl restart "$service" && systemctl is-active --quiet "$service" || return 1; fi
   committed=true
   rm -f "$check_log"
   local old
@@ -3206,28 +3212,43 @@ sing_asset() {
 
 sing_render() {
   local source="$1" output="$2"
-  jq -e '(.nodes | (type == "array" and length <= 1)) and
-    all(.nodes[]; .type == "vless-reality" and .enabled == true and
+  jq -e '(.nodes | type == "array") and
+    ([.nodes[].id] | length == (unique | length)) and
+    ([.nodes[] | select(.type == "vless-reality")] | length <= 1) and
+    ([.nodes[] | select(.type == "hysteria2")] | length <= 1) and
+    all(.nodes[]; .enabled == true and
       (.id|type == "string" and test("^[0-9a-f]{8}$")) and
-      (.tag == ("reality-" + .id)) and
       (.name|type == "string" and length > 0) and
-      (.uuid|type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
       (.port|type == "number" and floor == . and . >= 1 and . <= 65535) and
-      (.reality_target|type == "string" and length > 0) and
-      (.reality_target_port == 443) and
-      (.reality_sni == .reality_target) and
-      (.reality_public_key|type == "string" and length > 0) and
-      (.reality_private_key|type == "string" and length > 0) and
-      (.reality_short_id|type == "string" and test("^[0-9a-fA-F]{16}$")))' \
+      (if .type == "vless-reality" then
+        (.tag == ("reality-" + .id)) and
+        (.uuid|type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
+        (.reality_target|type == "string" and length > 0) and
+        (.reality_target_port == 443) and (.reality_sni == .reality_target) and
+        (.reality_public_key|type == "string" and length > 0) and
+        (.reality_private_key|type == "string" and length > 0) and
+        (.reality_short_id|type == "string" and test("^[0-9a-fA-F]{16}$"))
+      elif .type == "hysteria2" then
+        (.tag == ("hy2-" + .id)) and
+        (.domain|type == "string" and test("^[a-z0-9.-]+$")) and
+        (.password|type == "string" and length > 0) and
+        (.tls_cert|type == "string" and startswith("/")) and
+        (.tls_key|type == "string" and startswith("/"))
+      else false end))' \
     "$source" >/dev/null || return 1
   jq '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local"}]},
-    inbounds:[.nodes[] | {
-      type:"vless",tag:.tag,listen:"0.0.0.0",listen_port:.port,
-      users:[{name:"default",uuid:.uuid,flow:"xtls-rprx-vision"}],
-      tls:{enabled:true,server_name:.reality_sni,
-        reality:{enabled:true,handshake:{server:.reality_target,server_port:.reality_target_port},
-          private_key:.reality_private_key,short_id:[.reality_short_id]}}
-    }],
+    inbounds:[.nodes[] | if .type == "vless-reality" then
+      {type:"vless",tag:.tag,listen:"0.0.0.0",listen_port:.port,
+        users:[{name:"default",uuid:.uuid,flow:"xtls-rprx-vision"}],
+        tls:{enabled:true,server_name:.reality_sni,
+          reality:{enabled:true,handshake:{server:.reality_target,server_port:.reality_target_port},
+            private_key:.reality_private_key,short_id:[.reality_short_id]}}}
+      else
+        {type:"hysteria2",tag:.tag,listen:"0.0.0.0",listen_port:.port,
+          users:[{name:"default",password:.password}],
+          tls:{enabled:true,server_name:.domain,alpn:["h3"],
+            certificate_path:.tls_cert,key_path:.tls_key}}
+      end],
     outbounds:[{type:"direct",tag:"direct"}],
     route:{rules:[
       {action:"resolve",server:"local"},
@@ -3335,7 +3356,7 @@ sing_install() (
 sing_add_reality() (
   sing_require || return 1
   [[ -f "$SING_NODES" && -f "$SING_CONF" ]] || { err 'Sing-box state is incomplete'; return 1; }
-  jq -e '.nodes|length == 0' "$SING_NODES" >/dev/null || { err 'Only one sing-box node is supported in this phase'; return 1; }
+  jq -e 'all(.nodes[]; .type != "vless-reality")' "$SING_NODES" >/dev/null || { err 'Only one REALITY node is supported'; return 1; }
   local name uuid id port target kp pk pubk sid node work active=false
   name=$(ask 'Node name' "reality-$(openssl rand -hex 2)")
   uuid=$(ask_uuid)
@@ -3380,7 +3401,7 @@ sing_add_reality() (
     exit "$status"
   }
   trap sing_candidate_cleanup EXIT
-  printf '%s\n' "$node" > "$work/nodes.json"
+  jq --argjson added "$node" '.nodes += $added.nodes' "$SING_NODES" > "$work/nodes.json" || return 1
   sing_render "$work/nodes.json" "$work/config.json" && sing_check "$work/config.json" "$work/check.log" || {
     err 'Candidate sing-box configuration rejected'; return 1;
   }
@@ -3392,22 +3413,85 @@ sing_add_reality() (
   committed=true
   open_port "$port" tcp
   ok 'Sing-box VLESS REALITY node added'
-  node_link "$(jq -c '.nodes[0]' "$SING_NODES")"
+  node_link "$(jq -c --arg id "$id" '.nodes[] | select(.id == $id)' "$SING_NODES")"
+)
+
+sing_add_hysteria() (
+  sing_require || return 1
+  [[ -f "$SING_NODES" && -f "$SING_CONF" ]] || { err 'Sing-box state is incomplete'; return 1; }
+  jq -e 'all(.nodes[]; .type != "hysteria2")' "$SING_NODES" >/dev/null || { err 'Only one Hysteria2 node is supported'; return 1; }
+  local name domain port password id cert key node work active=false touched=false committed=false preserve=false
+  domain=$(normalize_domain "$(ask 'TLS domain')")
+  acme_domain_valid "$domain" || { err 'Invalid domain'; return 1; }
+  if ! command -v ss >/dev/null 2>&1 || ! command -v runuser >/dev/null 2>&1; then
+    err 'Hysteria2 requires ss and runuser'; return 1
+  fi
+  port=$(ask 'UDP listen port' 443)
+  realm_valid_port "$port" || { err 'Invalid port'; return 1; }
+  port=$((10#$port))
+  if port_in_use "$port" udp; then err 'UDP port already in use'; return 1; fi
+  name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
+  password=$(ask 'Password (Enter for random)' "$(rand_password)")
+  [[ -n "$password" ]] || { err 'Empty password'; return 1; }
+  id=$(openssl rand -hex 4)
+  cert="$ACME_CERT_DIR/$domain/current/fullchain.pem"
+  key="$ACME_CERT_DIR/$domain/current/key.pem"
+  caddy_certificate_issue "$domain" || { err 'Caddy certificate setup failed'; return 1; }
+  validate_hy2_certificate "$domain" "$cert" "$key" || return 1
+  node=$(jq -nc --arg id "$id" --arg name "$name" --arg domain "$domain" \
+    --arg password "$password" --arg cert "$cert" --arg key "$key" --argjson port "$port" \
+    '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:$password,
+      port:$port,tls_cert:$cert,tls_key:$key,enabled:true}') || return 1
+  work=$(mktemp -d "$SING_DIR/.candidate.XXXXXXXX") || return 1
+  sing_hy2_cleanup() {
+    local status=$? failed=false
+    trap - EXIT INT TERM HUP
+    if $touched && ! $committed; then
+      cp -p "$work/old-nodes.json" "$SING_NODES" && cp -p "$work/old-config.json" "$SING_CONF" || failed=true
+      if $active; then
+        systemctl restart sing-box && systemctl is-active --quiet sing-box || failed=true
+      else systemctl stop sing-box || failed=true; fi
+      if $failed; then preserve=true; err "ROLLBACK FAILED; backup retained at $work"
+      else err 'Candidate failed; old sing-box configuration restored'; fi
+      status=1
+    fi
+    if ! $preserve; then rm -rf "$work"; fi
+    exit "$status"
+  }
+  trap sing_hy2_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  jq --argjson added "$node" '.nodes += [$added]' "$SING_NODES" > "$work/nodes.json" || return 1
+  sing_render "$work/nodes.json" "$work/config.json" && sing_check "$work/config.json" "$work/check.log" || {
+    err 'Candidate sing-box configuration rejected'; return 1;
+  }
+  cp -p "$SING_NODES" "$work/old-nodes.json" && cp -p "$SING_CONF" "$work/old-config.json" || return 1
+  if systemctl is-active --quiet sing-box; then active=true; fi
+  touched=true
+  install -m 640 "$work/nodes.json" "$SING_NODES" && install -m 640 "$work/config.json" "$SING_CONF" &&
+    sing_secure && systemctl restart sing-box && systemctl is-active --quiet sing-box || return 1
+  committed=true
+  open_port "$port" udp
+  ok 'Sing-box Hysteria2 node added'
+  node_link "$node"
 )
 
 sing_menu() {
   while :; do
-    printf '\nSing-box (exclusive mode, VLESS REALITY only)\n1) Install sing-box\n2) Add VLESS REALITY node\n3) Show node link\n4) Restart service\n5) Update script\n9) Uninstall sing-box\n0) Back/exit\n'
+    printf '\nSing-box (exclusive mode)\n1) Install sing-box\n2) Add VLESS REALITY node\n3) Show node links\n4) Restart service\n5) Update script\n6) Add Hysteria2 (Caddy certificate)\n9) Uninstall sing-box\n0) Back/exit\n'
     case "$(ask 'Select')" in
       1) sing_install || warn 'Installation failed'; pause ;;
       2) sing_add_reality || warn 'Node not added'; pause ;;
       3) if sing_require; then
            local n
-           n=$(jq -c '.nodes[0] // empty' "$SING_NODES")
-           if [[ -n "$n" ]]; then node_link "$n"; else warn 'No node installed'; fi
+           if jq -e '.nodes|length > 0' "$SING_NODES" >/dev/null; then
+             while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$SING_NODES")
+           else warn 'No node installed'; fi
          fi; pause ;;
       4) sing_require && sing_check "$SING_CONF" /dev/null && systemctl restart sing-box || warn 'Restart failed'; pause ;;
       5) if update_script; then return 0; else pause; fi ;;
+      6) sing_add_hysteria || warn 'Hysteria2 node not added'; pause ;;
       9) sing_uninstall; pause ;;
       0|'') return ;;
       *) warn 'Invalid selection' ;;
@@ -3419,10 +3503,11 @@ sing_uninstall() {
   sing_require || return 1
   confirm 'Remove OneVPS sing-box binary, service and all its nodes?' n || return 0
   systemctl disable --now sing-box || return 1
+  systemctl disable --now onevps-caddy-sync.timer 2>/dev/null || true
   rm -f "$SING_BIN" "$SING_SERVICE" || return 1
   systemctl daemon-reload || return 1
   rm -rf "$SING_DIR"
-  ok 'Sing-box removed; firewall rules were not changed'
+  ok 'Sing-box removed; Caddy sites and certificates are retained; firewall rules were not changed'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
