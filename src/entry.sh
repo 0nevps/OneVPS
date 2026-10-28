@@ -19,6 +19,12 @@ XRAY_CONF=$XRAY_DIR/config.json
 XRAY_NODES=$XRAY_DIR/onevps-nodes.json
 XRAY_SERVICE=/etc/systemd/system/xray.service
 XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+SING_DIR=/usr/local/etc/sing-box
+SING_BIN=/usr/local/bin/sing-box
+SING_CONF=$SING_DIR/config.json
+SING_NODES=$SING_DIR/onevps-nodes.json
+SING_SERVICE=/etc/systemd/system/sing-box.service
+SING_VERSION=1.14.4
 ONEVPS_UPDATE_URL=https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 ONEVPS_SCRIPT_PATH=${BASH_SOURCE[0]}
 TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
@@ -134,6 +140,7 @@ is_valid_uuid() {
 
 rand_uuid() {
   if [[ -x "$XRAY_BIN" ]]; then "$XRAY_BIN" uuid | tr 'A-Z' 'a-z'; return; fi
+  if [[ -x "$SING_BIN" && -f "$SING_DIR/.onevps-managed" ]]; then "$SING_BIN" generate uuid; return; fi
   if [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid; return; fi
   if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'; return; fi
   python3 -c 'import uuid;print(uuid.uuid4())'
@@ -192,7 +199,7 @@ is_valid_domain() {
 # ----------------------------------------------------------------------------
 check_env() {
   [[ $EUID -eq 0 ]] || die "must run as root (sudo bash $0)"
-  command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script relies on systemd to manage Xray"
+  command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script relies on systemd to manage the core"
   id nobody >/dev/null 2>&1 || die "system user 'nobody' not found"
 
   case "$(uname -m)" in
@@ -2731,6 +2738,13 @@ update_script() (
 )
 
 status_line() {
+  if [[ -x "$SING_BIN" && -f "$SING_DIR/.onevps-managed" ]]; then
+    printf '%sSing-box %s - service:%s - nodes:%s%s\n' "$c_blu" \
+      "$("$SING_BIN" version | awk 'NR==1{print $3}')" \
+      "$(systemctl is-active sing-box 2>/dev/null || echo unknown)" \
+      "$(jq '.nodes|length' "$SING_NODES" 2>/dev/null || echo 0)" "$c_rst"
+    return
+  fi
   if [[ -x "$XRAY_BIN" ]]; then
     local v st bbr_cc
     v=$(installed_version)
@@ -2774,6 +2788,11 @@ network_menu() {
 
 main_menu() {
   while :; do
+    if [[ -e "$SING_BIN" || -L "$SING_BIN" || -e "$SING_DIR" ]] ||
+      systemctl cat sing-box >/dev/null 2>&1; then
+      sing_menu
+      return
+    fi
     clear
     cat <<'EOF'
  ╔════════════════════════════════════════════════╗
@@ -2792,6 +2811,7 @@ EOF
 
   Script:
    6) Update script
+   7) Use sing-box (new installation only)
 
   Danger zone:
    9) Uninstall Xray (keep Realm / Caddy)
@@ -2799,12 +2819,21 @@ EOF
    0) Exit
 EOF
     case "$(ask 'Select')" in
-      1) install_xray; pause ;;
+      1) [[ ! -e "$SING_BIN" && ! -L "$SING_BIN" && ! -e "$SING_DIR" ]] &&
+           ! systemctl cat sing-box >/dev/null 2>&1 || {
+           err 'Existing sing-box installation or data detected; automatic switching is not supported'; continue;
+         }; install_xray; pause ;;
       2) node_menu ;;
       3) certificate_menu ;;
       4) realm_menu ;;
       5) network_menu ;;
       6) if update_script; then return 0; else pause; fi ;;
+      7) if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" || -e "$XRAY_NODES" || -e "$XRAY_CONF" ]] ||
+           systemctl cat xray >/dev/null 2>&1; then
+           warn 'Existing Xray installation or data detected; automatic switching is not supported'; pause
+         else
+           sing_menu
+         fi ;;
       9) uninstall ;;
       0|"") exit 0 ;;
       *) warn 'invalid selection' ;;
@@ -2822,6 +2851,7 @@ main() {
 }
 
 # @include cores/xray.sh
+# @include cores/sing-box.sh
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"

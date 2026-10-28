@@ -9,6 +9,7 @@ mkdir -p "$work/scripts" "$work/src/cores"
 cp "$root/scripts/build.sh" "$work/scripts/build.sh"
 cp "$root/src/entry.sh" "$work/src/entry.sh"
 cp "$root/src/cores/xray.sh" "$work/src/cores/xray.sh"
+cp "$root/src/cores/sing-box.sh" "$work/src/cores/sing-box.sh"
 
 bash "$work/scripts/build.sh" --write
 bash "$work/scripts/build.sh" --check

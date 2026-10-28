@@ -6,7 +6,7 @@
 
 [简体中文](README_CN.md)
 
-OneVPS is an open-source automation tool for deploying and operating Xray nodes on Linux VPS hosts.
+OneVPS is an open-source automation tool for deploying and operating Xray or sing-box nodes on Linux VPS hosts.
 It turns the installation, configuration, service management, and routine maintenance steps into one
 auditable Bash workflow.
 
@@ -19,8 +19,29 @@ Four deployment modes are supported:
 - **Hysteria2 + QUIC + TLS** — a native Xray inbound with Caddy-managed certificates.
 - **VMess AEAD + WebSocket behind Caddy** — UUID authentication with Caddy-managed TLS.
 
-OneVPS deliberately focuses on Xray-based deployments. It is not a general-purpose VPS control panel or a
+Xray remains the full-featured mode; sing-box is currently limited to one VLESS + REALITY + Vision node.
+Core installations are exclusive: this release does not migrate or run Xray and sing-box together.
+OneVPS is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
+
+## Sing-box preview
+
+On a fresh host, select **7 → 1** to install the pinned sing-box 1.14.4 release, then **2** in the
+sing-box menu to add one VLESS + REALITY + Vision node. The release archive is verified with its
+SHA-256 digest before installation. Existing Xray installations or node data prevent switching;
+back up and migrate manually on a separate host rather than deleting data to bypass this check.
+Sing-box node management, user-specific outbounds, Trojan/VMess/WS and Hysteria2 are not supported yet.
+The sing-box menu can display a link, restart its service, update the script, and uninstall its own files.
+
+Sing-box [supports native ACME certificate issuance](https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/)
+through the certificate provider introduced in 1.14.0. The official 1.14.4 build includes `with_acme`,
+but **this preview does not use it**: REALITY needs no certificate. Xray's Caddy-owned TLS/certificate
+flow is unchanged. A later WS or Hysteria2 implementation must choose one certificate owner rather
+than silently letting both Caddy and sing-box issue for the same domain.
+
+For source changes, edit `src/entry.sh` or `src/cores/*.sh`, then run
+`bash scripts/build.sh --write` and `bash tests/test_build.sh`. The committed `onevps.sh` remains
+the standalone download and release asset.
 
 ## VMess (AEAD, WebSocket + TLS)
 
@@ -201,6 +222,7 @@ Setup / management:
 
 Script:
  6) Update script
+   7) Use sing-box (new installation only)
 
 Danger zone:
  9) Uninstall Xray (keep Realm / Caddy)

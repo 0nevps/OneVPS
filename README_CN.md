@@ -6,7 +6,7 @@
 
 [English](README.md)
 
-OneVPS 是一个开源的 Linux VPS Xray 节点部署与运维自动化工具。它把安装、配置生成、服务管理和日常维护步骤
+OneVPS 是一个开源的 Linux VPS Xray 或 sing-box 节点部署与运维自动化工具。它把安装、配置生成、服务管理和日常维护步骤
 集中在一个可审阅的 Bash 工作流中。
 
 目前支持四种部署模式：
@@ -16,7 +16,23 @@ OneVPS 是一个开源的 Linux VPS Xray 节点部署与运维自动化工具。
 - **VMess AEAD + WebSocket（Caddy 后端）**：UUID 认证，复用 Caddy 管理的 TLS。
 - **Hysteria2 + QUIC + TLS**：原生 Xray 入站，统一使用 Caddy 管理的证书。
 
-OneVPS 专注于基于 Xray 的部署，不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
+Xray 模式保持完整功能；sing-box 目前仅支持一个 VLESS + REALITY + Vision 节点。两个内核互斥，不自动迁移或同时运行。
+OneVPS 不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
+
+## sing-box 预览
+
+在全新主机选择 **7 → 1** 安装固定版本 sing-box 1.14.4，再在 sing-box 菜单选择 **2** 添加一个
+VLESS + REALITY + Vision 节点。安装前会校验官方发布包的 SHA-256。检测到既有 Xray 安装或节点数据时
+拒绝切换；请在独立主机手动备份和迁移，不要通过删除数据绕过检查。目前不支持 sing-box 节点编辑、
+按用户出站、Trojan/VMess/WS 或 Hysteria2。sing-box 菜单可查看链接、重启服务、更新脚本及卸载本模式文件。
+
+sing-box 的[官方文档](https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/)
+确认 1.14 起支持原生 ACME 证书签发，官方 1.14.4 构建包含 `with_acme`。但本阶段 REALITY 无需证书，
+**不启用内置 ACME**；Xray 的 Caddy 证书流程保持不变。后续接入 WS/Hysteria2 时需先确定单一签发方，
+不能让 Caddy 和 sing-box 对同一域名各自签发。
+
+修改源码时编辑 `src/entry.sh` 或 `src/cores/*.sh`，然后运行 `bash scripts/build.sh --write`
+及 `bash tests/test_build.sh`。提交到仓库的 `onevps.sh` 仍是可独立下载的发布脚本。
 
 ## VMess（AEAD，WebSocket + TLS）
 
