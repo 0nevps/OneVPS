@@ -990,4 +990,5 @@ fi
 assert_false 'failed direct call never reports success or continues' \
   command grep -Eq 'TCP tuning applied|unreachable' "$TEST_TMP/errexit-output"
 
+assert_true 'VMess configuration, links and lifecycle regressions' bash "$ROOT_DIR/tests/test_vmess.sh"
 printf '# %d tests passed\n' "$TEST_COUNT"

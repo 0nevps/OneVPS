@@ -7,6 +7,9 @@ All notable changes to OneVPS are documented in this file. The project follows
 
 ### Added
 
+- VMess AEAD WebSocket nodes behind Caddy with UUID users, share links and transactional route/config updates.
+- Strict v2 VMess upstream import for TCP/WS with verified TLS and supported AEAD encryption.
+- VMess lifecycle, rollback, malformed-link and real-core authentication/per-user routing regressions.
 - Independent realm port relay menu with verified v2.9.6 downloads for amd64, arm64, and armv7.
 - TCP and TCP+UDP rules, IPv4/IPv6 destinations, service status, deletion, restart, and independent uninstall.
 - Restricted systemd service, input and listening-port checks, unmanaged-file protection, and configuration rollback.

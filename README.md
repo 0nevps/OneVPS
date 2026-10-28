@@ -10,16 +10,53 @@ OneVPS is an open-source automation tool for deploying and operating Xray nodes 
 It turns the installation, configuration, service management, and routine maintenance steps into one
 auditable Bash workflow.
 
-Three deployment modes are supported:
+Four deployment modes are supported:
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS** — a standalone deployment that does not require a domain
   or certificate.
 - **Trojan + WebSocket behind Caddy** — a deployment that shares Caddy's `:443` listener and certificates
   with other Caddy-managed services.
 - **Hysteria2 + QUIC + TLS** — a native Xray inbound with Caddy-managed certificates.
+- **VMess AEAD + WebSocket behind Caddy** — UUID authentication with Caddy-managed TLS.
 
 OneVPS deliberately focuses on Xray-based deployments. It is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
+
+## VMess (AEAD, WebSocket + TLS)
+
+Choose **2 → 6** to add a VMess node. Point a domain at the VPS and allow TCP 80/443.
+Caddy terminates TLS on port 443 and proxies the secret WS path to a loopback-only Xray inbound.
+The existing Caddy setup policy applies, including its shared-listener HTTP/3 restriction.
+Menu **2 → 4** manages UUIDs, users, domains, paths, routes, outbounds and node state;
+**2 → 5** exports links. Existing menu numbers are unchanged. Deleting a node keeps its
+domain site and certificate automation. VMess route/config updates roll back on detected failures.
+
+Share links use the v2rayN v2 `vmess://BASE64(JSON)` format with `aid=0` and `scy=auto`.
+Upstream import accepts that format with TCP or WS **and TLS**, AEAD (`aid=0`), and
+`auto`, `aes-128-gcm` or `chacha20-poly1305` encryption. Standard/Base64URL encoding,
+numeric/string ports and formatted JSON are accepted. Unknown fields, nonzero alterId,
+insecure TLS, TCP HTTP camouflage and unsupported transports are rejected, not downgraded.
+URI-style VMess links, plaintext upstreams, gRPC and XHTTP are not included.
+
+Keep client and server UTC clocks within 120 seconds. VMess is offered for compatibility;
+current Xray warns about its lack of forward secrecy, and its WS documentation recommends
+XHTTP to avoid WS traffic fingerprints. This feature does not migrate existing nodes.
+Configuration uses the compatibility `clients`/`vnext` fields, tested against real Xray cores.
+
+References: [VMess inbound](https://xtls.github.io/config/inbounds/vmess.html),
+[VMess outbound](https://xtls.github.io/config/outbounds/vmess.html),
+[WebSocket](https://xtls.github.io/config/transports/websocket.html),
+[Xray 26.10.21 schema](https://github.com/XTLS/Xray-core/blob/v26.10.21/infra/conf/vmess.go),
+[v2rayN link implementation](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/VmessFmt.cs).
+
+```bash
+bash tests/test_vmess.sh
+XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_vmess.sh
+```
+
+The optional real-core test needs Python 3 and verifies WS backend traffic, two UUIDs,
+invalid-UUID rejection and per-user SOCKS routing. It does not test Caddy TLS termination
+or Linux systemd/firewall integration; verify those on the deployment host.
 
 ## Hysteria2 (native Xray)
 
@@ -113,7 +150,7 @@ the same workflow on another supported host, and contribute fixes in one place.
 | Area | Supported options |
 | --- | --- |
 | Core | [Xray-core](https://github.com/XTLS/Xray-core) |
-| Protocols | VLESS, Trojan, Hysteria2 |
+| Protocols | VLESS, Trojan, Hysteria2, VMess |
 | Transports | TCP, WebSocket, QUIC (UDP) |
 | Security | REALITY, XTLS Vision, TLS terminated by Caddy |
 | Service manager | systemd |
@@ -245,6 +282,8 @@ The independent core check requires a real binary and fails if it is missing:
 XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_xray_outbounds.sh
 ```
 
+VMess upstream import is also available; see the VMess section for its strict v2 JSON/TLS subset.
+
 CI runs this check with Xray `26.3.27`. Configuration acceptance is not proof of upstream reachability;
 verify traffic through your intended exit separately.
 
@@ -252,7 +291,7 @@ verify traffic through your intended exit separately.
 
 Use the user management entry in a node's menu to add users, delete users, and display individual
 share links. Users belong only to that node; there are no global accounts or cross-node assignments.
-Different nodes may use the same user name. Each new Reality user gets an independent UUID, and each
+Different nodes may use the same user name. Each new Reality or VMess user gets an independent UUID, and each
 Trojan user gets an independent password. New users inherit the node outbound.
 Names, user IDs, and credentials must be unique within the node; credentials must not collide with
 its default client either.

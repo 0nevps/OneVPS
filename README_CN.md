@@ -9,13 +9,46 @@
 OneVPS 是一个开源的 Linux VPS Xray 节点部署与运维自动化工具。它把安装、配置生成、服务管理和日常维护步骤
 集中在一个可审阅的 Bash 工作流中。
 
-目前支持三种部署模式：
+目前支持四种部署模式：
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS**：独立部署，无需域名或证书。
 - **Trojan + WebSocket（Caddy 后端）**：复用 Caddy 的 `:443` 监听与证书，可与其他 Caddy 服务共存。
+- **VMess AEAD + WebSocket（Caddy 后端）**：UUID 认证，复用 Caddy 管理的 TLS。
 - **Hysteria2 + QUIC + TLS**：原生 Xray 入站，统一使用 Caddy 管理的证书。
 
 OneVPS 专注于基于 Xray 的部署，不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
+
+## VMess（AEAD，WebSocket + TLS）
+
+选择 **2 → 6** 添加 VMess 节点，域名需解析到 VPS，并放行 TCP 80/443。
+Caddy 在 443 端口终止 TLS，通过随机 WS 路径转发到仅监听回环地址的 Xray 入站。
+沿用现有 Caddy 初始化策略，包括共享监听的 HTTP/3 限制，不改变原有菜单编号。
+通过 **2 → 4** 管理 UUID、多用户、域名、路径、路由、出站、启停和删除；**2 → 5** 显示分享链接。
+删除节点保留域名站点与证书自动化；检测到配置或服务更新失败时恢复节点配置与 Caddy 路由。
+
+分享链接采用 v2rayN v2 的 `vmess://BASE64(JSON)` 格式，固定 `aid=0`、`scy=auto`。
+导入上游仅支持该格式的 **TCP/WS + TLS + AEAD**，加密方式为 `auto`、`aes-128-gcm` 或
+`chacha20-poly1305`。支持标准 Base64/Base64URL、字符串或数字端口以及带格式的 JSON。
+未知字段、非零 alterId、跳过证书验证、TCP HTTP 伪装和不支持的传输均明确拒绝，不静默降级。
+本次不支持 URI 风格 VMess 链接、无 TLS 上游、gRPC 或 XHTTP。
+
+客户端与服务端的 UTC 时间误差须小于 120 秒。此功能面向兼容需求：当前 Xray 会提示 VMess
+缺乏前向保密，WS 文档也建议使用 XHTTP 避免明显流量特征；不迁移现有节点。
+配置沿用兼容的 `clients`/`vnext` 字段，并通过真实核心验证。
+
+参考：[VMess 入站](https://xtls.github.io/config/inbounds/vmess.html)、
+[VMess 出站](https://xtls.github.io/config/outbounds/vmess.html)、
+[WebSocket](https://xtls.github.io/config/transports/websocket.html)、
+[Xray 26.10.21 配置实现](https://github.com/XTLS/Xray-core/blob/v26.10.21/infra/conf/vmess.go)、
+[v2rayN 链接实现](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/VmessFmt.cs)。
+
+```bash
+bash tests/test_vmess.sh
+XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_vmess.sh
+```
+
+可选的真实核心测试需要 Python 3，验证 WS 后端通信、两个 UUID、无效 UUID 拒绝及按用户 SOCKS 分流。
+该测试不覆盖 Caddy 的公网 TLS 终止、Linux systemd 或防火墙，部署时仍需验证。
 
 ## Hysteria2（原生 Xray）
 
@@ -92,7 +125,7 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 | 类别 | 支持范围 |
 | --- | --- |
 | 核心 | [Xray-core](https://github.com/XTLS/Xray-core) |
-| 协议 | VLESS、Trojan、Hysteria2 |
+| 协议 | VLESS、Trojan、Hysteria2、VMess |
 | 传输 | TCP、WebSocket、QUIC（UDP） |
 | 安全 | REALITY、XTLS Vision、由 Caddy 终结的 TLS |
 | 服务管理 | systemd |
@@ -180,6 +213,8 @@ Danger zone:
   TCP + Reality + Vision 链接。不支持的传输、加密选项和不安全 TLS 选项会明确拒绝，不会静默忽略。
 - **SOCKS5：** `socks5://host:port` 或 `socks5://username:password@host:port`。
   凭据中的保留字符需要百分号编码；不支持 `socks://` 和 `socks5h://`。
+
+另支持 VMess 上游导入，其严格 v2 JSON/TLS 子集见 VMess 专节。
 
 VLESS 参数白名单为 `encryption`、`type`、`security`、`flow`、`sni`、`fp`、`pbk`、`sid`、
 `spx`、`host`、`path`、`serviceName`、`mode`、`alpn`，并须与所选传输匹配。

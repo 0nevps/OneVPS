@@ -62,6 +62,16 @@ check_link 'VLESS TLS gRPC' "vless://$uuid@proxy.example.com:443?encryption=none
 check_link 'VLESS TLS TCP Vision' "vless://$uuid@proxy.example.com:443?type=tcp&security=tls&flow=xtls-rprx-vision&fp=chrome&sni=proxy.example.com&alpn=h2%2Chttp%2F1.1"
 check_link 'VLESS TLS gRPC multi' "vless://$uuid@proxy.example.com:443?type=grpc&security=tls&sni=proxy.example.com&serviceName=proxy&mode=multi&alpn=h2"
 
+for transport in tcp ws; do
+  for method in auto aes-128-gcm chacha20-poly1305; do
+    payload=$(jq -ncj --arg uuid "$uuid" --arg net "$transport" --arg scy "$method" '
+      {v:"2",ps:"VMess test",add:"proxy.example.com",port:"443",id:$uuid,aid:"0",scy:$scy,
+       net:$net,type:"none",tls:"tls",sni:"proxy.example.com"} +
+      if $net == "ws" then {host:"proxy.example.com",path:"/vmess"} else {} end' | openssl base64 -A)
+    check_link "VMess TLS $transport $method" "vmess://$payload"
+  done
+done
+
 printf '%s\n' '{"mode":"direct"}' | prepare_outbound_assignment "$TEST_TMP/node.json" "$TEST_TMP/direct.json" a1b2c3d4
 render_config "$TEST_TMP/direct.json" "$TEST_TMP/config.json"
 "$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1
@@ -71,3 +81,5 @@ printf '%s\n' '"inherit"' | prepare_outbound_assignment "$TEST_TMP/direct.json" 
 render_config "$TEST_TMP/reset.json" "$TEST_TMP/config.json"
 "$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1
 printf 'ok - real Xray accepts restored default node outbound\n'
+
+XRAY_TEST_BIN="$CORE" bash "$ROOT_DIR/tests/test_vmess.sh"
