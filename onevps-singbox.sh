@@ -20,7 +20,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   else echo 'Please install Python 3.8 or later first.' >&2; exit 1; fi
 fi
 export ONEVPS_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-exec python3 - "$@" <<'PYTHON_APP'
+exec python3 /dev/fd/3 "$@" 3<<'PYTHON_APP'
 import base64
 import copy
 import hashlib
