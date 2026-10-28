@@ -230,8 +230,34 @@ check_env() {
 pkg_install() {
   case "$PKG" in
     apt)
-      DEBIAN_FRONTEND=noninteractive run_with_progress 'Refreshing apt package index' apt-get update -qq &&
-        run_with_progress "Installing packages: $*" apt-get install -y -qq "$@"
+      local log status=0 attempt
+      log=$(mktemp) || return "$?"
+      for attempt in 1 2; do
+        if DEBIAN_FRONTEND=noninteractive run_with_progress 'Refreshing apt package index' apt-get update -qq; then
+          :
+        else
+          status=$?
+          break
+        fi
+        # Keep diagnostics visible and use a stable locale to identify download 404s.
+        if LC_ALL=C run_with_progress "Installing packages: $*" apt-get install -y -qq "$@" 2>&1 | tee "$log" >&2; then
+          status=0
+          break
+        else
+          status=$?
+        fi
+        if ! grep -Eq '^E: Failed to fetch .*404[[:space:]]+Not Found' "$log"; then
+          break
+        fi
+        if (( attempt == 1 )); then
+          warn 'APT package download returned 404; refreshing the index and retrying once.' >&2
+        fi
+      done
+      rm -f "$log"
+      if (( status != 0 && attempt == 2 )); then
+        warn 'APT recovery failed; check apt-get update output and configured package sources. Sources and security checks were not changed.' >&2
+      fi
+      return "$status"
       ;;
     dnf) run_with_progress "Installing packages: $*" dnf install -y -q "$@" ;;
     yum) run_with_progress "Installing packages: $*" yum install -y -q "$@" ;;

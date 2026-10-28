@@ -147,6 +147,54 @@ for package_frontend in '' noninteractive readline; do
     "DEBIAN_FRONTEND=${package_frontend:-<unset>}"
 done
 pass 'package progress preserves apt environment and aborts after failed update'
+
+for apt_scenario in recovered persistent refresh_failed other_error; do
+  (
+    # Each invocation runs in a pipeline, so persist mock state outside the shell.
+    : > "$TEST_TMP/apt-retry-calls"
+    apt-get() {
+      printf '%s\n' "$*" >> "$TEST_TMP/apt-retry-calls"
+      local count
+      count=$(wc -l < "$TEST_TMP/apt-retry-calls")
+      if [[ "$1" == update ]]; then
+        if [[ "$apt_scenario" == refresh_failed && "$count" -eq 3 ]]; then
+          return 43
+        fi
+        return 0
+      fi
+      if [[ "$apt_scenario" == other_error ]]; then
+        printf 'E: dpkg returned an error code (1)\n' >&2
+        return 100
+      fi
+      if [[ "$apt_scenario" == recovered && "$count" -eq 4 ]]; then return 0; fi
+      printf 'E: Failed to fetch http://example.invalid/jq.deb  404  Not Found [IP: 192.0.2.1 80]\n' >&2
+      return 100
+    }
+    # shellcheck disable=SC2034
+    PKG=apt
+    status=0
+    TERM=dumb pkg_install jq 2> "$TEST_TMP/apt-retry-log" || status=$?
+    case "$apt_scenario" in
+      recovered) expected_status=0; expected_calls=4 ;;
+      persistent) expected_status=100; expected_calls=4 ;;
+      refresh_failed) expected_status=43; expected_calls=3 ;;
+      other_error) expected_status=100; expected_calls=2 ;;
+    esac
+    [[ "$status" -eq "$expected_status" ]] || exit 1
+    [[ $(wc -l < "$TEST_TMP/apt-retry-calls") -eq "$expected_calls" ]] || exit 1
+    if [[ "$apt_scenario" == other_error ]]; then
+      command grep -q 'dpkg returned an error' "$TEST_TMP/apt-retry-log" || exit 1
+      if command grep -q 'retrying once' "$TEST_TMP/apt-retry-log"; then exit 1; fi
+    else
+      command grep -q 'Failed to fetch.*404' "$TEST_TMP/apt-retry-log" || exit 1
+      command grep -q 'retrying once' "$TEST_TMP/apt-retry-log" || exit 1
+      if [[ "$apt_scenario" != recovered ]]; then
+        command grep -q 'check apt-get update output' "$TEST_TMP/apt-retry-log" || exit 1
+      fi
+    fi
+  ) || fail "APT download recovery: $apt_scenario"
+  pass "APT download recovery: $apt_scenario"
+done
 (
   XRAY_BIN="$BASH"
   # Consumed by auto_pick_reality_target() in the sourced script.
