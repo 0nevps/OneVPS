@@ -549,8 +549,8 @@ HTML
     chmod a+r "$root/index.html"
 }
 
-# Append a marked site block routing a secret WS path to a local Xray inbound.
-# Requests to the secret path are proxied to Xray (reverse_proxy handles the
+# Append a marked site block routing a secret WS path to a local core inbound.
+# Requests to the secret path are proxied to the core (reverse_proxy handles the
 # WebSocket upgrade); every other path returns HTTP 403 with the styled 403
 # page, so the rest of the subdomain looks like a locked-down site.
 # Reverts the append if Caddy reload fails. Returns non-zero on failure.

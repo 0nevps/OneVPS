@@ -16,17 +16,21 @@ OneVPS 是一个开源的 Linux VPS Xray 或 sing-box 节点部署与运维自�
 - **VMess AEAD + WebSocket（Caddy 后端）**：UUID 认证，复用 Caddy 管理的 TLS。
 - **Hysteria2 + QUIC + TLS**：原生 Xray 入站，统一使用 Caddy 管理的证书。
 
-Xray 模式保持完整功能；sing-box 目前支持一个 VLESS + REALITY + Vision 节点和一个 Hysteria2 节点。
+Xray 模式保持完整功能；sing-box 目前支持 VLESS + REALITY + Vision、Hysteria2、Trojan + WebSocket
+各一个节点。
 两个内核互斥，不自动迁移或同时运行。
 OneVPS 不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
 
 ## sing-box 预览
 
 在全新主机选择 **7 → 1** 安装固定版本 sing-box 1.14.4，再在 sing-box 菜单选择 **2** 添加一个
-VLESS + REALITY + Vision 节点；选择 **6** 添加一个 Hysteria2 节点。安装前会校验官方发布包的 SHA-256。
+VLESS + REALITY + Vision 节点；选择 **6** 添加一个 Hysteria2 节点，或选择 **7** 添加由 Caddy 代理的
+Trojan + WebSocket 节点。安装前会校验官方发布包的 SHA-256。
 检测到既有 Xray 安装或节点数据时
 拒绝切换；请在独立主机手动备份和迁移，不要通过删除数据绕过检查。目前不支持 sing-box 节点编辑、
-按用户出站或 Trojan/VMess/WS。sing-box 菜单可查看链接、重启服务、更新脚本及卸载本模式文件。
+按用户出站或 VMess（包括 VMess + WS）。sing-box 菜单可查看链接、重启服务、更新脚本及卸载本模式文件。
+Trojan + WS 的公网 TLS 由 Caddy 负责，随机路径反代至仅监听回环地址且不启用 TLS 的 sing-box 入站。
+创建节点或更新 Caddy 路由失败时恢复原有节点配置及路由；域名站点及证书继续由 Caddy 管理。
 
 sing-box 的[官方文档](https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/)
 确认 1.14 起支持原生 ACME 证书签发，官方 1.14.4 构建包含 `with_acme`。但本阶段 REALITY 无需证书，

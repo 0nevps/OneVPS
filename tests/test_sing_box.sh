@@ -71,6 +71,26 @@ sing_render "$work/both-nodes.json" "$work/both-config.json" || fail 'Reality an
 if [[ -n "${SING_TEST_BIN:-}" ]]; then
   "$SING_TEST_BIN" check -c "$work/both-config.json" || fail 'multi-inbound real core check'
 fi
+jq -n '{nodes:[{id:"cdef1234",name:"Trojan WS",tag:"trojan-cdef1234",type:"trojan-ws",
+  domain:"ws.example.com",password:"strong-password",port:24777,ws_path:"/test-ws",
+  caddy_file:"/etc/caddy/Caddyfile",enabled:true}]}' > "$work/trojan-nodes.json"
+sing_render "$work/trojan-nodes.json" "$work/trojan-config.json" || fail 'Trojan WS render'
+jq -e '.inbounds[0] | .type == "trojan" and .listen == "127.0.0.1" and
+  .listen_port == 24777 and .transport == {type:"ws",path:"/test-ws"} and
+  .users[0].password == "strong-password" and (has("tls") | not)' \
+  "$work/trojan-config.json" >/dev/null || fail 'loopback-only Trojan WS config'
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  "$SING_TEST_BIN" check -c "$work/trojan-config.json" || fail 'Trojan WS real core check'
+fi
+jq -s '{nodes: (.[0].nodes + .[1].nodes)}' "$work/both-nodes.json" "$work/trojan-nodes.json" > "$work/all-nodes.json"
+sing_render "$work/all-nodes.json" "$work/all-config.json" || fail 'all three inbounds render'
+if [[ -n "${SING_TEST_BIN:-}" ]]; then
+  "$SING_TEST_BIN" check -c "$work/all-config.json" || fail 'all-inbound real core check'
+fi
+jq '.nodes[2].port = .nodes[0].port' "$work/all-nodes.json" > "$work/conflicting-ports.json"
+reject sing_render "$work/conflicting-ports.json" "$work/reject.json"
+jq '.nodes += .nodes' "$work/trojan-nodes.json" > "$work/two-trojan.json"
+reject sing_render "$work/two-trojan.json" "$work/reject.json"
 jq '.nodes += .nodes' "$SING_NODES" > "$work/two.json"
 reject sing_render "$work/two.json" "$work/reject.json"
 jq '.nodes += .nodes' "$work/hy2-nodes.json" > "$work/two-hy2.json"
@@ -145,6 +165,92 @@ grep -q '^vless://' "$work/link" || fail 'share link'
   cmp "$SING_NODES" "$work/hy2-before-nodes.json" || fail 'HY2 metadata rollback'
   cmp "$SING_CONF" "$work/hy2-before-config.json" || fail 'HY2 config rollback'
 )
+
+# Exercise the real Caddy route helper with mocked reload and service operations.
+(
+  test_root="$work"
+  CADDY_STATE="$work/trojan-caddy"
+  mkdir -p "$CADDY_STATE/routes"
+  printf ':80 { respond "existing" }\n' > "$work/Caddyfile"
+  cp "$SING_NODES" "$work/trojan-before-nodes.json"
+  cp "$SING_CONF" "$work/trojan-before-config.json"
+  prepare_caddy_for_trojan() { :; }
+  find_caddyfile() { printf '%s\n' "$test_root/Caddyfile"; }
+  caddy_domain_ensure() { mkdir -p "$CADDY_STATE/routes/$1"; }
+  caddy_reload() { [[ "${RELOAD_FAIL:-0}" == 0 ]]; }
+  ask() {
+    case "$1" in
+      'Node name') echo 'Trojan WS' ;;
+      'TLS domain') echo ws.example.com ;;
+      'Loopback TCP port') echo 24777 ;;
+      'Password (Enter for random)') echo strong-password ;;
+      *) return 1 ;;
+    esac
+  }
+  sing_add_trojan_ws > "$work/trojan-link" || fail 'Trojan WS node transaction'
+  jq -e '(.nodes|length == 3) and .nodes[2].type == "trojan-ws"' "$SING_NODES" >/dev/null || fail 'Trojan WS stored with REALITY and HY2'
+  id=$(jq -r '.nodes[2].id' "$SING_NODES")
+  route="$CADDY_STATE/routes/ws.example.com/$id.caddy"
+  test -f "$route" || fail 'Caddy WS route missing'
+  grep -q 'reverse_proxy 127.0.0.1:24777' "$route" || fail 'Caddy WS backend'
+  grep -q '^trojan://' "$work/trojan-link" || fail 'Trojan WS share link'
+  reject sing_add_trojan_ws
+  cp "$work/trojan-before-nodes.json" "$SING_NODES"
+  cp "$work/trojan-before-config.json" "$SING_CONF"
+  caddy_remove_route "$id"
+  restart_count=0
+  systemctl() {
+    if [[ "$1" == restart ]]; then
+      restart_count=$((restart_count+1))
+      (( restart_count > 1 ))
+    else return 0; fi
+  }
+  reject sing_add_trojan_ws
+  cmp "$SING_NODES" "$work/trojan-before-nodes.json" || fail 'service failure restored Trojan metadata'
+  cmp "$SING_CONF" "$work/trojan-before-config.json" || fail 'service failure restored Trojan config'
+  test ! -e "$CADDY_STATE/routes/ws.example.com/$id.caddy" || fail 'service failure retained Caddy route'
+
+  systemctl() { return 0; }
+  RELOAD_FAIL=1
+  reject sing_add_trojan_ws
+  cmp "$SING_NODES" "$work/trojan-before-nodes.json" || fail 'route failure restored Trojan metadata'
+  cmp "$SING_CONF" "$work/trojan-before-config.json" || fail 'route failure restored Trojan config'
+  test -z "$(find "$CADDY_STATE/routes" -name '*.caddy' -print)" || fail 'route failure retained a Caddy route'
+)
+
+# Uninstall removes the owned WS route but keeps the Caddy domain and certificate state.
+(
+  test_root="$work"
+  CADDY_STATE="$work/uninstall-caddy"
+  mkdir -p "$CADDY_STATE/routes/ws.example.com"
+  printf ':80 { respond "existing" }\n' > "$work/uninstall-Caddyfile"
+  cp "$work/trojan-nodes.json" "$work/uninstall-nodes.json"
+  jq --arg file "$work/uninstall-Caddyfile" '.nodes[0].caddy_file=$file' \
+    "$work/uninstall-nodes.json" > "$SING_NODES"
+  printf 'handle /test-ws { reverse_proxy 127.0.0.1:24777 }\n' > "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy"
+  confirm() { return 0; }
+  systemctl() { return 0; }
+  caddy_reload() { [[ "$1" == "$test_root/uninstall-Caddyfile" ]]; }
+  sing_uninstall > "$work/trojan-uninstall" || fail 'Trojan WS uninstall'
+  test ! -e "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" || fail 'uninstall retained Trojan route'
+  test -f "$work/uninstall-Caddyfile" || fail 'uninstall removed Caddy site'
+  test -d "$CADDY_STATE" || fail 'uninstall removed Caddy state'
+)
+mkdir -p "$SING_DIR"
+cat > "$SING_BIN" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == generate && "${2:-}" == reality-keypair ]]; then
+  echo 'PrivateKey: 2A1nlCd-rZYG58FRsWQ5sPaZa0m1wTR6REBBto1JK3U'
+  echo 'PublicKey: 2wpfMwjkaOOdvhN5F_ik0QgyCEM6DhVyXYsaDHixuFo'
+elif [[ "${1:-}" == generate ]]; then
+  echo '123e4567-e89b-12d3-a456-426614174003'
+else
+  echo 'sing-box version 1.14.4'
+  echo 'Tags: with_acme'
+fi
+EOF
+chmod 755 "$SING_BIN"
+touch "$SING_DIR/.onevps-managed"
 
 # A failed service restart must restore both metadata and the generated config.
 printf '{"nodes":[]}\n' > "$SING_NODES"

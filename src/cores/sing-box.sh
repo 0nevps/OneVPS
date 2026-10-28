@@ -22,6 +22,8 @@ sing_render() {
     ([.nodes[].id] | length == (unique | length)) and
     ([.nodes[] | select(.type == "vless-reality")] | length <= 1) and
     ([.nodes[] | select(.type == "hysteria2")] | length <= 1) and
+    ([.nodes[] | select(.type == "trojan-ws")] | length <= 1) and
+    ([.nodes[] | select(.type != "hysteria2") | .port] | length == (unique | length)) and
     all(.nodes[]; .enabled == true and
       (.id|type == "string" and test("^[0-9a-f]{8}$")) and
       (.name|type == "string" and length > 0) and
@@ -40,6 +42,12 @@ sing_render() {
         (.password|type == "string" and length > 0) and
         (.tls_cert|type == "string" and startswith("/")) and
         (.tls_key|type == "string" and startswith("/"))
+      elif .type == "trojan-ws" then
+        (.tag == ("trojan-" + .id)) and
+        (.domain|type == "string" and test("^[a-z0-9.-]+$")) and
+        (.password|type == "string" and length > 0) and
+        (.ws_path|type == "string" and test("^/[a-zA-Z0-9_/-]+$")) and
+        (.caddy_file|type == "string" and startswith("/"))
       else false end))' \
     "$source" >/dev/null || return 1
   jq '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local"}]},
@@ -49,11 +57,15 @@ sing_render() {
         tls:{enabled:true,server_name:.reality_sni,
           reality:{enabled:true,handshake:{server:.reality_target,server_port:.reality_target_port},
             private_key:.reality_private_key,short_id:[.reality_short_id]}}}
-      else
+      elif .type == "hysteria2" then
         {type:"hysteria2",tag:.tag,listen:"0.0.0.0",listen_port:.port,
           users:[{name:"default",password:.password}],
           tls:{enabled:true,server_name:.domain,alpn:["h3"],
             certificate_path:.tls_cert,key_path:.tls_key}}
+      else
+        {type:"trojan",tag:.tag,listen:"127.0.0.1",listen_port:.port,
+          users:[{name:"default",password:.password}],
+          transport:{type:"ws",path:.ws_path}}
       end],
     outbounds:[{type:"direct",tag:"direct"}],
     route:{rules:[
@@ -283,9 +295,81 @@ sing_add_hysteria() (
   node_link "$node"
 )
 
+sing_add_trojan_ws() (
+  sing_require || return 1
+  [[ -f "$SING_NODES" && -f "$SING_CONF" ]] || { err 'Sing-box state is incomplete'; return 1; }
+  jq -e 'all(.nodes[]; .type != "trojan-ws")' "$SING_NODES" >/dev/null || {
+    err 'Only one Trojan WebSocket node is supported'; return 1;
+  }
+  local name domain port password id path file node work route touched=false committed=false active=false preserve=false
+  name=$(ask 'Node name' "trojan-$(openssl rand -hex 2)")
+  domain=$(normalize_domain "$(ask 'TLS domain')")
+  acme_domain_valid "$domain" || { err 'Invalid domain'; return 1; }
+  port=$(ask 'Loopback TCP port' "$(rand_port)")
+  realm_valid_port "$port" || { err 'Invalid port'; return 1; }
+  port=$((10#$port))
+  if port_in_use "$port" tcp || jq -e --argjson p "$port" \
+    'any(.nodes[]; .type != "hysteria2" and .port == $p)' "$SING_NODES" >/dev/null; then
+    err 'TCP port already in use'; return 1
+  fi
+  if (( port == 80 || port == 443 )); then err 'Caddy reserves TCP 80/443'; return 1; fi
+  password=$(ask 'Password (Enter for random)' "$(rand_password)")
+  [[ -n "$password" ]] || { err 'Empty password'; return 1; }
+  path="/$(openssl rand -hex 8)" || return 1
+  id=$(openssl rand -hex 4) || return 1
+  jq -e --arg id "$id" --arg domain "$domain" --arg path "$path" '
+    all(.nodes[]; .id != $id and
+      (.type != "trojan-ws" or .domain != $domain or .ws_path != $path))' "$SING_NODES" >/dev/null || return 1
+  prepare_caddy_for_trojan || return 1
+  file=$(find_caddyfile)
+  [[ -n "$file" && -f "$file" && ! -L "$file" ]] || return 1
+  route="$CADDY_STATE/routes/$domain/$id.caddy"
+  [[ ! -e "$route" && ! -L "$route" ]] || { err 'Caddy route already exists'; return 1; }
+  node=$(jq -nc --arg id "$id" --arg name "$name" --arg domain "$domain" \
+    --arg password "$password" --arg path "$path" --arg file "$file" --argjson port "$port" \
+    '{id:$id,name:$name,tag:("trojan-"+$id),type:"trojan-ws",domain:$domain,password:$password,
+      port:$port,ws_path:$path,caddy_file:$file,enabled:true}') || return 1
+  work=$(mktemp -d "$SING_DIR/.candidate.XXXXXXXX") || return 1
+  sing_trojan_cleanup() {
+    local status=$? failed=false
+    trap - EXIT INT TERM HUP
+    if $touched && ! $committed; then
+      if [[ -f "$route" ]]; then
+        caddy_remove_route "$id" && caddy_reload "$file" || failed=true
+      fi
+      cp -p "$work/old-nodes.json" "$SING_NODES" && cp -p "$work/old-config.json" "$SING_CONF" || failed=true
+      if $active; then
+        systemctl restart sing-box && systemctl is-active --quiet sing-box || failed=true
+      else systemctl stop sing-box || failed=true; fi
+      if $failed; then preserve=true; err "ROLLBACK FAILED; backup retained at $work"
+      else err 'Candidate failed; old sing-box configuration and Caddy route restored'; fi
+      status=1
+    fi
+    if ! $preserve; then rm -rf "$work"; fi
+    exit "$status"
+  }
+  trap sing_trojan_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  jq --argjson added "$node" '.nodes += [$added]' "$SING_NODES" > "$work/nodes.json" || return 1
+  sing_render "$work/nodes.json" "$work/config.json" && sing_check "$work/config.json" "$work/check.log" || {
+    err 'Candidate sing-box configuration rejected'; return 1;
+  }
+  cp -p "$SING_NODES" "$work/old-nodes.json" && cp -p "$SING_CONF" "$work/old-config.json" || return 1
+  if systemctl is-active --quiet sing-box; then active=true; fi
+  touched=true
+  install -m 640 "$work/nodes.json" "$SING_NODES" && install -m 640 "$work/config.json" "$SING_CONF" &&
+    sing_secure && systemctl restart sing-box && systemctl is-active --quiet sing-box || return 1
+  caddy_add_route "$id" "$domain" "$path" "$port" "$file" || return 1
+  committed=true
+  ok 'Sing-box Trojan WebSocket node added'
+  node_link "$node"
+)
+
 sing_menu() {
   while :; do
-    printf '\nSing-box (exclusive mode)\n1) Install sing-box\n2) Add VLESS REALITY node\n3) Show node links\n4) Restart service\n5) Update script\n6) Add Hysteria2 (Caddy certificate)\n9) Uninstall sing-box\n0) Back/exit\n'
+    printf '\nSing-box (exclusive mode)\n1) Install sing-box\n2) Add VLESS REALITY node\n3) Show node links\n4) Restart service\n5) Update script\n6) Add Hysteria2 (Caddy certificate)\n7) Add Trojan WebSocket (behind Caddy)\n9) Uninstall sing-box\n0) Back/exit\n'
     case "$(ask 'Select')" in
       1) sing_install || warn 'Installation failed'; pause ;;
       2) sing_add_reality || warn 'Node not added'; pause ;;
@@ -298,6 +382,7 @@ sing_menu() {
       4) sing_require && sing_check "$SING_CONF" /dev/null && systemctl restart sing-box || warn 'Restart failed'; pause ;;
       5) if update_script; then return 0; else pause; fi ;;
       6) sing_add_hysteria || warn 'Hysteria2 node not added'; pause ;;
+      7) sing_add_trojan_ws || warn 'Trojan WebSocket node not added'; pause ;;
       9) sing_uninstall; pause ;;
       0|'') return ;;
       *) warn 'Invalid selection' ;;
@@ -308,6 +393,20 @@ sing_menu() {
 sing_uninstall() {
   sing_require || return 1
   confirm 'Remove OneVPS sing-box binary, service and all its nodes?' n || return 0
+  local node route file
+  while IFS= read -r node; do
+    route="$CADDY_STATE/routes/$(jq -r '.domain' <<<"$node")/$(jq -r '.id' <<<"$node").caddy"
+    file=$(jq -r '.caddy_file' <<<"$node")
+    [[ -f "$route" && -f "$file" && ! -L "$route" && ! -L "$file" ]] || {
+      err 'Missing or unmanaged Caddy route; sing-box uninstall cancelled'; return 1;
+    }
+  done < <(jq -c '.nodes[] | select(.type == "trojan-ws")' "$SING_NODES")
+  while IFS= read -r node; do
+    file=$(jq -r '.caddy_file' <<<"$node")
+    caddy_remove_route "$(jq -r '.id' <<<"$node")" && caddy_reload "$file" || {
+      err 'Caddy route cleanup failed; sing-box uninstall cancelled'; return 1;
+    }
+  done < <(jq -c '.nodes[] | select(.type == "trojan-ws")' "$SING_NODES")
   systemctl disable --now sing-box || return 1
   systemctl disable --now onevps-caddy-sync.timer 2>/dev/null || true
   rm -f "$SING_BIN" "$SING_SERVICE" || return 1
