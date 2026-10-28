@@ -3219,7 +3219,7 @@ sing_render() {
     ([.nodes[] | select(.type == "trojan-ws")] | length <= 1) and
     ([.nodes[] | select(.type == "vmess-ws")] | length <= 1) and
     ([.nodes[] | select(.type != "hysteria2") | .port] | length == (unique | length)) and
-    all(.nodes[]; .enabled == true and
+    all(.nodes[]; (.enabled | type == "boolean") and
       (.id|type == "string" and test("^[0-9a-f]{8}$")) and
       (.name|type == "string" and length > 0) and
       (.port|type == "number" and floor == . and . >= 1 and . <= 65535) and
@@ -3248,7 +3248,7 @@ sing_render() {
       else false end))' \
     "$source" >/dev/null || return 1
   jq '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local"}]},
-    inbounds:[.nodes[] | if .type == "vless-reality" then
+    inbounds:[.nodes[] | select(.enabled) | if .type == "vless-reality" then
       {type:"vless",tag:.tag,listen:"0.0.0.0",listen_port:.port,
         users:[{name:"default",uuid:.uuid,flow:"xtls-rprx-vision"}],
         tls:{enabled:true,server_name:.reality_sni,
@@ -3580,9 +3580,149 @@ sing_add_ws() (
   node_link "$node"
 )
 
+# Keep node metadata, core config and the owned WS route in one rollback boundary.
+sing_change_node() (
+  local id="$1" action="$2" value='' old new work route='' file='' active=false
+  local touched=false committed=false preserve=false route_changed=false failed=false
+  sing_require || return 1
+  [[ -f "$SING_NODES" && -f "$SING_CONF" ]] || return 1
+  old=$(jq -ce --arg id "$id" '.nodes[] | select(.id == $id)' "$SING_NODES") || return 1
+  [[ -n "$old" ]] || return 1
+  if [[ "$action" != toggle && "$action" != delete ]]; then
+    value=$(jq -cse 'select(length == 1) | .[0]') || return 1
+  fi
+  work=$(mktemp -d "$SING_DIR/.candidate.XXXXXXXX") || return 1
+  sing_change_cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    if $touched && ! $committed; then
+      if $route_changed; then
+        if [[ -f "$work/old-route.caddy" ]]; then
+          install -m 644 "$work/old-route.caddy" "$route" && caddy_reload "$file" || failed=true
+        else
+          caddy_remove_route "$id" && caddy_reload "$file" || failed=true
+        fi
+      fi
+      cp -p "$work/old-nodes.json" "$SING_NODES" &&
+        cp -p "$work/old-config.json" "$SING_CONF" || failed=true
+      if $active; then
+        systemctl restart sing-box && systemctl is-active --quiet sing-box || failed=true
+      else
+        systemctl stop sing-box || failed=true
+      fi
+      if $failed; then preserve=true; err "ROLLBACK FAILED; backup retained at $work"
+      else err 'Change failed; old sing-box node and route restored'; fi
+      status=1
+    fi
+    if ! $preserve; then rm -rf "$work"; fi
+    exit "$status"
+  }
+  trap sing_change_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  case "$action" in
+    port)
+      [[ "$value" =~ ^[0-9]+$ ]] && realm_valid_port "$value" || return 1
+      if jq -e '.type == "trojan-ws" or .type == "vmess-ws"' <<<"$old" >/dev/null &&
+        (( value == 80 || value == 443 )); then return 1; fi
+      if [[ "$value" != "$(jq -r '.port' <<<"$old")" ]]; then
+        local proto=tcp
+        [[ $(jq -r '.type' <<<"$old") == hysteria2 ]] && proto=udp
+        if port_in_use "$value" "$proto"; then err 'Port already in use'; return 1; fi
+      fi ;;
+    credential)
+      if jq -e '.type == "vless-reality" or .type == "vmess-ws"' <<<"$old" >/dev/null; then
+        is_valid_uuid "$(jq -r . <<<"$value")" || return 1
+      else [[ $(jq -r 'type == "string" and length > 0' <<<"$value") == true ]] || return 1; fi ;;
+    toggle|delete) ;;
+    *) return 1 ;;
+  esac
+  jq --arg id "$id" --arg action "$action" --argjson value "${value:-null}" '
+    if $action == "delete" then .nodes |= map(select(.id != $id))
+    else (.nodes[] | select(.id == $id)) |=
+      if $action == "port" then .port = $value
+      elif $action == "credential" then
+        if .type == "vless-reality" or .type == "vmess-ws" then .uuid = $value else .password = $value end
+      else .enabled |= not end end' "$SING_NODES" > "$work/nodes.json" || return 1
+  sing_render "$work/nodes.json" "$work/config.json" && sing_check "$work/config.json" "$work/check.log" || {
+    err 'Candidate sing-box configuration rejected'; return 1;
+  }
+  new=$(jq -c --arg id "$id" '.nodes[] | select(.id == $id)' "$work/nodes.json") || return 1
+  if jq -e '.type == "trojan-ws" or .type == "vmess-ws"' <<<"$old" >/dev/null &&
+    [[ "$action" == port || "$action" == toggle || "$action" == delete ]]; then
+    file=$(jq -r '.caddy_file' <<<"$old")
+    route="$CADDY_STATE/routes/$(jq -r '.domain' <<<"$old")/$id.caddy"
+    [[ -f "$file" && ! -L "$file" && ! -L "$route" ]] || return 1
+    if [[ $(jq -r '.enabled' <<<"$old") == true ]]; then
+      [[ -f "$route" ]] || { err 'Managed WS route missing'; return 1; }
+      cp -p "$route" "$work/old-route.caddy" || return 1
+    elif [[ -e "$route" ]]; then err 'Unexpected route for disabled node'; return 1; fi
+  fi
+  cp -p "$SING_NODES" "$work/old-nodes.json" && cp -p "$SING_CONF" "$work/old-config.json" || return 1
+  if systemctl is-active --quiet sing-box; then active=true; fi
+  touched=true
+  install -m 640 "$work/nodes.json" "$SING_NODES" && install -m 640 "$work/config.json" "$SING_CONF" &&
+    sing_secure && systemctl restart sing-box && systemctl is-active --quiet sing-box || return 1
+  if [[ -n "$route" ]]; then
+    route_changed=true
+    if [[ -n "$new" && $(jq -r '.enabled' <<<"$new") == true ]]; then
+      caddy_add_route "$id" "$(jq -r .domain <<<"$new")" "$(jq -r .ws_path <<<"$new")" \
+        "$(jq -r .port <<<"$new")" "$file" || return 1
+    else
+      caddy_remove_route "$id" && caddy_reload "$file" || return 1
+    fi
+  fi
+  committed=true
+  if [[ "$action" == port || "$action" == delete ]]; then
+    local proto=tcp oldport
+    [[ $(jq -r '.type' <<<"$old") == hysteria2 ]] && proto=udp
+    oldport=$(jq -r .port <<<"$old")
+    if [[ "$proto" == udp || $(jq -r '.type' <<<"$old") == vless-reality ]]; then
+      if [[ "$action" == delete || "$oldport" != "$value" ]]; then close_port "$oldport" "$proto"; fi
+      if [[ "$action" == port && "$oldport" != "$value" ]]; then open_port "$value" "$proto"; fi
+    fi
+  fi
+)
+
+sing_manage_nodes() {
+  sing_require || return 1
+  local index id node type action value
+  while :; do
+    if ! jq -e '.nodes|length > 0' "$SING_NODES" >/dev/null; then warn 'No nodes'; return; fi
+    jq -r '.nodes | to_entries[] | "\(.key+1)) \(.value.name) [\(.value.type)] port:\(.value.port) \(if .value.enabled then "enabled" else "disabled" end)"' "$SING_NODES"
+    index=$(ask 'Node number (Enter to go back)')
+    [[ -n "$index" ]] || return
+    [[ "$index" =~ ^[1-9][0-9]{0,5}$ ]] || { warn 'Invalid node number'; continue; }
+    node=$(jq -ce --argjson i "$((index-1))" '.nodes[$i] // empty' "$SING_NODES") || return 1
+    [[ -n "$node" ]] || { warn 'Invalid node number'; continue; }
+    id=$(jq -r .id <<<"$node")
+    type=$(jq -r .type <<<"$node")
+    printf '1) Change port\n2) Reset default credential\n3) Enable/disable\n4) Show share link\n5) Delete node\n0) Back\n'
+    action=$(ask 'Select')
+    case "$action" in
+      1)
+        value=$(ask 'New listen port' "$(jq -r .port <<<"$node")")
+        [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || { warn 'Invalid port'; continue; }
+        printf '%s\n' "$value" | jq -R 'tonumber' | sing_change_node "$id" port || warn 'Port unchanged' ;;
+      2)
+        if [[ "$type" == vless-reality || "$type" == vmess-ws ]]; then value=$(ask_uuid)
+        else value=$(ask 'New password (Enter for random)' "$(rand_password)"); fi
+        printf '%s\n' "$value" | jq -R . | sing_change_node "$id" credential || warn 'Credential unchanged' ;;
+      3) sing_change_node "$id" toggle || warn 'Status unchanged' ;;
+      4) node_link "$node"; pause ;;
+      5) if confirm "Delete node $(jq -r .name <<<"$node")?" n; then
+           sing_change_node "$id" delete || warn 'Node not deleted'
+         fi ;;
+      0|'') return ;;
+      *) warn 'Invalid selection' ;;
+    esac
+  done
+}
+
 sing_menu() {
   while :; do
-    printf '\nSing-box (exclusive mode)\n1) Install sing-box\n2) Add VLESS REALITY node\n3) Show node links\n4) Restart service\n5) Update script\n6) Add Hysteria2 (Caddy certificate)\n7) Add Trojan WebSocket (behind Caddy)\n8) Add VMess AEAD WebSocket (behind Caddy)\n9) Uninstall sing-box\n0) Back/exit\n'
+    printf '\nSing-box (exclusive mode)\n1) Install sing-box\n2) Add VLESS REALITY node\n3) Show node links\n4) Restart service\n5) Update script\n6) Add Hysteria2 (Caddy certificate)\n7) Add Trojan WebSocket (behind Caddy)\n8) Add VMess AEAD WebSocket (behind Caddy)\n9) Uninstall sing-box\n10) Manage nodes\n0) Back/exit\n'
     case "$(ask 'Select')" in
       1) sing_install || warn 'Installation failed'; pause ;;
       2) sing_add_reality || warn 'Node not added'; pause ;;
@@ -3598,6 +3738,7 @@ sing_menu() {
       7) sing_add_ws trojan-ws || warn 'Trojan WebSocket node not added'; pause ;;
       8) sing_add_ws vmess-ws || warn 'VMess WebSocket node not added'; pause ;;
       9) sing_uninstall; pause ;;
+      10) sing_manage_nodes ;;
       0|'') return ;;
       *) warn 'Invalid selection' ;;
     esac

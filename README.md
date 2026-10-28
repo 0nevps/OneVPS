@@ -33,8 +33,10 @@ Trojan + WebSocket, or **8** for VMess AEAD + WebSocket behind Caddy.
 The release archive is verified with its
 SHA-256 digest before installation. Existing Xray installations or node data prevent switching;
 back up and migrate manually on a separate host rather than deleting data to bypass this check.
-Sing-box node management and user-specific outbounds are not supported yet.
-The sing-box menu can display links, restart its service, update the script, and uninstall its own files.
+Sing-box menu **10** manages nodes: change the listen port or default credential, enable/disable,
+show the share link, or delete a node. User accounts and user-specific outbounds are not supported yet.
+WS nodes remove only their own Caddy routes when disabled or deleted; Caddy domain sites and certificates remain.
+The menu can also display all links, restart the service, update the script, and uninstall its own files.
 For Trojan or VMess over WS, Caddy owns public TLS and proxies the generated path to a loopback-only sing-box
 inbound without TLS. A failed node creation or Caddy route update restores the previous node configuration
 and route; the domain site and certificate remain managed by Caddy.

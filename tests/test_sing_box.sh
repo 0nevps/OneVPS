@@ -289,6 +289,89 @@ grep -q '^vless://' "$work/link" || fail 'share link'
   test -z "$(find "$CADDY_STATE/routes/vmess.example.com" -name '*.caddy' -print)" || fail 'VMess route rollback retained route'
 )
 
+# Exercise lifecycle changes for every inbound without touching the host.
+(
+  lifecycle_root="$work"
+  CADDY_STATE="$work/lifecycle-caddy"
+  mkdir -p "$CADDY_STATE/routes/ws.example.com" "$CADDY_STATE/routes/vmess.example.com"
+  printf ':80 { respond "existing" }\n' > "$work/lifecycle-Caddyfile"
+  jq --arg file "$work/lifecycle-Caddyfile" '
+    .nodes |= map(if .type == "trojan-ws" or .type == "vmess-ws" then .caddy_file=$file else . end)' \
+    "$work/four-nodes.json" > "$SING_NODES"
+  sing_render "$SING_NODES" "$SING_CONF" || fail 'lifecycle initial render'
+  printf 'handle /test-ws { reverse_proxy 127.0.0.1:24777 }\n' > "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy"
+  printf 'handle /test-vmess { reverse_proxy 127.0.0.1:24888 }\n' > "$CADDY_STATE/routes/vmess.example.com/f1e2d3c4.caddy"
+  sing_check() {
+    [[ ! -f "$lifecycle_root/lifecycle-fail-check" ]] &&
+      { [[ -z "${SING_TEST_BIN:-}" ]] || "$SING_TEST_BIN" check -c "$1"; }
+  }
+  caddy_domain_ensure() { mkdir -p "$CADDY_STATE/routes/$1"; }
+  caddy_reload() {
+    if [[ -f "$lifecycle_root/lifecycle-fail-caddy" ]]; then
+      command rm "$lifecycle_root/lifecycle-fail-caddy"; return 1
+    fi
+  }
+  systemctl() {
+    if [[ "$1" == restart && -f "$lifecycle_root/lifecycle-fail-restart" ]]; then
+      command rm "$lifecycle_root/lifecycle-fail-restart"; return 1
+    fi
+    return 0
+  }
+  for id in a1b2c3d4 abc12345 cdef1234 f1e2d3c4; do
+    sing_change_node "$id" toggle || fail "disable $id"
+    jq -e --arg id "$id" 'any(.nodes[]; .id == $id and .enabled == false)' "$SING_NODES" >/dev/null || fail "disable state $id"
+    jq -e --arg id "$id" 'all(.inbounds[]; .tag != ("reality-"+$id) and .tag != ("hy2-"+$id) and
+      .tag != ("trojan-"+$id) and .tag != ("vmess-"+$id))' "$SING_CONF" >/dev/null || fail "disable inbound $id"
+    sing_change_node "$id" toggle || fail "enable $id"
+  done
+  for id in cdef1234 f1e2d3c4; do
+    test -f "$CADDY_STATE/routes/$(if [[ "$id" == cdef1234 ]]; then echo ws.example.com; else echo vmess.example.com; fi)/$id.caddy" || fail "WS route enable $id"
+  done
+  port=24998
+  for id in a1b2c3d4 abc12345 cdef1234 f1e2d3c4; do
+    port=$((port+1))
+    printf '%s\n' "$port" | jq -R 'tonumber' | sing_change_node "$id" port || fail "port change $id"
+    jq -e --arg id "$id" --argjson port "$port" 'any(.nodes[]; .id == $id and .port == $port)' "$SING_NODES" >/dev/null || fail "port state $id"
+    if [[ "$id" == cdef1234 || "$id" == f1e2d3c4 ]]; then
+      domain=ws.example.com; [[ "$id" == f1e2d3c4 ]] && domain=vmess.example.com
+      grep -q "reverse_proxy 127.0.0.1:$port" "$CADDY_STATE/routes/$domain/$id.caddy" || fail "port route $id"
+    fi
+  done
+  printf '"123e4567-e89b-12d3-a456-426614174099"\n' | sing_change_node a1b2c3d4 credential || fail 'REALITY credential'
+  printf '"123e4567-e89b-12d3-a456-426614174098"\n' | sing_change_node f1e2d3c4 credential || fail 'VMess credential'
+  printf '"new-hy2-password"\n' | sing_change_node abc12345 credential || fail 'HY2 credential'
+  printf '"new-trojan-password"\n' | sing_change_node cdef1234 credential || fail 'Trojan credential'
+  printf '"invalid-uuid"\n' | reject sing_change_node f1e2d3c4 credential
+  printf '443\n' | reject sing_change_node cdef1234 port
+  printf '25002\n' | reject sing_change_node cdef1234 port
+  cp "$SING_NODES" "$work/lifecycle-before-nodes.json"
+  cp "$SING_CONF" "$work/lifecycle-before-config.json"
+  cp "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" "$work/lifecycle-before-route.caddy"
+  touch "$work/lifecycle-fail-check"
+  reject sing_change_node cdef1234 toggle
+  command rm "$work/lifecycle-fail-check"
+  touch "$work/lifecycle-fail-restart"
+  reject sing_change_node cdef1234 toggle
+  touch "$work/lifecycle-fail-caddy"
+  reject sing_change_node cdef1234 delete
+  cmp "$SING_NODES" "$work/lifecycle-before-nodes.json" || fail 'lifecycle rollback nodes'
+  cmp "$SING_CONF" "$work/lifecycle-before-config.json" || fail 'lifecycle rollback config'
+  cmp "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" "$work/lifecycle-before-route.caddy" || fail 'lifecycle rollback route'
+  for id in a1b2c3d4 abc12345 cdef1234 f1e2d3c4; do
+    touch "$work/lifecycle-fail-restart"
+    reject sing_change_node "$id" delete
+    cmp "$SING_NODES" "$work/lifecycle-before-nodes.json" || fail "delete rollback metadata $id"
+    cmp "$SING_CONF" "$work/lifecycle-before-config.json" || fail "delete rollback config $id"
+  done
+  for id in a1b2c3d4 abc12345 cdef1234 f1e2d3c4; do
+    sing_change_node "$id" delete || fail "delete $id"
+  done
+  jq -e '.nodes == []' "$SING_NODES" >/dev/null || fail 'lifecycle delete metadata'
+  test ! -e "$CADDY_STATE/routes/ws.example.com/cdef1234.caddy" || fail 'Trojan route retained after delete'
+  test ! -e "$CADDY_STATE/routes/vmess.example.com/f1e2d3c4.caddy" || fail 'VMess route retained after delete'
+  test -f "$work/lifecycle-Caddyfile" || fail 'Caddy site removed on node deletion'
+)
+
 # Uninstall removes the owned WS route but keeps the Caddy domain and certificate state.
 (
   test_root="$work"
