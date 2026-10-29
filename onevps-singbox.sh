@@ -1709,7 +1709,7 @@ def main_menu():
         print('Core:',('.'.join(map(str,ver)) if ver else 'not installed'),
               '| service:',('active' if service_active() else 'inactive'),
               '| nodes:',len(read_meta()['nodes']))
-        print('1) Install / update sing-box (stable >=1.14)\n2) Nodes / users / outbound / share links\n3) Caddy TLS certificate management\n4) Realm relay\n5) Service / BBR / TCP tuning\n6) Update this manager from repository\n7) Diagnostics\n8) VPS-local acceptance checks\n9) Uninstall managed sing-box\n0) Exit')
+        print('1) Install / update sing-box (stable >=1.14)\n2) Nodes / users / outbound / share links\n3) Caddy TLS certificate management\n4) Realm relay\n5) Service / BBR / TCP tuning\n6) Update script\n7) Diagnostics\n8) VPS-local acceptance checks\n9) Uninstall managed sing-box\n0) Exit')
         try:
             c=ask('Select','0')
             if c=='0':return
