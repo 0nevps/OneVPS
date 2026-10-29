@@ -60,6 +60,7 @@ SERVICE = pathlib.Path('/etc/systemd/system/onevps-singbox.service')
 TIMER_SERVICE = pathlib.Path('/etc/systemd/system/onevps-singbox-certs.service')
 TIMER = pathlib.Path('/etc/systemd/system/onevps-singbox-certs.timer')
 SCRIPT_INSTALLED = pathlib.Path('/usr/local/sbin/onevps-singbox')
+UPDATE_URL = 'https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps-singbox.sh'
 REALM_BASE = pathlib.Path('/etc/onevps-singbox-realm')
 REALM_BINARY = pathlib.Path('/usr/local/bin/onevps-sb-realm')
 REALM_UNIT = pathlib.Path('/etc/systemd/system/onevps-sb-realm.service')
@@ -1518,19 +1519,37 @@ def realm_menu():
         except (OneVPSException, ValueError) as e:warn(str(e))
 
 def update_self():
-    url=ask('HTTPS URL of trusted updated onevps-singbox.sh (empty cancels)')
-    if not url:return
-    parsed=urllib.parse.urlparse(url)
-    if parsed.scheme!='https':fail('Only HTTPS updates are allowed')
-    content=request(url)
+    current=pathlib.Path(os.environ.get('ONEVPS_SCRIPT_PATH',''))
+    if not current.is_file() or current.is_symlink():
+        fail('Launch from a saved script file to update it (not a pipe)')
+    targets=[current]
+    if SCRIPT_INSTALLED!=current and (SCRIPT_INSTALLED.exists() or SCRIPT_INSTALLED.is_symlink()):
+        if not SCRIPT_INSTALLED.is_file() or SCRIPT_INSTALLED.is_symlink():
+            fail('Installed maintenance script is not a regular file; refusing update')
+        targets.append(SCRIPT_INSTALLED)
+    with urllib.request.urlopen(UPDATE_URL,timeout=35) as response:
+        if response.geturl()!=UPDATE_URL:fail('Repository download redirected; refusing update')
+        content=response.read()
     if not content.startswith(b'#!/usr/bin/env bash') or b'PYTHON_APP' not in content:fail('Not a valid OneVPS script')
     with tempfile.TemporaryDirectory() as tmp:
         path=pathlib.Path(tmp)/'update.sh';path.write_bytes(content)
         command(['bash','-n',str(path)])
     print('SHA256: '+hashlib.sha256(content).hexdigest())
-    if not confirm('Install this reviewed update?'):return
-    write_secure(SCRIPT_INSTALLED,content,0o700)
-    ok('Installed updated maintenance script at '+str(SCRIPT_INSTALLED))
+    if not confirm('Install this downloaded update?'):return
+    original=[(target,target.read_bytes(),target.stat().st_mode&0o777) for target in targets]
+    changed=[]
+    try:
+        for target,_,mode in original:
+            changed.append(target)
+            write_secure(target,content,mode)
+    except BaseException as exc:
+        rollback_errors=[]
+        for target,old,mode in reversed(original[:len(changed)]):
+            try:write_secure(target,old,mode)
+            except Exception as rollback_exc:rollback_errors.append('%s: %s'%(target,rollback_exc))
+        if rollback_errors:fail('Update failed; manual recovery required: '+', '.join(rollback_errors))
+        fail('Update failed; previous scripts restored: '+str(exc))
+    ok('Updated '+', '.join(map(str,targets))+'; restart this menu to use the new version')
 
 def uninstall():
     if not confirm('Remove managed sing-box nodes, config and service? (Caddy/Realm untouched)'):return
@@ -1690,7 +1709,7 @@ def main_menu():
         print('Core:',('.'.join(map(str,ver)) if ver else 'not installed'),
               '| service:',('active' if service_active() else 'inactive'),
               '| nodes:',len(read_meta()['nodes']))
-        print('1) Install / update sing-box (stable >=1.14)\n2) Nodes / users / outbound / share links\n3) Caddy TLS certificate management\n4) Realm relay\n5) Service / BBR / TCP tuning\n6) Update this manager from HTTPS\n7) Diagnostics\n8) VPS-local acceptance checks\n9) Uninstall managed sing-box\n0) Exit')
+        print('1) Install / update sing-box (stable >=1.14)\n2) Nodes / users / outbound / share links\n3) Caddy TLS certificate management\n4) Realm relay\n5) Service / BBR / TCP tuning\n6) Update this manager from repository\n7) Diagnostics\n8) VPS-local acceptance checks\n9) Uninstall managed sing-box\n0) Exit')
         try:
             c=ask('Select','0')
             if c=='0':return
@@ -1719,6 +1738,56 @@ def _selftest():
             if t=='hysteria2':obj['domain']='example.org'
             if t=='ss2022':obj['credential']=base64.b64encode(secrets.token_bytes(16)).decode()
             return obj
+        def test_update_self_replaces_both_scripts_or_restores_them(self):
+            from unittest.mock import patch
+            class Download:
+                def __init__(self,data,url=UPDATE_URL):self.data=data;self.url=url
+                def __enter__(self):return self
+                def __exit__(self,*args):pass
+                def geturl(self):return self.url
+                def read(self):return self.data
+            new=b"#!/usr/bin/env bash\nexec python3 /dev/fd/3 3<<'PYTHON_APP'\nprint('new')\nPYTHON_APP\n"
+            with tempfile.TemporaryDirectory() as td:
+                d=pathlib.Path(td);current=d/'current.sh';installed=d/'installed.sh'
+                old_current=b'old current';old_installed=b'old installed'
+                def reset():
+                    current.write_bytes(old_current);installed.write_bytes(old_installed)
+                    current.chmod(0o700);installed.chmod(0o755)
+                reset()
+                with patch.dict(os.environ,{'ONEVPS_SCRIPT_PATH':str(current)}),patch.dict(globals(),{'SCRIPT_INSTALLED':installed}),patch.object(urllib.request,'urlopen',return_value=Download(new)),patch.dict(globals(),{'confirm':lambda *a:True}):
+                    update_self()
+                    self.assertEqual(current.read_bytes(),new)
+                    self.assertEqual(installed.read_bytes(),new)
+                    self.assertEqual(current.stat().st_mode&0o777,0o700)
+                    self.assertEqual(installed.stat().st_mode&0o777,0o755)
+                    reset()
+                    with patch.dict(globals(),{'confirm':lambda *a:False}):update_self()
+                    self.assertEqual((current.read_bytes(),installed.read_bytes()),(old_current,old_installed))
+                    real_write=write_secure
+                    def fail_second(path,data,mode):
+                        if path==installed and data==new:raise OSError('simulated write failure')
+                        return real_write(path,data,mode)
+                    with patch.dict(globals(),{'write_secure':fail_second}):
+                        with self.assertRaisesRegex(OneVPSException,'previous scripts restored'):update_self()
+                    self.assertEqual((current.read_bytes(),installed.read_bytes()),(old_current,old_installed))
+                    with patch.object(urllib.request,'urlopen',return_value=Download(new,'http://example.org/script')):
+                        with self.assertRaisesRegex(OneVPSException,'redirected'):update_self()
+                    with patch.object(urllib.request,'urlopen',return_value=Download(b'#!/usr/bin/env bash\n# PYTHON_APP\nif\n')):
+                        with self.assertRaises(OneVPSException):update_self()
+                    with patch.object(urllib.request,'urlopen',side_effect=urllib.error.URLError('offline')):
+                        with self.assertRaises(urllib.error.URLError):update_self()
+                    self.assertEqual((current.read_bytes(),installed.read_bytes()),(old_current,old_installed))
+                installed.unlink()
+                with patch.dict(os.environ,{'ONEVPS_SCRIPT_PATH':str(current)}),patch.dict(globals(),{'SCRIPT_INSTALLED':installed,'confirm':lambda *a:True}),patch.object(urllib.request,'urlopen',return_value=Download(new)):
+                    update_self()
+                self.assertEqual(current.read_bytes(),new)
+                self.assertFalse(installed.exists())
+                reset()
+                with patch.dict(os.environ,{'ONEVPS_SCRIPT_PATH':str(current)}),patch.dict(globals(),{'SCRIPT_INSTALLED':current,'confirm':lambda *a:True}),patch.object(urllib.request,'urlopen',return_value=Download(new)):
+                    update_self()
+                self.assertEqual(current.read_bytes(),new)
+                with patch.dict(os.environ,{'ONEVPS_SCRIPT_PATH':'/dev/fd/999999'}):
+                    with self.assertRaisesRegex(OneVPSException,'saved script file'):update_self()
         def test_inbounds(self):
             for t in ('vless-reality','trojan-ws','vmess-ws','snell5','snell6','ss2022'):
                 with self.subTest(t=t):
