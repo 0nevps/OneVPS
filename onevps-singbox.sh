@@ -76,6 +76,15 @@ MIN_VERSION = (1, 14, 0)
 class OneVPSException(Exception):
     pass
 
+def color(text, code, stream=None):
+    stream = stream or sys.stdout
+    if 'NO_COLOR' in os.environ or os.environ.get('TERM') == 'dumb' or not stream.isatty():
+        return str(text)
+    return '\033[%sm%s\033[0m' % (code, text)
+
+def field(label, value, value_color='36'):
+    return '%s %s' % (color(label, '1'), color(value, value_color))
+
 def fail(msg):
     raise OneVPSException(msg)
 
@@ -1009,9 +1018,11 @@ def link_output(n,u=None):
 
 def show_nodes():
     for i,n in enumerate(read_meta()['nodes'],1):
-        print('%d. %s | %s | %s:%s | %s | users:%s' % (
-            i,n['name'],n['type'],n.get('domain',n.get('target','VPS')),n['port'],
-            'ON' if n['enabled'] else 'OFF',1+len(n.get('users',[]))))
+        state = color('ON' if n['enabled'] else 'OFF', '32' if n['enabled'] else '33')
+        print('%d. %s | %s | %s:%s | %s | %s' % (
+            i,color(n['name'],'1;36'),color(n['type'],'36'),
+            color(n.get('domain',n.get('target','VPS')),'36'),color(n['port'],'36'),
+            state,field('users:',1+len(n.get('users',[])))))
 
 def select_node():
     meta=read_meta()
@@ -1102,8 +1113,8 @@ def user_menu(nid):
     while True:
         m=read_meta();n=find_node(m,nid)
         users=[default_user(n)]+n.get('users',[])
-        print('\nUsers:')
-        for i,u in enumerate(users): print('%d) %s [%s]'%(i+1,u['name'],u['id']))
+        print('\n'+color('Users:', '1'))
+        for i,u in enumerate(users): print('%d) %s [%s]'%(i+1,color(u['name'],'1;36'),color(u['id'],'36')))
         print('1) Add user  2) Delete user  3) Reset user credential  4) Show link  0) Back')
         choice=ask('Action','0')
         if choice=='0': return
@@ -1240,7 +1251,7 @@ def outbound_menu(nid):
     scope='all' if selection=='1' else 'selected'
     selected=[]
     if scope=='selected':
-        for idx,u in enumerate(users,1):print('%d) %s [%s]'%(idx,u['name'],u['id']))
+        for idx,u in enumerate(users,1):print('%d) %s [%s]'%(idx,color(u['name'],'1;36'),color(u['id'],'36')))
         ids=ask('User numbers, separated by spaces')
         if not re.fullmatch(r'[0-9]+(?: +[0-9]+)*',ids):fail('Invalid user selection')
         values=[int(x) for x in ids.split()]
@@ -1280,7 +1291,7 @@ def manage_nodes():
     while True:
         try:n=find_node(read_meta(),nid)
         except OneVPSException:return
-        print('\n=== '+n['name']+' ===')
+        print('\n=== '+color(n['name'],'1;36')+' ===')
         print('1) Change port  2) Reset default credential  3) Users  4) Outbound')
         print('5) Enable/disable  6) Delete node  7) Show links')
         if n['type']=='vless-reality':print('8) Rotate Reality keys  9) Change Reality target')
@@ -1319,8 +1330,8 @@ def certificate_menu():
                     cert,_=tls_cert_paths(domain)
                     if pathlib.Path(cert).exists():
                         result=command(['openssl','x509','-in',cert,'-noout','-enddate'],check=False).stdout.strip()
-                        print(domain, result)
-                    else:print(domain, '(pending)')
+                        print(color(domain,'1;36'), color(result,'36'))
+                    else:print(color(domain,'1;36'), color('(pending)','33'))
             elif c=='3':sync_certs()
             elif c=='4':
                 command(['systemctl','--no-pager','status','caddy','onevps-singbox-certs.timer'],check=False,capture=False)
@@ -1497,12 +1508,12 @@ def realm_menu():
                 firewall_allow(port,'tcp')
                 if mode=='both':firewall_allow(port,'udp')
             elif c=='2':
-                for i,x in enumerate(realm_endpoints()['endpoints'],1):print(i,x['listen'],'->',x['remote'])
+                for i,x in enumerate(realm_endpoints()['endpoints'],1):print(i,color(x['listen'],'36'),'->',color(x['remote'],'36'))
                 if REALM_UNIT.exists():command(['systemctl','--no-pager','status','onevps-sb-realm'],check=False,capture=False)
             elif c=='3':
                 if not REALM_UNIT.is_file():fail('Realm not installed')
                 m=realm_endpoints()
-                for i,x in enumerate(m['endpoints'],1):print(i,x['listen'],'->',x['remote'])
+                for i,x in enumerate(m['endpoints'],1):print(i,color(x['listen'],'36'),'->',color(x['remote'],'36'))
                 idx=int(ask('Delete number'))-1
                 if idx<0 or idx>=len(m['endpoints']):fail('Invalid index')
                 if confirm('Delete relay?'):
@@ -1585,10 +1596,10 @@ def uninstall():
 def diagnostics():
     require_root()
     v=version_tuple()
-    print('sing-box:',('.'.join(map(str,v)) if v else 'not installed'))
-    print('Service:', 'active' if service_active() else 'inactive')
-    print('Caddy:', 'active' if service_active('caddy.service') else 'inactive')
-    m=read_meta();print('Nodes:',len(m['nodes']))
+    print(field('sing-box:', '.'.join(map(str,v)) if v else 'not installed'))
+    for label, active in (('Service:',service_active()),('Caddy:',service_active('caddy.service'))):
+        print(field(label,'active' if active else 'inactive','32' if active else '33'))
+    m=read_meta();print(field('Nodes:',len(m['nodes'])))
     if v and v>=MIN_VERSION:
         with locked():
             check_core(render_config(m))
@@ -1596,7 +1607,7 @@ def diagnostics():
     if CONF.is_file():
         cmd=command(['systemctl','show','-p','MainPID','--value','onevps-singbox.service'],check=False)
         pid=cmd.stdout.strip()
-        print('MainPID:',pid)
+        print(field('MainPID:',pid))
         if service_active() and shutil.which('ss'):
             command(['ss','-lntup'],check=False,capture=False)
     # Check actual sockets by listening port and protocol, not just systemd status.
@@ -1626,7 +1637,7 @@ def acceptance():
     problems=[]
     def mark(name,yes,why=''):
         label='PASS' if yes else 'FAIL'
-        print('[%s] %s%s'%(label,name,(': '+why) if why else ''))
+        print('[%s] %s%s'%(color(label,'32' if yes else '31'),name,(': '+why) if why else ''))
         if not yes:problems.append(name)
     m=read_meta()
     mark('At least one enabled proxy node',any(n.get('enabled') for n in m['nodes']))
@@ -1706,9 +1717,10 @@ def main_menu():
     while True:
         print('\n╔════════════════════════════════════════╗\n║     OneVPS · sing-box / Surge Snell    ║\n╚════════════════════════════════════════╝')
         ver=version_tuple()
-        print('Core:',('.'.join(map(str,ver)) if ver else 'not installed'),
-              '| service:',('active' if service_active() else 'inactive'),
-              '| nodes:',len(read_meta()['nodes']))
+        active=service_active()
+        print(field('Core:', '.'.join(map(str,ver)) if ver else 'not installed'),
+              '|',field('service:', 'active' if active else 'inactive','32' if active else '33'),
+              '|',field('nodes:',len(read_meta()['nodes'])))
         print('1) Install / update sing-box (stable >=1.14)\n2) Nodes / users / outbound / share links\n3) Caddy TLS certificate management\n4) Realm relay\n5) Service / BBR / TCP tuning\n6) Update script\n7) Diagnostics\n8) VPS-local acceptance checks\n9) Uninstall managed sing-box\n0) Exit')
         try:
             c=ask('Select','0')
@@ -1738,6 +1750,32 @@ def _selftest():
             if t=='hysteria2':obj['domain']='example.org'
             if t=='ss2022':obj['credential']=base64.b64encode(secrets.token_bytes(16)).decode()
             return obj
+        def test_terminal_colors_only_for_human_readable_fields(self):
+            import io
+            from unittest.mock import patch
+            class Tty(io.StringIO):
+                def isatty(self):return True
+            node=self.base('trojan-ws')
+            with patch.dict(os.environ,{'TERM':'xterm'},clear=True):
+                self.assertEqual(color('value','36',io.StringIO()),'value')
+                self.assertEqual(color('value','36',Tty()),'\033[36mvalue\033[0m')
+                with patch.dict(os.environ,{'NO_COLOR':''}):
+                    self.assertEqual(color('value','36',Tty()),'value')
+                with patch.dict(os.environ,{'TERM':'dumb'}):
+                    self.assertEqual(color('value','36',Tty()),'value')
+                output=io.StringIO()
+                with patch.object(sys,'stdout',output),patch.dict(globals(),{'read_meta':lambda:{'nodes':[node]}}):
+                    show_nodes()
+                self.assertEqual(output.getvalue(),'1. test | trojan-ws | example.org:18888 | ON | users: 1\n')
+                output=Tty()
+                with patch.object(sys,'stdout',output),patch.dict(globals(),{'read_meta':lambda:{'nodes':[node]}}):
+                    show_nodes()
+                self.assertIn('\033[1;36mtest\033[0m',output.getvalue())
+                output=Tty()
+                with patch.object(sys,'stdout',output):
+                    link=link_output(node)
+                self.assertIn(link,output.getvalue())
+                self.assertNotIn('\033[',output.getvalue())
         def test_update_self_replaces_both_scripts_or_restores_them(self):
             from unittest.mock import patch
             class Download:
