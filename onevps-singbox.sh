@@ -1685,7 +1685,7 @@ def acceptance():
 def main_menu():
     require_root()
     while True:
-        print('\n╔════════════════════════════════════════╗\n║     OneVPS · sing-box / Surge Snell     ║\n╚════════════════════════════════════════╝')
+        print('\n╔════════════════════════════════════════╗\n║     OneVPS · sing-box / Surge Snell    ║\n╚════════════════════════════════════════╝')
         ver=version_tuple()
         print('Core:',('.'.join(map(str,ver)) if ver else 'not installed'),
               '| service:',('active' if service_active() else 'inactive'),
