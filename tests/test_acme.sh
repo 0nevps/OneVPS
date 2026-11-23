@@ -76,6 +76,29 @@ caddy_storage_root() { echo "$TMP/storage"; }
 caddy_site_root() { echo "$TMP/sites/$1"; }
 caddy_reload() { return "${RELOAD_STATUS:-0}"; }
 printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
+(
+  CADDYFILE="$TMP/menu-Caddyfile"; printf ':80 {\n respond 200\n}\n' > "$CADDYFILE"
+  ask() { printf '%s\n' site.example.com; }; ensure_deps() { :; }; flock() { :; }
+  ensure_caddy() { touch "$TMP/caddy-prepared"; }; ss() { printf '%s' "${SOCKETS:-}"; }
+  systemctl() { [[ "$1" == show ]] && printf '123\n'; }
+  XRAY_NODES="$TMP/site-nodes.json"
+  printf '{"nodes":[{"type":"vless-reality","enabled":true,"port":443}]}' > "$XRAY_NODES"
+  reject 'Reality reservation stops site setup' setup_static_site
+  rm "$XRAY_NODES"
+  SOCKETS='LISTEN 0 128 *:443 *:* users:(("xray",pid=456,fd=7))'
+  reject 'foreign TCP listener stops site setup' setup_static_site
+  reject 'conflicts checked before Caddy setup' test -e "$TMP/caddy-prepared"
+  SOCKETS='LISTEN 0 128 *:443 *:* users:(("caddy",pid=123,fd=7))'
+  check 'static page needs no Xray installation' setup_static_site
+  check 'static site metadata kept outside HY2 sync' test -f "$CADDY_STATE/sites/site.example.com.json"
+  reject 'static-only certificate not exported' test -f "$CADDY_STATE/domains/site.example.com.json"
+  printf 'my custom 403\n' > "$TMP/sites/site.example.com/index.html"
+  check 'repeat static setup' setup_static_site
+  check 'custom content retained' grep -qx 'my custom 403' "$TMP/sites/site.example.com/index.html"
+  check 'HY2 can reuse static domain' caddy_domain_ensure site.example.com "$CADDYFILE"
+  check 'explicit certificate request enrolls site for sync' test -f "$CADDY_STATE/domains/site.example.com.json"
+  check 'single shared site definition' test "$(grep -cx 'site.example.com {' "$CADDYFILE")" = 1
+)
 check 'HY2-first domain created' caddy_domain_ensure example.com "$CADDYFILE"
 check 'domain error page generated' test -s "$TMP/sites/example.com/index.html"
 check 'domain-specific page root' grep -qF "root * $TMP/sites/example.com" "$CADDYFILE"
@@ -132,3 +155,33 @@ check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
   check 'new deployment setup succeeds' prepare_caddy_for_certificates
   check 'setup is repeatable' prepare_caddy_for_certificates
 )
+
+if [[ -n ${CADDY_TEST_BIN:-} ]]; then
+  (
+    CADDYFILE="$TMP/https-Caddyfile"
+    port=$(python3 -c 'import socket; sock=socket.socket(); sock.bind(("127.0.0.1",0)); print(sock.getsockname()[1])')
+    printf '{\n admin off\n auto_https disable_redirects\n https_port %s\n}\n' "$port" > "$CADDYFILE"
+    check 'generate real static site' caddy_domain_ensure live.example.com "$CADDYFILE" static
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=live.example.com \
+      -addext subjectAltName=DNS:live.example.com -keyout "$TMP/live.key" -out "$TMP/live.crt" >/dev/null 2>&1
+    awk -v dir="$TMP" '{print} /^live\.example\.com \{/ {print "    bind 127.0.0.1\n    tls " dir "/live.crt " dir "/live.key"}' \
+      "$CADDYFILE" > "$TMP/loopback-Caddyfile"
+    export XDG_DATA_HOME="$TMP/data" XDG_CONFIG_HOME="$TMP/config"
+    "$CADDY_TEST_BIN" run --adapter caddyfile --config "$TMP/loopback-Caddyfile" > "$TMP/caddy.log" 2>&1 & pid=$!
+    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+    fetch_site() {
+      curl -sS --noproxy '*' --max-time 2 --cacert "$TMP/live.crt" --resolve "live.example.com:$port:127.0.0.1" \
+        -o "$TMP/body" -w '%{http_code}' "https://live.example.com:$port/"
+    }
+    status=''
+    for ((attempt=0; attempt<50; attempt++)); do
+      if status=$(fetch_site 2>/dev/null); then break; fi
+      sleep 0.1
+    done
+    check 'HTTPS returns actual HTTP 403' test "$status" = 403
+    check 'HTTPS serves the existing page template' cmp "$TMP/body" "$TMP/sites/live.example.com/index.html"
+    printf 'my custom page\n' > "$TMP/sites/live.example.com/index.html"
+    check 'custom page still returns HTTP 403' test "$(fetch_site)" = 403
+    check 'HTTPS serves customized contents' cmp "$TMP/body" "$TMP/sites/live.example.com/index.html"
+  )
+fi

@@ -19,7 +19,6 @@ XRAY_SERVICE=/etc/systemd/system/xray.service
 XRAY_INSTALL_URL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 ONEVPS_UPDATE_URL=https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 ONEVPS_SCRIPT_PATH=${BASH_SOURCE[0]}
-TUNE_CONF=/etc/sysctl.d/99-onevps-tune.conf
 BBR_CONF=/etc/sysctl.d/99-bbr.conf
 REALITY_PROBE_ROUNDS=3
 REALM_DIR=/usr/local/etc/onevps-realm
@@ -445,7 +444,11 @@ caddy_install_binary() {
 
   id caddy >/dev/null 2>&1 || \
     useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
-  mkdir -p /etc/caddy /var/lib/caddy /var/log/caddy
+  if [[ ! -d /etc/caddy ]]; then install -d -m 755 /etc/caddy || return 1; fi
+  local dir
+  for dir in /var/lib/caddy /var/log/caddy; do
+    [[ -d "$dir" ]] || install -d -o caddy -g caddy -m 750 "$dir" || return 1
+  done
 
   cat > /etc/systemd/system/caddy.service <<'EOF'
 [Unit]
@@ -476,7 +479,7 @@ EOF
 # failure. Sets CADDYFILE on success.
 ensure_caddy() {
   if ! caddy_present; then
-    warn "Caddy not found; installing (required for HY2 certificate management)"
+    warn "Caddy not found; installing for HTTPS"
     if ! caddy_install_repo; then
       warn "repo install unavailable; falling back to static binary"
       caddy_install_binary || { err "Caddy install failed"; return 1; }
@@ -489,7 +492,7 @@ ensure_caddy() {
   cf=$(find_caddyfile)
   if [[ -z "$cf" ]]; then
     cf=/etc/caddy/Caddyfile
-    mkdir -p /etc/caddy
+    if [[ ! -d /etc/caddy ]]; then install -d -m 755 /etc/caddy || return 1; fi
     cat > "$cf" <<'EOF'
 # Managed alongside OneVPS. Caddy reverse-proxies real services here;
 # OneVPS appends managed certificate domains below.
@@ -497,6 +500,7 @@ ensure_caddy() {
 	respond "OK" 200
 }
 EOF
+    chmod 644 "$cf" || return 1
     CADDYFILE="$cf"
   fi
 
@@ -1271,8 +1275,9 @@ caddy_state_init() {
     mkdir -p "$CADDY_STATE" && touch "$CADDY_STATE/.onevps-owned" || return 1
   fi
   [[ ! -L "$CADDY_STATE" ]] || return 1
-  mkdir -p "$CADDY_STATE/domains" "$CADDY_STATE/staging" "$ACME_CERT_DIR" || return 1
   chmod 755 "$CADDY_STATE" || return 1
+  [[ "${1:-}" != static ]] || return 0
+  mkdir -p "$CADDY_STATE/domains" "$CADDY_STATE/staging" "$ACME_CERT_DIR" || return 1
   chmod 700 "$CADDY_STATE/domains" || return 1
   chmod 750 "$ACME_CERT_DIR" && chown root:"$(id -gn nobody)" "$ACME_CERT_DIR" || return 1
 }
@@ -1322,17 +1327,32 @@ caddy_tcp_https() {
 }
 
 caddy_domain_ensure() {
-  local domain="$1" file="$2" backup root site_root
+  local domain="$1" file="$2" mode="${3:-certificate}" backup root site_root record static_record
   acme_domain_valid "$domain" || return 1
-  if [[ -f "$CADDY_STATE/domains/$domain.json" ]]; then
-    jq -e --arg file "$file" '.caddy_file == $file' "$CADDY_STATE/domains/$domain.json" >/dev/null &&
+  record="$CADDY_STATE/domains/$domain.json"
+  static_record="$CADDY_STATE/sites/$domain.json"
+  if [[ -f "$record" || -f "$static_record" ]]; then
+    local existing="$record"
+    [[ -f "$existing" ]] || existing="$static_record"
+    jq -e --arg file "$file" '.caddy_file == $file' "$existing" >/dev/null &&
       [[ $(grep -cxF "# OneVPS-domain:$domain BEGIN" "$file") == 1 ]] &&
       [[ $(grep -cxF "# OneVPS-domain:$domain END" "$file") == 1 ]] &&
       grep -qxF "$domain {" "$file" || return 1
+    ensure_site_content "$domain" || return 1
+    if [[ "$mode" == certificate && ! -f "$record" ]]; then
+      root=$(caddy_storage_root "$file") || return 1
+      jq --arg root "$root" '.storage_root=$root' "$existing" > "$record.next" && mv "$record.next" "$record" || return 1
+    fi
     return 0
   fi
   if grep -qiF "$domain" "$file"; then err "unmanaged domain already appears in Caddyfile: $domain"; return 1; fi
-  root=$(caddy_storage_root "$file") || return 1
+  if [[ "$mode" == static ]]; then
+    mkdir -p "$CADDY_STATE/sites" || return 1
+    record="$static_record"
+    root=''
+  else
+    root=$(caddy_storage_root "$file") || return 1
+  fi
   site_root=$(caddy_site_root "$domain")
   ensure_site_content "$domain" || return 1
   backup=$(mktemp "$CADDY_STATE/.domain.XXXXXXXX") || return 1
@@ -1355,11 +1375,43 @@ EOF_SITE
   if ! caddy_reload "$file"; then
     cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup"; return 1
   fi
-  if ! jq -n --arg file "$file" --arg root "$root" '{caddy_file:$file,storage_root:$root}' > "$CADDY_STATE/domains/$domain.json"; then
-    cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup" "$CADDY_STATE/domains/$domain.json"; return 1
+  if ! jq -n --arg file "$file" --arg root "$root" '{caddy_file:$file} + (if $root=="" then {} else {storage_root:$root} end)' > "$record"; then
+    cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup" "$record"; return 1
   fi
   rm -f "$backup"
 }
+
+setup_static_site() (
+  local domain file listeners listener pid
+  domain=$(normalize_domain "$(ask 'Static site domain (DNS must point to this VPS)')")
+  acme_domain_valid "$domain" || { err 'Enter a valid domain name'; return 1; }
+  ensure_deps || return 1
+  if [[ -f "$XRAY_NODES" ]]; then
+    local reserved
+    reserved=$(jq -r 'any(.nodes[]; .enabled and .type=="vless-reality" and (.port==443 or .port==80))' "$XRAY_NODES") || {
+      err 'Cannot read Xray node reservations'; return 1;
+    }
+    if [[ "$reserved" == true ]]; then err 'A Reality node uses TCP 80 or 443; static site setup cancelled'; return 1; fi
+  fi
+  listeners=$(ss -H -ltnp '( sport = :80 or sport = :443 )') || { err 'Cannot check TCP listeners (ss required)'; return 1; }
+  pid=$(systemctl show caddy -p MainPID --value 2>/dev/null) || pid=''
+  while IFS= read -r listener; do
+    [[ -z "$listener" ]] && continue
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$listener" == *"pid=$pid,"* ]] || {
+      err "TCP 80 or 443 is occupied by another service; static site setup cancelled"; return 1;
+    }
+  done <<< "$listeners"
+  caddy_state_init static || return 1
+  exec 9> "$CADDY_STATE/operation.lock" || return 1
+  flock -n 9 || { err 'another Caddy operation is running'; return 1; }
+  ensure_caddy || return 1
+  file=$(find_caddyfile)
+  [[ -f "$file" && ! -L "$file" ]] || { err 'Missing or unsupported Caddyfile'; return 1; }
+  caddy_domain_ensure "$domain" "$file" static || return 1
+  open_port 80 tcp; open_port 443 tcp
+  ok "Static site configured: https://$domain (HTTP 403 after certificate issuance)"
+  info "Edit $(caddy_site_root "$domain")/index.html; allow TCP 80/443 in your cloud firewall."
+)
 
 caddy_sync_domain() {
   local domain="$1" file root cert key found=false stage="$CADDY_STATE/staging/$1"
@@ -2376,65 +2428,6 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-# TCP optimization
-# ----------------------------------------------------------------------------
-write_tune_conf() {
-  local key values min initial maximum rmem wmem
-  for key in tcp_rmem tcp_wmem; do
-    values=$(sysctl -n "net.ipv4.$key" 2>/dev/null) || {
-      err "cannot read $key; tuning file unchanged"; return 1;
-    }
-    # Restrict size before arithmetic to avoid overflow and reject multiline data.
-    if [[ ! "$values" =~ ^[[:blank:]]*[0-9]{1,10}[[:blank:]]+[0-9]{1,10}[[:blank:]]+[0-9]{1,10}[[:blank:]]*$ ]]; then
-      err "invalid $key triple; tuning file unchanged"; return 1
-    fi
-    read -r min initial maximum <<<"$values"
-    min=$((10#$min)); initial=$((10#$initial)); maximum=$((10#$maximum))
-    if (( min <= 0 || min > initial || initial > maximum || initial > 67108864 )); then
-      err "invalid $key bounds; tuning file unchanged"; return 1
-    fi
-    if [[ "$key" == tcp_rmem ]]; then rmem="$min $initial"; else wmem="$min $initial"; fi
-  done
-  if ! cat > "$TUNE_CONF" <<EOF
-# OneVPS TCP tuning
-# Ceilings are not preallocated; preserve current minimum and initial buffers.
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = $rmem 67108864
-net.ipv4.tcp_wmem = $wmem 67108864
-# TFO requires application support; no universal speedup is guaranteed.
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-# Shared socket/backlog/port settings can also affect non-TCP traffic.
-net.ipv4.ip_local_port_range = 10000 65535
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.somaxconn = 8192
-# Unsent-data readiness threshold, not a hard cap on all send memory.
-net.ipv4.tcp_notsent_lowat = 131072
-EOF
-  then
-    err "cannot write $TUNE_CONF; tuning not applied"; return 1
-  fi
-  apply_sysctl_file "$TUNE_CONF" || return 1
-  ok "TCP tuning applied ($TUNE_CONF)"
-}
-
-optimize_system() {
-  echo; info "TCP optimization"
-  if [[ -f "$TUNE_CONF" ]]; then
-    info "TCP tuning configuration file exists ($TUNE_CONF); runtime state not verified"
-    if confirm "Re-apply (overwrite)?" n; then
-      write_tune_conf || err "TCP tuning failed; some settings may already be applied"
-    fi
-  else
-    if confirm "Apply TCP tuning (buffer ceilings, TFO, backlog)?" y; then
-      write_tune_conf || err "TCP tuning failed; some settings may already be applied"
-    fi
-  fi
-  pause
-}
-
-# ----------------------------------------------------------------------------
 # Service / uninstall
 # ----------------------------------------------------------------------------
 restart_service() {
@@ -2811,11 +2804,11 @@ node_menu() {
 
 network_menu() {
   while :; do
-    printf '\nService / network:\n1) Restart Xray service\n2) Enable BBR / show status\n3) TCP optimization\n0) Back\n'
+    printf '\nService / network:\n1) Restart Xray service\n2) Enable BBR / show status\n3) Set up HTTPS static site (403)\n0) Back\n'
     case "$(ask 'Select')" in
       1) restart_service ;;
       2) enable_bbr || { err 'BBR configuration failed; some settings may already be applied'; pause; } ;;
-      3) optimize_system ;;
+      3) setup_static_site || err 'Static site setup failed'; pause ;;
       0|"") return ;;
       *) warn 'invalid selection' ;;
     esac

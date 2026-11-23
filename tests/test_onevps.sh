@@ -838,69 +838,25 @@ MOCK_SERVICE_MODE=ok
 pass 'real menus add/link/select multiple/all/delete on both protocols'
 assert_file_jq "menu deletion preserves other users and removes all overrides" "$XRAY_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
 
-# Isolate all host tuning operations and paths, including child shells.
+printf '3\n0\n' > "$TEST_TMP/network-choices"
+assert_true 'network menu option 3 sets up a static site' bash -c '
+  source "$1"; exec 3< "$2"; pause() { :; }
+  ask() { local choice; read -r choice <&3; printf "%s\n" "$choice"; }
+  setup_static_site() { printf "SITE_SETUP\n"; }
+  output=$(network_menu)
+  [[ "$output" == *"3) Set up HTTPS static site (403)"*SITE_SETUP* ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/network-choices"
+
 (
-  TUNE_CONF="$TEST_TMP/tune.conf"
   BBR_CONF="$TEST_TMP/bbr.conf"
-  pause() { :; }
-  confirm() { return 0; }
-  MOCK_RMEM='4096 131072 6291456'
-  MOCK_WMEM='8192 262144 4194304'
-  MOCK_LOAD=0
-  MOCK_READ=0
+  pause() { :; }; confirm() { return 0; }
   sysctl() {
-    if [[ "$1" == -p ]]; then
-      [[ "$2" == "$TUNE_CONF" || "$2" == "$BBR_CONF" ]] || return 99
-      return "$MOCK_LOAD"
-    fi
-    case "$2" in
-      net.ipv4.tcp_rmem) printf '%s\n' "$MOCK_RMEM"; return "$MOCK_READ" ;;
-      net.ipv4.tcp_wmem) printf '%s\n' "$MOCK_WMEM"; return "$MOCK_READ" ;;
-      net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
-      net.core.default_qdisc) printf 'fq\n' ;;
+    case "$*" in
+      '-n net.ipv4.tcp_congestion_control') printf 'bbr\n' ;;
+      '-n net.core.default_qdisc') printf 'fq\n' ;;
       *) return 99 ;;
     esac
   }
-  write_tune_conf > "$TEST_TMP/tune-output"
-  command grep -qx 'net.ipv4.tcp_rmem = 4096 131072 67108864' "$TUNE_CONF" || exit 1
-  command grep -qx 'net.ipv4.tcp_wmem = 8192 262144 67108864' "$TUNE_CONF" || exit 1
-  if command grep -Eq 'swappiness|conntrack|slow_start_after_idle|fin_timeout' "$TUNE_CONF"; then exit 1; fi
-  cp "$TUNE_CONF" "$TEST_TMP/tune-original"
-  for MOCK_RMEM in 'garbage' '1 2' '1 2 3 4' '0 2 3' '4 2 6' '1 8 6' \
-    '1 67108865 99999999' '99999999999999999999999999 2 3' $'1 2 3\n1 2 3'; do
-    if write_tune_conf > "$TEST_TMP/tune-output" 2>&1; then exit 1; fi
-    cmp "$TUNE_CONF" "$TEST_TMP/tune-original" || exit 1
-  done
-  MOCK_RMEM='0004096 00087380 67108864'
-  write_tune_conf >/dev/null
-  command grep -qx 'net.ipv4.tcp_rmem = 4096 87380 67108864' "$TUNE_CONF" || exit 1
-  MOCK_WMEM='1 67108864 67108864'
-  write_tune_conf >/dev/null
-  MOCK_WMEM='invalid'
-  cp "$TUNE_CONF" "$TEST_TMP/tune-original"
-  if write_tune_conf >/dev/null 2>&1; then exit 1; fi
-  cmp "$TUNE_CONF" "$TEST_TMP/tune-original" || exit 1
-  MOCK_WMEM='8192 262144 4194304'
-  MOCK_READ=1
-  if write_tune_conf >/dev/null 2>&1; then exit 1; fi
-  cmp "$TUNE_CONF" "$TEST_TMP/tune-original" || exit 1
-  MOCK_READ=0
-  MOCK_LOAD=1
-  if write_tune_conf > "$TEST_TMP/tune-output" 2>&1; then exit 1; fi
-  if command grep -q 'TCP tuning applied' "$TEST_TMP/tune-output"; then exit 1; fi
-  optimize_system > "$TEST_TMP/tune-output" 2>&1
-  command grep -q 'configuration file exists' "$TEST_TMP/tune-output" || exit 1
-  command grep -q 'TCP tuning failed' "$TEST_TMP/tune-output" || exit 1
-  if command grep -q 'already applied' "$TEST_TMP/tune-output"; then exit 1; fi
-  MOCK_LOAD=0
-  TUNE_CONF="$TEST_TMP/nonexistent/tune.conf"
-  if write_tune_conf > "$TEST_TMP/tune-output" 2>&1; then exit 1; fi
-  if command grep -q 'TCP tuning applied' "$TEST_TMP/tune-output"; then exit 1; fi
-  # Missing sysctl must fail even inside an if (where errexit is disabled).
-  command() { if [[ "$*" == '-v sysctl' ]]; then return 1; fi; builtin command "$@"; }
-  if apply_sysctl_file "$TUNE_CONF" >/dev/null 2>&1; then exit 1; fi
-  unset -f command
-
   MOCK_QUEUE='qdisc fq 0: root refcnt 2'
   MOCK_QUERY=0
   MOCK_REPLACE=0
@@ -940,20 +896,7 @@ assert_file_jq "menu deletion preserves other users and removes all overrides" "
   [[ ! -s "$TEST_TMP/tc-calls" && ! -e "$BBR_CONF" ]] || exit 1
   bbr_status > "$TEST_TMP/bbr-status"
   command grep -q 'default qdisc: fq  interface qdisc: qdisc pfifo_fast' "$TEST_TMP/bbr-status" || exit 1
-) || fail 'isolated TCP tuning and qdisc safety regressions'
-pass 'isolated TCP tuning and qdisc safety regressions'
-
-# A direct call under ordinary set -e must stop before claiming success.
-if bash -c '
-  source "$1"
-  TUNE_CONF="$2"; BBR_CONF="$3"
-  sysctl() { if [[ "$1" == -n ]]; then printf "4096 65536 4194304\n"; else return 1; fi; }
-  write_tune_conf
-  printf "unreachable\n"
-' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/errexit-tune" "$TEST_TMP/errexit-bbr" > "$TEST_TMP/errexit-output" 2>&1; then
-  fail 'direct sysctl failure obeys errexit'
-fi
-assert_false 'failed direct call never reports success or continues' \
-  command grep -Eq 'TCP tuning applied|unreachable' "$TEST_TMP/errexit-output"
+) || fail 'BBR and qdisc safety regressions'
+pass 'BBR and qdisc safety regressions'
 
 printf '# %d tests passed\n' "$TEST_COUNT"

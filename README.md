@@ -50,7 +50,7 @@ Firewall allowances are retained to avoid disrupting other services.
 
 HY2 listens on IPv4 UDP and can share port 443 with Caddy's TCP listener.
 Allow the chosen UDP port in your provider security group as well as the host firewall.
-Do not publish an AAAA record for an IPv4-only endpoint. BBR/TCP tuning is not QUIC tuning.
+Do not publish an AAAA record for an IPv4-only endpoint. BBR does not tune QUIC.
 
 Menu **2 → 4** supports changing the UDP port, resetting the default password, managing users,
 selecting node/user outbounds, enabling/disabling and deleting the node. Updates use the
@@ -111,7 +111,7 @@ the same workflow on another supported host, and contribute fixes in one place.
 - **Secure defaults**: random UUIDs, X25519 keys, short IDs, and passwords
 - **Restricted routing**: blocks private address ranges and BitTorrent traffic
 - **Least-privilege service**: runs Xray as `nobody` with only the low-port bind capability
-- **Operations**: manages nodes and share links, restarts the service, enables BBR, and applies optional TCP tuning
+- **Operations**: manages nodes and share links, restarts the service, enables BBR, and hosts HTTPS static pages
 
 ## Supported Technologies
 
@@ -430,34 +430,27 @@ xray run -test -config /usr/local/etc/xray/config.json
 - amd64, arm64, or armv7 architecture
 - apt, dnf, yum, or zypper
 - `curl`, `jq`, `openssl`, and CA certificates; missing dependencies are installed automatically
-- Caddy for HY2 certificate management; it is installed automatically when required
+- Caddy for HTTPS static pages and HY2 certificates; it is installed automatically when required
 
 Support is best-effort because distribution releases, package repositories, Xray, and Caddy change independently.
 When reporting a compatibility problem, include the distribution, version, architecture, package manager, and
 sanitized command output.
 
-## BBR and TCP Tuning
+## Service and network
 
 Menu `5` → `2` enables BBR and writes `/etc/sysctl.d/99-bbr.conf`. Status distinguishes the default qdisc
 from the interface's actual queues. Existing fq is unchanged; only a single default `pfifo_fast` root
 (handle `0:`, without filters) is eligible for replacement. Custom, multiqueue, fq_codel and unknown layouts
 are preserved. The already-enabled BBR path does not change queues.
 
-Menu `5` → `3` writes optional TCP settings to `/etc/sysctl.d/99-onevps-tune.conf`:
+### HTTPS static site
 
-- Raises TCP buffer ceilings to `67108864`, preserving each current minimum and initial value after validation
-- Rejects unreadable/invalid triples or initial values above the target without overwriting the old file
-- Enables TCP Fast Open (requires application support) and MTU probing, and raises backlog limits
-- Sets the ephemeral port range to `10000-65535`; shared socket/backlog/port settings may affect non-TCP traffic
-- Uses `tcp_notsent_lowat` as an unsent-data readiness threshold, not a hard cap on all send memory
+Point a domain at the VPS and allow inbound TCP 80 and 443 in the cloud firewall. Choose **5 → 3**, then enter
+that domain. Caddy obtains and renews its TLS certificate. Once issued, visiting `https://your-domain` displays
+the static page with HTTP status `403`. Xray is not required.
 
-Buffer ceilings are not preallocated and these settings do not guarantee a speedup. A file's existence does
-not prove runtime activation. Failed writes or sysctl loads are reported; a failed load may partially apply
-settings and does not trigger an atomic rollback. Unsupported keys are reported as failures too.
-
-Swap creation, swappiness, journald limits, conntrack tuning, slow-start-after-idle and FIN timeout overrides
-are no longer part of this option. Existing swap, fstab and journald files are not removed, and previously
-applied runtime values are not reset to guessed defaults. Reapplying updates only OneVPS's tuning file.
+Edit `/var/lib/onevps/sites/<domain>/index.html` to customize the page. Running setup again preserves that file.
+If Reality or another service owns either TCP port, setup stops; it does not stop the service or change any node.
 
 OneVPS does not block UDP/443 by default. Private-address, BitTorrent and node/user outbound rules still apply.
 

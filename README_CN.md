@@ -39,7 +39,7 @@ Caddy、域名站点和证书。清理不用的域名前须人工确认没有其
 
 HY2 监听 IPv4 UDP，可与 Caddy 的 TCP 443 共用端口号。
 除主机防火墙外，还需在云安全组放行该端口。IPv4-only 端点不要配置 AAAA 记录。
-现有 BBR/TCP 优化不等于 QUIC 调优。
+BBR 不会调优 QUIC。
 
 菜单 **2 → 4** 支持修改 UDP 端口、重置默认密码、管理用户、节点/用户出站分流、启停和删除。
 更新复用配置校验、服务重启与失败回滚事务。菜单 **2 → 4/5** 输出正确编码的 `hysteria2://` 链接，
@@ -93,7 +93,7 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 - **安全默认值**：随机 UUID、X25519 密钥、short ID 和密码
 - **受限路由**：阻断私网地址和 BitTorrent 流量
 - **最小权限服务**：Xray 使用 `nobody` 运行，仅保留绑定低端口的能力
-- **运维能力**：节点与分享链接管理、服务重启、BBR 和可选 TCP 优化
+- **运维能力**：节点与分享链接管理、服务重启、BBR 和 HTTPS 静态页托管
 
 ## 支持的技术
 
@@ -383,31 +383,24 @@ xray run -test -config /usr/local/etc/xray/config.json
 - amd64、arm64 或 armv7 架构
 - apt、dnf、yum 或 zypper
 - `curl`、`jq`、`openssl` 和 CA 证书；缺失依赖会自动安装
-- HY2 使用 Caddy 管理证书；缺失时自动安装
+- HTTPS 静态页和 HY2 证书管理需要 Caddy；缺失时自动安装
 
 由于发行版、软件源、Xray 和 Caddy 会各自变化，兼容性支持按最大努力提供。报告兼容性问题时，请附发行版、版本、
 架构、包管理器和已脱敏的命令输出。
 
-## BBR 与 TCP 优化
+## 服务与网络
 
 菜单 `5` → `2` 启用 BBR，并写入 `/etc/sysctl.d/99-bbr.conf`。状态分别显示默认 qdisc 与网卡实际队列。
 已有 fq 不变；只有单一默认 `pfifo_fast` root（handle 为 `0:` 且无 filters）才允许替换。
 自定义、多队列、fq_codel 和未知布局会保留。BBR 已启用分支不会改变队列。
 
-菜单 `5` → `3` 将可选 TCP 设置写入 `/etc/sysctl.d/99-onevps-tune.conf`：
+### HTTPS 静态页
 
-- 将 TCP buffer 上限设为 `67108864`，校验后保留各自当前的最小值和初始值
-- 读取失败、三元组非法或初始值超过目标上限时拒绝操作，不覆盖旧配置
-- 启用 TCP Fast Open（需要应用配合）、MTU probing，并提高 backlog
-- 设置临时端口范围为 `10000-65535`；共享 socket、backlog 和端口设置可能同时影响非 TCP 流量
-- `tcp_notsent_lowat` 是未发送数据的就绪阈值，不是全部发送内存的硬上限
+将域名解析到 VPS，在云安全组放行 TCP 80 和 443，然后选择 **5 → 3** 并输入域名。Caddy 自动申请并续期证书。
+证书签发后，访问 `https://你的域名` 即可看到静态页，HTTP 状态码为 `403`。建站无需安装 Xray。
 
-缓冲上限不是预分配，这些设置不保证普遍提速。配置文件存在不代表运行时已生效。
-写入或 sysctl 加载失败会明确报告；加载失败可能已经部分生效，不执行原子回滚，不支持的键也报告为失败。
-
-此选项不再创建 swap，也不再设置 swappiness、journald 限额、conntrack、空闲后慢启动或 FIN timeout。
-不会删除现有 swap、fstab 或 journald 文件，也不会猜测系统默认值来重置历史运行参数。
-重新应用仅更新 OneVPS 自己的调优文件。
+编辑 `/var/lib/onevps/sites/<域名>/index.html` 即可自定义页面，重复建站会保留文件内容。
+如果 Reality 或其他服务占用这两个 TCP 端口中的任意一个，脚本会提示冲突并退出，不会停止服务或更改节点。
 
 OneVPS 默认不阻断 UDP/443。私网、BitTorrent 阻断和节点／用户出站规则仍然生效。
 
