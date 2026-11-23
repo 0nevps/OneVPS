@@ -157,8 +157,8 @@ rand_port() {
   local p
   while :; do
     p=$(( ( (RANDOM << 15) | RANDOM ) % 55535 + 10000 ))
-    port_taken_by_node "$p" 2>/dev/null && continue
-    port_in_use "$p" && continue
+    port_taken_by_node "$p" tcp 2>/dev/null && continue
+    port_in_use "$p" tcp && continue
     echo "$p"; return
   done
 }
@@ -320,27 +320,30 @@ install_xray() {
 # ----------------------------------------------------------------------------
 # Firewall / ports
 # ----------------------------------------------------------------------------
-open_port() {
-  local p="$1" proto="$2"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "$p/$proto" >/dev/null 2>&1 || true
+update_firewall_port() {
+  local action="$1" endpoint="$2/$3" state flag result=0
+  local -a args
+  if [[ "$action" == open ]]; then args=(allow); flag=--add-port; else args=(delete allow); flag=--remove-port; fi
+  if command -v ufw >/dev/null 2>&1; then
+    state=$(LC_ALL=C ufw status) || { err "Cannot read UFW status for $endpoint"; return 1; }
+    if [[ "$state" == 'Status: active'* ]] && ! ufw "${args[@]}" "$endpoint"; then
+      err "UFW failed to $action $endpoint"; result=1
+    fi
   fi
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$p/$proto" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if firewall-cmd --state >/dev/null 2>&1; then
+      if ! firewall-cmd --permanent "$flag=$endpoint" || ! firewall-cmd --reload; then
+        err "firewalld failed to $action $endpoint"; result=1
+      fi
+    elif [[ $? != 252 ]]; then
+      err "Cannot read firewalld status for $endpoint"; result=1
+    fi
   fi
+  return "$result"
 }
 
-close_port() {
-  local p="$1" proto="$2"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw delete allow "$p/$proto" >/dev/null 2>&1 || true
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --remove-port="$p/$proto" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-}
+open_port() { update_firewall_port open "$@"; }
+close_port() { update_firewall_port close "$@"; }
 
 port_in_use() {
   local p="$1" proto="${2:-both}" flags=-tunl
@@ -609,14 +612,6 @@ HTML
 ensure_nodes_file() {
   [[ ! -f "$XRAY_NODES" ]] || return 0
   mkdir -p "$XRAY_DIR" && echo '{"nodes":[]}' > "$XRAY_NODES"
-}
-
-jq_update_nodes() {
-  ensure_nodes_file || return 1
-  local t
-  t=$(mktemp)
-  jq "$@" "$XRAY_NODES" > "$t" && mv "$t" "$XRAY_NODES" || { rm -f "$t"; return 1; }
-  secure_xray_files
 }
 
 node_count() {
@@ -1416,7 +1411,7 @@ setup_static_site() (
   file=$(find_caddyfile)
   [[ -f "$file" && ! -L "$file" ]] || { err 'Missing or unsupported Caddyfile'; return 1; }
   caddy_domain_ensure "$domain" "$file" static || return 1
-  open_port 80 tcp; open_port 443 tcp
+  open_port 80 tcp && open_port 443 tcp || return 1
   ok "Static site configured: https://$domain (HTTP 403 after certificate issuance)"
   info "Edit $(caddy_site_root "$domain")/index.html; allow TCP 80/443 in your cloud firewall."
 )
@@ -1454,9 +1449,16 @@ caddy_sync_all() (
 
 caddy_sync_install() {
   local tmp
+  if [[ ! -f "$ONEVPS_SCRIPT_PATH" || ! -s "$ONEVPS_SCRIPT_PATH" ]]; then
+    err 'Certificate sync requires the complete onevps.sh file. Download it before running bash.'; return 1
+  fi
   mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
   tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
-  cat "$ONEVPS_SCRIPT_PATH" > "$tmp" && bash -n "$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || return 1
+  if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! grep -Fxq 'caddy_sync_all() (' "$tmp" ||
+     [[ $(tail -n 1 "$tmp") != 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi' ]] || ! bash -n "$tmp"; then
+    rm -f "$tmp"; err 'Incomplete OneVPS script; certificate sync runner not installed'; return 1
+  fi
+  chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || { rm -f "$tmp"; return 1; }
   cat > "$ACME_UNIT_DIR/onevps-caddy-sync.service" <<EOF_SERVICE
 [Unit]
 Description=Deploy Caddy certificates to OneVPS Xray
@@ -1487,7 +1489,7 @@ caddy_certificate_issue() (
   flock -n 9 || { err 'another Caddy certificate operation is running'; return 1; }
   file=$(find_caddyfile)
   caddy_domain_ensure "$domain" "$file" || return 1
-  open_port 80 tcp; open_port 443 tcp
+  open_port 80 tcp && open_port 443 tcp || return 1
   for ((i=0; i<30; i++)); do
     if caddy_sync_domain "$domain"; then return 0; fi
     sleep 2
@@ -1859,7 +1861,7 @@ add_hysteria_node() {
       port:$port,tls_cert:$cert,tls_key:$key,enabled:true} +
       (if $hopping == null then {} else {hopping:$hopping} end)') || return 1
   if apply_candidate_transaction prepare_hy2_change "$id" add "$node"; then
-    open_port "$port" udp
+    open_port "$port" udp || { err 'Node saved; check the host firewall before connecting'; pause; return; }
     ok 'Hysteria2 node added; allow the advertised UDP ports in your cloud firewall'
     node_link "$node"
   else
@@ -2014,6 +2016,28 @@ pick_reality_target() {
 # ----------------------------------------------------------------------------
 # [4] Add VLESS Reality node
 # ----------------------------------------------------------------------------
+prepare_reality_change() {
+  local source="$1" output="$2" id="$3" action="$4" value="${5:-null}"
+  validate_node_metadata "$source" || return 1
+  printf '%s\n' "$value" | jq --slurpfile source "$source" --arg id "$id" --arg action "$action" '
+    . as $value | $source[0] |
+    if $action == "add" then
+      if $value.type == "vless-reality" and $value.id == $id and all(.nodes[]; .id != $id)
+      then .nodes += [$value] else error("invalid Reality node") end
+    elif any(.nodes[]; .id == $id and .type == "vless-reality") then
+      if $action == "delete" then del(.nodes[] | select(.id == $id))
+      else (.nodes[] | select(.id == $id)) |=
+        if $action == "port" then .port=$value
+        elif $action == "toggle" then .enabled |= not
+        elif $action == "secrets" then .reality_private_key=$value.private | .reality_public_key=$value.public | .reality_short_id=$value.short
+        elif $action == "target" then .reality_sni=$value | .reality_target=$value | .reality_target_port=443
+        else error("unknown Reality change") end end
+    else error("unknown Reality node") end' > "$output" || return 1
+  validate_node_metadata "$output" || return 1
+  jq -e '[.nodes[] | select(.type=="vless-reality") | .port] |
+    all(.[]; type=="number" and floor==. and .>=1 and .<=65535) and length==(unique|length)' "$output" >/dev/null
+}
+
 add_reality_node() {
   require_xray
   ensure_nodes_file || return 1
@@ -2025,7 +2049,7 @@ add_reality_node() {
   id=$(openssl rand -hex 4)
 
   default_port=443
-  if port_taken_by_node "$default_port" || port_in_use "$default_port"; then
+  if port_taken_by_node "$default_port" tcp || port_in_use "$default_port" tcp; then
     default_port=$(rand_port)
   fi
 
@@ -2034,8 +2058,8 @@ add_reality_node() {
     [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
     port=$((10#$port))
     (( port >= 1 && port <= 65535 )) || { warn "port out of range"; continue; }
-    if port_taken_by_node "$port"; then warn "port $port already used by another node"; continue; fi
-    if port_in_use "$port"; then
+    if port_taken_by_node "$port" tcp; then warn "TCP port $port already used by another node"; continue; fi
+    if port_in_use "$port" tcp; then
       confirm "Port $port appears to be in use. Use anyway?" n || continue
     fi
     break
@@ -2069,17 +2093,12 @@ add_reality_node() {
       enabled: true
     }')
 
-  jq_update_nodes --argjson node "$node" '.nodes += [$node]' || return 1
-  open_port "$port" tcp
-
-  if rebuild_config; then
+  if apply_candidate_transaction prepare_reality_change "$id" add "$node"; then
+    open_port "$port" tcp || { err 'Node saved; check the host firewall before connecting'; pause; return; }
     ok "Reality node added"
-    node_link "$(node_by_id "$id")"
+    node_link "$node"
   else
-    err "config generation failed, rolled back"
-    jq_update_nodes --arg id "$id" 'del(.nodes[] | select(.id==$id))'
-    close_port "$port" tcp
-    rebuild_config || true
+    err 'Reality node not added'
   fi
   pause
 }
@@ -2229,7 +2248,7 @@ EOF
 }
 
 edit_port() {
-  local id="$1" n newp oldp proto=tcp
+  local id="$1" n newp oldp proto=tcp prepare=prepare_reality_change
   n=$(node_by_id "$id")
   [[ $(jq -r '.type' <<<"$n") != hysteria2 ]] || proto=udp
   while :; do
@@ -2247,18 +2266,13 @@ edit_port() {
     break
   done
   oldp=$(jq -r '.port' <<<"$n")
-  if [[ "$proto" == udp ]]; then
-    if apply_candidate_transaction prepare_hy2_change "$id" port "$newp"; then
-      [[ "$newp" == "$oldp" ]] || close_port "$oldp" udp
-      open_port "$newp" udp
-      ok "port changed to $newp"
-    else err 'port unchanged'; fi
-    pause; return
+  [[ "$proto" != udp ]] || prepare=prepare_hy2_change
+  if apply_candidate_transaction "$prepare" "$id" port "$newp"; then
+    if ! open_port "$newp" "$proto"; then err "Node port saved as $newp/$proto; check the firewall. The old rule was not removed."
+    elif [[ "$newp" != "$oldp" ]] && ! close_port "$oldp" "$proto"; then err "Node port saved as $newp/$proto; check the old firewall rule for $oldp/$proto"
+    else ok "port changed to $newp"; fi
+  else err 'port change failed'
   fi
-  jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p' || return 1
-  if [[ "$newp" != "$oldp" ]]; then close_port "$oldp" tcp; fi
-  open_port "$newp" tcp
-  rebuild_config && ok "port changed to $newp" || err "apply failed"
   pause
 }
 
@@ -2271,23 +2285,19 @@ reset_uuid() {
 }
 
 rotate_reality_secret() {
-  local id="$1" pk pubk sid
+  local id="$1" pk pubk sid secrets
   confirm "Rotate Reality keypair and shortId? Existing links for this node will stop working." n || return
-  read -r pk pubk < <(gen_x25519)
+  read -r pk pubk < <(gen_x25519) || { err 'key generation failed'; pause; return; }
   sid=$(rand_short_id)
-  jq_update_nodes --arg id "$id" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
-    (.nodes[]|select(.id==$id)) |=
-      (.reality_private_key=$pk | .reality_public_key=$pubk | .reality_short_id=$sid)' || return 1
-  rebuild_config && ok "Reality keypair rotated" || err "apply failed"
+  secrets=$(printf '%s\n' "$pk" "$pubk" "$sid" | jq -Rsc 'split("\n") | {private:.[0],public:.[1],short:.[2]}') || return 1
+  apply_candidate_transaction prepare_reality_change "$id" secrets "$secrets" && ok "Reality keypair rotated" || err "apply failed"
   pause
 }
 
 edit_reality_target() {
   local id="$1" target
   target=$(pick_reality_target)
-  jq_update_nodes --arg id "$id" --arg target "$target" '
-    (.nodes[]|select(.id==$id)) |= (.reality_sni=$target | .reality_target=$target | .reality_target_port=443)' || return 1
-  rebuild_config && ok "target changed to $target" || err "apply failed"
+  apply_candidate_transaction prepare_reality_change "$id" target "$(jq -Rn --arg target "$target" '$target')" && ok "target changed to $target" || err "apply failed"
   pause
 }
 
@@ -2300,32 +2310,26 @@ reset_hy2_password() {
 }
 
 toggle_enabled() {
-  local id="$1"
+  local id="$1" prepare=prepare_reality_change
   if [[ $(node_by_id "$id" | jq -r '.type') == hysteria2 ]]; then
-    apply_candidate_transaction prepare_hy2_change "$id" toggle && ok 'enabled state toggled' || err 'apply failed'
-    pause; return
+    prepare=prepare_hy2_change
   fi
-  jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)' || return 1
-  rebuild_config && ok "enabled state toggled" || err "apply failed"
+  apply_candidate_transaction "$prepare" "$id" toggle && ok 'enabled state toggled' || err 'apply failed'
   pause
 }
 
 del_node() {
-  local id="$1" n port type
+  local id="$1" n port type proto=tcp prepare=prepare_reality_change
   confirm "Delete this node?" n || return
   n=$(node_by_id "$id")
   port=$(jq -r '.port' <<<"$n")
   type=$(jq -r '.type' <<<"$n")
   if [[ "$type" == hysteria2 ]]; then
-    if apply_candidate_transaction prepare_hy2_change "$id" delete; then
-      close_port "$port" udp
-      ok 'deleted; externally managed certificate files were kept'
-    else err 'delete failed'; fi
-    pause; return
+    proto=udp; prepare=prepare_hy2_change
   fi
-  jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))' || return 1
-  close_port "$port" tcp
-  rebuild_config && ok "deleted" || err "apply failed"
+  if apply_candidate_transaction "$prepare" "$id" delete; then
+    close_port "$port" "$proto" && ok 'deleted' || err "Node deleted; check the firewall rule for $port/$proto"
+  else err 'delete failed'; fi
   pause
 }
 
@@ -2872,6 +2876,4 @@ main() {
   main_menu
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "$@"
-fi
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

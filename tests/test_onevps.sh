@@ -429,6 +429,54 @@ systemctl() {
 render_config "$XRAY_NODES" "$XRAY_CONF"
 chmod 640 "$XRAY_NODES"
 chmod 600 "$XRAY_CONF"
+(
+  pause() { :; }; confirm() { return 0; }; port_in_use() { return 1; }; ask() { echo 20001; }
+  TEST_TMP="$TEST_TMP/reality-lifecycle"; mkdir "$TEST_TMP" || exit 1
+  open_port() { printf 'open %s %s\n' "$@" >> "$TEST_TMP/fw"; }
+  close_port() { printf 'close %s %s\n' "$@" >> "$TEST_TMP/fw"; }
+  cp "$XRAY_NODES" "$TEST_TMP/reality-before"; cp "$XRAY_CONF" "$TEST_TMP/config-before"
+  for failure in validation restart; do
+    for operation in edit_port del_node; do
+      if [[ "$failure" == validation ]]; then MOCK_VALIDATE_FAIL=true; else
+        MOCK_VALIDATE_FAIL=false; MOCK_SERVICE_MODE=once; rm -f "$TEST_TMP/restart-failed"
+      fi
+      "$operation" a1b2c3d4 > "$TEST_TMP/reality-error" 2>&1
+      grep -q 'failed' "$TEST_TMP/reality-error" && cmp "$TEST_TMP/reality-before" "$XRAY_NODES" &&
+        cmp "$TEST_TMP/config-before" "$XRAY_CONF" && [[ ! -e "$TEST_TMP/fw" ]] || exit 1
+    done
+  done
+  MOCK_VALIDATE_FAIL=false; MOCK_SERVICE_MODE=ok
+  edit_port a1b2c3d4
+  [[ $(cat "$TEST_TMP/fw") == $'open 20001 tcp\nclose 443 tcp' ]] || exit 1
+  del_node a1b2c3d4
+  [[ $(tail -1 "$TEST_TMP/fw") == 'close 20001 tcp' ]] || exit 1
+  jq -e 'all(.nodes[]; .id!="a1b2c3d4")' "$XRAY_NODES" >/dev/null || exit 1
+  jq '.nodes |= map(select(.type=="hysteria2") | .port=443)' "$FIXTURE" > "$XRAY_NODES"
+  render_config "$XRAY_NODES" "$XRAY_CONF" || exit 1
+  ask() { case "$1" in 'Node name') echo mixed ;; 'Listen port') echo "$2" ;; *) return 1 ;; esac; }
+  ask_uuid() { echo '123e4567-e89b-12d3-a456-426614174099'; }; pick_reality_target() { echo example.org; }
+  gen_x25519() { echo 'fixture-private fixture-public'; }; pub_ip() { echo 192.0.2.20; }
+  add_reality_node > "$TEST_TMP/add-reality" || exit 1
+  jq -e '[.nodes[].port]==[443,443]' "$XRAY_NODES" >/dev/null || exit 1
+  cp "$TEST_TMP/reality-before" "$XRAY_NODES" && cp "$TEST_TMP/config-before" "$XRAY_CONF"
+) || fail 'Reality rollback, firewall ordering and shared TCP/UDP port'
+pass 'Reality rollback, firewall ordering and shared TCP/UDP port'
+(
+  ufw() { if [[ "$1" == status ]]; then printf 'Status: %s\n' "$ufw_state"; else return "$ufw_result"; fi; }
+  firewall-cmd() { case "$1" in --state) return "$daemon_status" ;; --reload) return "$reload_status" ;; *) return "$rule_status" ;; esac; }
+  ufw_state=inactive; ufw_result=1; daemon_status=252; reload_status=1; rule_status=1
+  open_port 443 tcp || exit 1
+  ufw_state=active
+  if close_port 443 udp 2> "$TEST_TMP/fw-error"; then exit 1; fi
+  grep -q 'UFW.*443/udp' "$TEST_TMP/fw-error" || exit 1
+  ufw_result=0; daemon_status=0
+  if open_port 443 tcp 2> "$TEST_TMP/fw-error"; then exit 1; fi
+  grep -q 'firewalld.*443/tcp' "$TEST_TMP/fw-error" || exit 1
+  rule_status=0
+  if open_port 443 tcp; then exit 1; fi
+  reload_status=0; open_port 443 tcp
+) || fail 'firewall backends distinguish inactive, failed and applied rules'
+pass 'firewall backends distinguish inactive, failed and applied rules'
 cp -p "$XRAY_NODES" "$TEST_TMP/before-nodes"
 cp -p "$XRAY_CONF" "$TEST_TMP/before-config"
 assert_true "transaction applies a node outbound" apply_outbound_assignment a1b2c3d4 <<<'{"mode":"direct"}'

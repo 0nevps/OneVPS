@@ -141,6 +141,17 @@ check 'timer syncs every minute' grep -q '^OnUnitActiveSec=1min' "$ACME_UNIT_DIR
 check 'runner dispatches Caddy sync' grep -q -- '--caddy-sync' "$CADDY_SYNC_RUNNER"
 check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
 (
+  cp "$CADDY_SYNC_RUNNER" "$TMP/working-runner"
+  ONEVPS_SCRIPT_PATH="$TMP/incomplete-script"
+  : > "$ONEVPS_SCRIPT_PATH"
+  reject 'empty source cannot replace sync runner' caddy_sync_install
+  sed '$d' "$ROOT_DIR/onevps.sh" > "$ONEVPS_SCRIPT_PATH"
+  reject 'syntactically valid truncated source rejected' caddy_sync_install
+  exec 7< <(cat "$ROOT_DIR/onevps.sh"); ONEVPS_SCRIPT_PATH=/dev/fd/7
+  reject 'pipe cannot replace sync runner' caddy_sync_install
+  check 'working runner preserved' cmp "$TMP/working-runner" "$CADDY_SYNC_RUNNER"
+)
+(
   CADDY_STATE="$TMP/setup-state"
   CADDYFILE="$TMP/setup-Caddyfile"
   printf ':80 {\n respond 200\n}\n' > "$CADDYFILE"

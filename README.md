@@ -147,7 +147,7 @@ assets, not this repository download.
 Convenience command for an already trusted environment:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
+(script=$(mktemp) && trap 'rm -f "$script"' EXIT && curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh -o "$script" && bash -n "$script" && bash "$script")
 ```
 
 The convenience command must be run from a root shell. On first use, select `1` to install or update Xray-core,
@@ -178,8 +178,9 @@ Danger zone:
 
 Option `6` (**Update script**) downloads OneVPS from the repository `main` branch after confirmation,
 checks Bash syntax, and starts the updated menu. No script version is displayed. A local script is replaced
-only after validation; a streamed launch uses a temporary script for the current session. Download or
-validation failures leave the current script unchanged. Updating the script does not update Xray or Realm.
+only after validation. The convenience command downloads a complete temporary file so certificate sync can install
+its runner. Download or validation failures leave the current script unchanged. Updating the script does not update
+Xray or Realm.
 
 ## Long-running operations
 

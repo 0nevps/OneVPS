@@ -126,7 +126,7 @@ sudo bash onevps.sh
 已确认环境可信时，也可使用便捷命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
+(script=$(mktemp) && trap 'rm -f "$script"' EXIT && curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh -o "$script" && bash -n "$script" && bash "$script")
 ```
 
 便捷命令需要在 root Shell 中运行。首次使用时先选 `1` 安装或更新 Xray-core，再选 `2 → 1` 添加 Reality，或选 `2 → 3` 添加 HY2。
@@ -155,7 +155,7 @@ Danger zone:
 ```
 
 菜单 `6`（**Update script**）确认后从仓库 `main` 分支下载 OneVPS，检查 Bash 语法并启动更新后的菜单，
-不显示脚本版本号。本地脚本通过校验后才替换；通过管道式便捷命令启动时，使用临时脚本更新当前会话。
+不显示脚本版本号。本地脚本通过校验后才替换；便捷命令会先完整下载到临时文件，供证书同步功能安装定时任务。
 下载或校验失败不会修改当前脚本。更新脚本不会升级 Xray 或 Realm。
 
 ## 耗时操作反馈
