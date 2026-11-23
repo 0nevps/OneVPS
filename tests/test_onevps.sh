@@ -391,6 +391,26 @@ MOCK_VALIDATE_FAIL=false
 validate_xray_config() { ! $MOCK_VALIDATE_FAIL; }
 SERVICE_STATE="$TEST_TMP/service-state"
 printf 'active\n' > "$SERVICE_STATE"
+(
+  pause() { :; }
+  systemctl() {
+    case "$1" in
+      restart) echo restart >> "$TEST_TMP/menu-restarts"; return "$restart_status" ;;
+      is-active) return "$active_status" ;;
+      *) return 0 ;;
+    esac
+  }
+  restart_status=0; active_status=0
+  restart_service > "$TEST_TMP/restart-output" || exit 1
+  [[ $(wc -l < "$TEST_TMP/menu-restarts") -eq 1 ]] || exit 1
+  for failure in restart inactive; do
+    if [[ "$failure" == restart ]]; then restart_status=1; else restart_status=0; active_status=1; fi
+    if restart_service > "$TEST_TMP/restart-output" 2>&1; then exit 1; fi
+    if grep -q '\[+\].*restarted' "$TEST_TMP/restart-output"; then exit 1; fi
+  done
+  [[ $(wc -l < "$TEST_TMP/menu-restarts") -eq 3 ]]
+) || fail 'restart action restarts once and propagates service failures'
+pass 'restart action restarts once and propagates service failures'
 MOCK_SERVICE_MODE=ok
 systemctl() {
   case "$1" in

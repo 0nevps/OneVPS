@@ -8,7 +8,6 @@ trap 'rm -rf "$TMP"' EXIT
 CADDY_STATE="$TMP/caddy-state"
 ACME_CERT_DIR="$TMP/certs"
 # shellcheck disable=SC2034
-# shellcheck disable=SC2034
 ACME_UNIT_DIR="$TMP/units"
 XRAY_NODES="$TMP/nodes.json"
 XRAY_CONF="$TMP/xray.json"
@@ -27,7 +26,6 @@ chown() { :; }
 systemctl() { printf '%s\n' "$*" >> "$TMP/systemctl"; return 0; }
 open_port() { printf '%s\n' "$*" >> "$TMP/ports"; }
 port_in_use() { return 1; }
-socat() { :; }
 validate_xray_config() { return 0; }
 # Production uses GNU mv -T. Emulate only the symlink replacement on macOS.
 if [[ $(uname -s) == Darwin ]]; then
@@ -75,6 +73,11 @@ check 'initialize owned Caddy state' caddy_state_init
 caddy_storage_root() { echo "$TMP/storage"; }
 caddy_site_root() { echo "$TMP/sites/$1"; }
 caddy_reload() { return "${RELOAD_STATUS:-0}"; }
+ADAPTED_CONFIG='{}'
+caddy() {
+  [[ "$1" == adapt ]] || return 1
+  printf '%s\n' "$ADAPTED_CONFIG"
+}
 printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
 (
   CADDYFILE="$TMP/menu-Caddyfile"; printf ':80 {\n respond 200\n}\n' > "$CADDYFILE"
@@ -114,8 +117,15 @@ check 'second certificate domain created' caddy_domain_ensure other.example.com 
 check 'existing custom index preserved' cmp "$TMP/custom-index" "$TMP/sites/other.example.com/index.html"
 printf '\nexternal.example.com {\n respond 200\n}\n' >> "$CADDYFILE"
 cp "$CADDYFILE" "$TMP/before-domain-failure"
+ADAPTED_CONFIG='{"apps":{"http":{"servers":{"web":{"routes":[{"match":[{"host":["external.example.com","*.wild.example.com"]}]}]}}}}}'
 reject 'unknown site not overwritten' caddy_domain_ensure external.example.com "$CADDYFILE"
+reject 'matching wildcard site not shadowed' caddy_domain_ensure one.wild.example.com "$CADDYFILE"
 check 'external site is untouched' cmp "$CADDYFILE" "$TMP/before-domain-failure"
+(
+  caddy() { return 1; }
+  reject 'failed Caddy adaptation stops setup' caddy_domain_ensure inspect.example.com "$CADDYFILE" static
+  check 'unreadable routes leave file intact' cmp "$CADDYFILE" "$TMP/before-domain-failure"
+)
 RELOAD_STATUS=1
 reject 'failed domain reload' caddy_domain_ensure failed.example.com "$CADDYFILE"
 check 'failed domain reload restores file' cmp "$CADDYFILE" "$TMP/before-domain-failure"
@@ -158,9 +168,20 @@ check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
 
 if [[ -n ${CADDY_TEST_BIN:-} ]]; then
   (
+    caddy() { "$CADDY_TEST_BIN" "$@"; }
     CADDYFILE="$TMP/https-Caddyfile"
     port=$(python3 -c 'import socket; sock=socket.socket(); sock.bind(("127.0.0.1",0)); print(sock.getsockname()[1])')
     printf '{\n admin off\n auto_https disable_redirects\n https_port %s\n}\n' "$port" > "$CADDYFILE"
+    (
+      fixture="$TMP/domain-match-Caddyfile"
+      printf '# live.example.com\nimport imported-sites\n' > "$fixture"
+      printf 'sub.live.example.com, *.private.example.com {\n respond "live.example.com"\n}\n' > "$TMP/imported-sites"
+      reject 'imported exact site name blocks setup' caddy_domain_ensure sub.live.example.com "$fixture" static
+      reject 'imported wildcard blocks matching name' caddy_domain_ensure app.private.example.com "$fixture" static
+      check 'wildcard does not match multiple labels' caddy_domain_ensure deep.app.private.example.com "$fixture" static
+      CADDY_STATE="$TMP/domain-match-state"; caddy_state_init static
+      check 'comment, body and subdomain do not reserve parent' caddy_domain_ensure live.example.com "$fixture" static
+    )
     check 'generate real static site' caddy_domain_ensure live.example.com "$CADDYFILE" static
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=live.example.com \
       -addext subjectAltName=DNS:live.example.com -keyout "$TMP/live.key" -out "$TMP/live.crt" >/dev/null 2>&1

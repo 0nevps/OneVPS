@@ -516,9 +516,9 @@ find_caddyfile() {
   local c
   c=$(systemctl cat caddy 2>/dev/null \
       | sed -n 's/.*--config[ =]\([^ ]*\).*/\1/p' | head -n1)
-  if [[ -n "$c" && -f "$c" ]]; then CADDYFILE="$c"; echo "$c"; return; fi
+  if [[ -n "$c" && -f "$c" ]]; then echo "$c"; return; fi
   for c in /etc/caddy/Caddyfile /etc/Caddyfile /usr/local/etc/caddy/Caddyfile; do
-    [[ -f "$c" ]] && { CADDYFILE="$c"; echo "$c"; return; }
+    [[ -f "$c" ]] && { echo "$c"; return; }
   done
   echo ""
 }
@@ -964,10 +964,12 @@ rebuild_config() {
   fi
   rm -f "$chk_err"
 
-  mv "$tmp_conf" "$XRAY_CONF"
-  secure_xray_files
+  mv "$tmp_conf" "$XRAY_CONF" || { rm -f "$tmp_conf"; return 1; }
+  secure_xray_files || return 1
   if [[ -x "$XRAY_BIN" ]]; then
-    run_with_progress 'Restarting Xray service' systemctl restart xray || true
+    run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || {
+      err 'Xray did not restart successfully'; return 1;
+    }
   fi
 }
 
@@ -1327,7 +1329,7 @@ caddy_tcp_https() {
 }
 
 caddy_domain_ensure() {
-  local domain="$1" file="$2" mode="${3:-certificate}" backup root site_root record static_record
+  local domain="$1" file="$2" mode="${3:-certificate}" backup site_root record static_record occupied
   acme_domain_valid "$domain" || return 1
   record="$CADDY_STATE/domains/$domain.json"
   static_record="$CADDY_STATE/sites/$domain.json"
@@ -1340,18 +1342,24 @@ caddy_domain_ensure() {
       grep -qxF "$domain {" "$file" || return 1
     ensure_site_content "$domain" || return 1
     if [[ "$mode" == certificate && ! -f "$record" ]]; then
-      root=$(caddy_storage_root "$file") || return 1
-      jq --arg root "$root" '.storage_root=$root' "$existing" > "$record.next" && mv "$record.next" "$record" || return 1
+      caddy_storage_root "$file" >/dev/null || return 1
+      jq '{caddy_file}' "$existing" > "$record.next" && mv "$record.next" "$record" || return 1
     fi
     return 0
   fi
-  if grep -qiF "$domain" "$file"; then err "unmanaged domain already appears in Caddyfile: $domain"; return 1; fi
+  occupied=$(caddy adapt --adapter caddyfile --config "$file" | jq -er --arg domain "$domain" '
+    def covers($name): ascii_downcase | rtrimstr(".") | split(".") as $pattern |
+      ($name | split(".")) as $labels | ($pattern | length) == ($labels | length) and
+      all(range(0; $labels | length); . as $idx | $pattern[$idx] == "*" or $pattern[$idx] == $labels[$idx]);
+    any(.apps.http.servers[]?.routes[]? | recurse(.handle[]?.routes[]?) | .match[]?.host[]?; covers($domain)) | tostring') || {
+    err 'Cannot inspect existing Caddy routes'; return 1;
+  }
+  if [[ "$occupied" == true ]]; then err "unmanaged Caddy route already matches $domain"; return 1; fi
   if [[ "$mode" == static ]]; then
     mkdir -p "$CADDY_STATE/sites" || return 1
     record="$static_record"
-    root=''
   else
-    root=$(caddy_storage_root "$file") || return 1
+    caddy_storage_root "$file" >/dev/null || return 1
   fi
   site_root=$(caddy_site_root "$domain")
   ensure_site_content "$domain" || return 1
@@ -1375,7 +1383,7 @@ EOF_SITE
   if ! caddy_reload "$file"; then
     cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup"; return 1
   fi
-  if ! jq -n --arg file "$file" --arg root "$root" '{caddy_file:$file} + (if $root=="" then {} else {storage_root:$root} end)' > "$record"; then
+  if ! jq -n --arg file "$file" '{caddy_file:$file}' > "$record"; then
     cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup" "$record"; return 1
   fi
   rm -f "$backup"
@@ -2432,8 +2440,8 @@ EOF
 # ----------------------------------------------------------------------------
 restart_service() {
   require_xray
-  rebuild_config
-  run_with_progress 'Restarting Xray service' systemctl restart xray && ok "restarted" || err "restart failed"
+  rebuild_config || return 1
+  ok "restarted"
   systemctl --no-pager -l status xray 2>/dev/null | head -n 8 || true
   pause
 }
@@ -2806,7 +2814,7 @@ network_menu() {
   while :; do
     printf '\nService / network:\n1) Restart Xray service\n2) Enable BBR / show status\n3) Set up HTTPS static site (403)\n0) Back\n'
     case "$(ask 'Select')" in
-      1) restart_service ;;
+      1) restart_service || { err 'Xray restart failed'; pause; } ;;
       2) enable_bbr || { err 'BBR configuration failed; some settings may already be applied'; pause; } ;;
       3) setup_static_site || err 'Static site setup failed'; pause ;;
       0|"") return ;;
