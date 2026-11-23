@@ -43,7 +43,21 @@ HY2 监听 IPv4 UDP，可与 Caddy 的 TCP 443 共用端口号。
 
 菜单 **2 → 4** 支持修改 UDP 端口、重置默认密码、管理用户、节点/用户出站分流、启停和删除。
 更新复用配置校验、服务重启与失败回滚事务。菜单 **2 → 4/5** 输出正确编码的 `hysteria2://` 链接，
-不关闭 TLS 校验。现有上游协议类型不变；本次不包含 HY2 上游导入、混淆或端口跳跃。
+不关闭 TLS 校验。不支持 HY2 上游导入或混淆。
+
+### 可选：UDP 端口跳跃
+
+创建 HY2 时，“Public UDP hopping ports”留空即保持单端口；要启用，请输入至少两个公网 UDP 端口，
+例如 `20000-20100,21000`，再填写公网入接口名（例如 `eth0`）。通过 **2 → 4 → 选择 HY2 节点 → 3**
+可替换列表或留空关闭。修改后，各用户需重新导入分享链接，例如
+`hysteria2://PASSWORD@example.com:20000-20100,21000/?sni=example.com`。跳跃间隔由客户端设置。
+
+Xray 仍只监听一个 UDP 端口（如 `443`），跳跃范围须与监听端口分开。主机需安装 `nftables`；云安全组和
+NAT 前的过滤规则须放行公网跳跃端口，主机 INPUT 防火墙须放行重定向后的监听端口。
+不要使用其他服务或 NAT 规则预留的端口；同号 TCP 不受影响。
+脚本仅重定向指定入接口上、目的地址为本机的 IPv4 UDP 流量，使用专属 nftables 表 `ip onevps_hy2_hop`，
+由 `onevps-hy2-hop.service` 开机恢复。停用节点或关闭跳跃会移除该节点的规则，重新启用节点会恢复已配置的跳跃。
+没有启用跳跃的节点时，移除专属表和启动单元。详见[官方端口跳跃指南](https://v2.hysteria.network/docs/advanced/Port-Hopping/)。
 
 实现依据：[Xray 入站文档](https://xtls.github.io/en/config/inbounds/hysteria.html)、
 [QUIC 传输文档](https://xtls.github.io/en/config/transports/hysteria.html)、

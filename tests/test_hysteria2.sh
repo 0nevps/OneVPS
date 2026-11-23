@@ -17,6 +17,25 @@ check 'per-user route generated' jq -e 'any(.routing.rules[]; .user? == ["WyJoeT
 link=$(node_link "$node")
 [[ "$link" == *'hysteria2://default%2Bpass%3A%40@localhost:24443/?sni=localhost#HY2%20%2F%20test'* && "$link" != *insecure* ]] || fail 'encoded secure share link'
 check 'additional user share link' bash -c '[[ "$1" == *"hysteria2://alice-secret@"* ]]' _ "$(node_user_link "$node" alice)"
+hop='{"ports":"21000,22000-22002","interface":"eth0"}'
+check 'store hopping without changing listener' prepare_hy2_change "$TEST_TMP/nodes.json" "$TEST_TMP/hop.json" hy2 hopping "$hop"
+hop_node=$(jq -c '.nodes[0]' "$TEST_TMP/hop.json")
+for client in default alice; do
+  [[ $(node_user_link "$hop_node" "$client") == *'@localhost:21000,22000-22002/?sni=localhost#'* ]] || fail 'multi-port URI'
+done
+check 'Xray still has one listener' jq -e '.port == 24443 and .protocol == "hysteria"' <<<"$(build_hysteria_inbound "$hop_node")"
+for bad_ports in '0,1' '3,65536' '1,01' '1,2-1' '1,1' '24442-24443' '1-8,8-10' '1-2,,3' '3-3' '1,$port' $'1,2\n'; do
+  reject "invalid hopping ports: $bad_ports" prepare_hy2_change "$TEST_TMP/nodes.json" "$TEST_TMP/bad.json" hy2 hopping \
+    "$(jq -c --arg ports "$bad_ports" '.ports=$ports' <<<"$hop")"
+done
+for iface in lo 'eth*' 'bad"name'; do
+  reject 'invalid ingress interface' prepare_hy2_change "$TEST_TMP/nodes.json" "$TEST_TMP/bad.json" hy2 hopping \
+    "$(jq -c --arg iface "$iface" '.interface=$iface' <<<"$hop")"
+done
+reject 'another node cannot claim hopping port' prepare_hy2_change "$TEST_TMP/hop.json" "$TEST_TMP/bad.json" other add \
+  "$(jq -c '.id="other" | .port=22001 | .enabled=false' <<<"$node")"
+check 'turn hopping off' prepare_hy2_change "$TEST_TMP/hop.json" "$TEST_TMP/plain.json" hy2 hopping null
+check 'off restores plain node' jq -e --argjson node "$node" '.nodes == [$node]' "$TEST_TMP/plain.json"
 for field in password domain tls_cert tls_key; do
   jq --arg field "$field" '.nodes[0][$field]=""' "$TEST_TMP/nodes.json" > "$TEST_TMP/bad.json"
   reject "reject empty $field" validate_node_metadata "$TEST_TMP/bad.json"
@@ -83,6 +102,48 @@ check 'metadata restored' cmp "$XRAY_NODES" "$TEST_TMP/before.json"
 check 'config restored' cmp "$XRAY_CONF" "$TEST_TMP/config.json"
 unset -f systemctl
 systemctl() { return 0; }
+(
+  HY2_HOP_DIR="$TEST_TMP/hop-state"; HY2_HOP_UNIT="$TEST_TMP/hop.service"
+  mkdir "$TEST_TMP/bin"; PATH="$TEST_TMP/bin:$PATH"
+  printf '#!/bin/sh\nexit 0\n' > "$TEST_TMP/bin/nft"; chmod +x "$TEST_TMP/bin/nft"
+  ip() { return 0; }; ss() { printf '%s' "${SOCKETS:-}"; }
+  nft() {
+    if [[ "$1" == list ]]; then
+      if [[ -f "$TEST_TMP/live-table" ]]; then cat "$TEST_TMP/live-table"; fi
+    elif [[ "$1" == -j ]]; then
+      printf '{"nftables":[{"table":{"family":"ip","name":"onevps_hy2_hop","comment":"Managed by OneVPS"}}]}\n'
+    elif [[ "$1" == -f ]]; then
+      if [[ -e "$TEST_TMP/fail-nft" ]]; then rm "$TEST_TMP/fail-nft"; return 1; fi
+      if grep -q 'redirect to' "$2"; then printf 'table ip onevps_hy2_hop\n  comment "Managed by OneVPS"\n' > "$TEST_TMP/live-table"
+      else rm -f "$TEST_TMP/live-table"; fi
+    fi
+  }
+  SOCKETS='UNCONN 0 0 0.0.0.0:22002 0.0.0.0:*'
+  reject 'occupied UDP range rejected before apply' apply_candidate_transaction prepare_hy2_change hy2 hopping "$hop"
+  unset SOCKETS
+  echo 'table ip onevps_hy2_hop' > "$TEST_TMP/live-table"
+  reject 'refuse a foreign table before changing files' apply_candidate_transaction prepare_hy2_change hy2 hopping "$hop"
+  [[ ! -e "$HY2_HOP_DIR" && -s "$TEST_TMP/live-table" ]] || fail 'foreign table modified'
+  rm "$TEST_TMP/live-table"
+  check 'install persistent forwarding' apply_candidate_transaction prepare_hy2_change hy2 hopping "$hop"
+  check 'scoped local IPv4 forwarding' grep -Fq 'iifname "eth0" fib daddr type local udp dport { 21000,22000-22002 } counter redirect to :24443' "$HY2_HOP_DIR/rules.nft"
+  check 'service restores rules on boot' grep -Fq "$HY2_HOP_DIR/rules.nft" "$HY2_HOP_UNIT"
+  touch "$TEST_TMP/fail-nft"
+  reject 'nft failure rolls back changed listener' apply_candidate_transaction prepare_hy2_change hy2 port 24444
+  check 'previous listener restored' jq -e '.nodes[0].port==24443' "$XRAY_NODES"
+  check 'previous rules restored' grep -q 'redirect to :24443' "$HY2_HOP_DIR/rules.nft"
+  touch "$TEST_TMP/fail-nft"
+  reject 'failed disable restores active rules' apply_candidate_transaction prepare_hy2_change hy2 toggle
+  check 'failed disable leaves node enabled' jq -e '.nodes[0].enabled' "$XRAY_NODES"
+  check 'change listener updates redirect' apply_candidate_transaction prepare_hy2_change hy2 port 24444
+  check 'new redirect target' grep -q 'redirect to :24444' "$HY2_HOP_DIR/rules.nft"
+  check 'disable removes rules' apply_candidate_transaction prepare_hy2_change hy2 toggle
+  [[ ! -e "$TEST_TMP/live-table" && ! -e "$HY2_HOP_UNIT" ]] || fail 'disable cleanup'
+  check 'enable restores rules' apply_candidate_transaction prepare_hy2_change hy2 toggle
+  check 'delete hopping node' apply_candidate_transaction prepare_hy2_change hy2 delete
+  [[ ! -e "$TEST_TMP/live-table" && ! -e "$HY2_HOP_DIR" ]] || fail 'delete cleanup'
+)
+cp "$TEST_TMP/before.json" "$XRAY_NODES"; cp "$TEST_TMP/config.json" "$XRAY_CONF"
 pause() { :; }
 confirm() { return 0; }
 open_port() { printf 'open %s %s\n' "$@" >> "$TEST_TMP/firewall"; }
@@ -108,6 +169,7 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
   ask() {
     case "$1" in
       'Node name') printf 'Created from menu\n' ;;
+      'Public UDP hopping'*) printf '\n' ;;
       'TLS domain') printf 'node.example.com\n' ;;
       'UDP listen port'*) printf '24445\n' ;;
       'Password'*) printf 'new-menu-password\n' ;;
@@ -122,6 +184,7 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
   ask() {
     case "$1" in
       'Node name') printf 'Automatic HY2\n' ;;
+      'Public UDP hopping'*) printf '\n' ;;
       'TLS domain') printf 'node.example.com\n' ;;
       'UDP listen port'*) printf '24445\n' ;;
       'Password'*) printf 'auto-password\n' ;;

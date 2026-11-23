@@ -27,6 +27,8 @@ REALM_BIN=/usr/local/bin/onevps-realm
 REALM_SERVICE=/etc/systemd/system/onevps-realm.service
 REALM_VERSION=v2.9.6
 HY2_MIN_VERSION=26.10.21
+HY2_HOP_DIR=/etc/onevps-hy2-hop
+HY2_HOP_UNIT=/etc/systemd/system/onevps-hy2-hop.service
 ACME_CERT_DIR=/etc/onevps-certs
 ACME_UNIT_DIR=/etc/systemd/system
 
@@ -355,8 +357,10 @@ port_in_use() {
 port_taken_by_node() {
   [[ -f "$XRAY_NODES" ]] || return 1
   jq -e --argjson p "$1" --arg proto "${2:-both}" --arg exclude "${3:-}" '
-    .nodes[] | select(.port == $p and .id != $exclude) |
-    select($proto == "both" or (if .type == "hysteria2" then "udp" else "tcp" end) == $proto)
+    any(.nodes[]; .id != $exclude and
+      ($proto == "both" or (if .type == "hysteria2" then "udp" else "tcp" end) == $proto) and
+      (.port == $p or (.hopping != null and any(.hopping.ports | split(",")[] | split("-") | map(tonumber);
+        first <= $p and last >= $p))))
   ' "$XRAY_NODES" >/dev/null 2>&1
 }
 
@@ -975,6 +979,7 @@ node_clients() {
 
 validate_node_metadata() {
   local outbounds outbound
+  hy2_hop_plan "$1" >/dev/null || return 1
   outbounds=$(jq -c '.nodes[] | (select(has("outbound")) | .outbound), (select(has("default_outbound")) | .default_outbound), ((.users // [])[] | select(has("outbound")) | .outbound)' "$1" 2>/dev/null) || return 1
   while IFS= read -r outbound; do
     [[ -n "$outbound" ]] || continue
@@ -1019,7 +1024,7 @@ apply_candidate_transaction() (
   local prepare="$1"
   shift
   umask 077
-  local tx active=false touched=false committed=false preserve=false
+  local tx active=false touched=false committed=false preserve=false hop_changed=false hop_touched=false
   [[ -x "$XRAY_BIN" && -f "$XRAY_NODES" && -f "$XRAY_CONF" ]] || {
     err "installed Xray and existing configuration required"; return 1;
   }
@@ -1030,6 +1035,7 @@ apply_candidate_transaction() (
     if $touched && ! $committed; then
       cp -p "$tx/nodes.backup" "$XRAY_NODES" || failed=true
       cp -p "$tx/config.backup" "$XRAY_CONF" || failed=true
+      if $hop_touched; then hy2_hop_apply "$tx/hop.before" || failed=true; fi
       if $active; then
         run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || failed=true
       else
@@ -1056,6 +1062,11 @@ apply_candidate_transaction() (
   if ! validate_xray_config "$tx/config.json" "$tx/check.log"; then
     err "candidate Xray validation failed"; return 1
   fi
+  hy2_hop_plan "$XRAY_NODES" > "$tx/hop.before" && hy2_hop_plan "$tx/nodes.json" > "$tx/hop.after" || return 1
+  if ! cmp -s "$tx/hop.before" "$tx/hop.after"; then
+    hop_changed=true
+    hy2_hop_preflight "$tx/hop.after" || return 1
+  fi
   cp -p "$XRAY_NODES" "$tx/nodes.backup" || return 1
   cp -p "$XRAY_CONF" "$tx/config.backup" || return 1
   # Copy attributes from each original before filling replacement contents.
@@ -1066,6 +1077,10 @@ apply_candidate_transaction() (
   mv -f "$tx/nodes.next" "$XRAY_NODES" || return 1
   mv -f "$tx/config.next" "$XRAY_CONF" || return 1
   run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || return 1
+  if $hop_changed; then
+    hop_touched=true
+    hy2_hop_apply "$tx/hop.after" || return 1
+  fi
   committed=true
 )
 
@@ -1590,6 +1605,129 @@ validate_hy2_pem() {
   [[ "$cert_pub" == "$key_pub" ]] || { err 'certificate and unencrypted private key do not match'; return 1; }
 }
 
+hy2_hop_plan() {
+  jq -r '
+    def ranges: split(",") | map(split("-") | map(tonumber) | [first,last]);
+    [.nodes[] | select(has("hopping")) | . as $node | .hopping |
+      if $node.type != "hysteria2" or (.interface | type != "string" or
+          (test("^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,14}\\z") | not) or . == "lo") or
+         (.ports | type != "string" or (test("^[1-9][0-9]{0,4}(-[1-9][0-9]{0,4})?(,[1-9][0-9]{0,4}(-[1-9][0-9]{0,4})?)*\\z") | not))
+      then error("invalid HY2 hopping interface or port list") else . end |
+      (.ports | ranges) as $ranges |
+      if any($ranges[]; .[0] > .[1] or .[1] > 65535) or
+         ([$ranges[] | .[1] - .[0] + 1] | add) < 2 then error("invalid HY2 hopping range") else . end |
+      {interface,ports, ranges:$ranges, target:$node.port, enabled:$node.enabled}] as $hops |
+    if ($hops | length) > 0 then
+      ([.nodes[] | select(.type == "hysteria2") | [.port,.port]] + [$hops[].ranges[]] | sort) as $all |
+      if any(range(1; $all|length); . as $idx | $all[$idx][0] <= $all[$idx-1][1])
+      then error("overlapping HY2 listening or hopping ports") else
+        $hops[] | select(.enabled) | [.interface,.ports,.target] | @tsv end
+    else empty end' "$1"
+}
+
+hy2_hop_rules() {
+  local iface ports target
+  printf '%s\n' 'table ip onevps_hy2_hop {' '  comment "Managed by OneVPS"' \
+    '  chain ingress {' '    type nat hook prerouting priority dstnat; policy accept;'
+  while IFS=$'\t' read -r iface ports target; do
+    printf '    iifname "%s" fib daddr type local udp dport { %s } counter redirect to :%s\n' "$iface" "$ports" "$target"
+  done < "$1"
+  printf '%s\n' '  }' '}'
+}
+
+hy2_hop_owned() {
+  [[ ! -L "$HY2_HOP_DIR" && ! -L "$HY2_HOP_UNIT" ]] &&
+    { [[ ! -e "$HY2_HOP_DIR" ]] || [[ -f "$HY2_HOP_DIR/.onevps-managed" ]]; } &&
+    { [[ ! -e "$HY2_HOP_UNIT" ]] || grep -qxF '# Managed by OneVPS HY2' "$HY2_HOP_UNIT"; } || {
+    err 'refusing to overwrite unmanaged HY2 hopping files'; return 1;
+  }
+}
+
+hy2_hop_table_delete_rule() {
+  local tables
+  command -v nft >/dev/null || { err 'HY2 hopping requires nft (install nftables)'; return 1; }
+  tables=$(nft list tables) || return 1
+  if grep -Fxq 'table ip onevps_hy2_hop' <<<"$tables"; then
+    if [[ ! -f "$HY2_HOP_DIR/.onevps-managed" ]] || ! nft -j list table ip onevps_hy2_hop |
+      jq -e 'any(.nftables[].table?; .family=="ip" and .name=="onevps_hy2_hop" and .comment=="Managed by OneVPS")' >/dev/null; then
+      err 'nft table ip onevps_hy2_hop is not owned by OneVPS'; return 1;
+    fi
+    printf 'delete table ip onevps_hy2_hop\n'
+  fi
+}
+
+hy2_hop_preflight() {
+  local iface ports target sockets occupied relay_ports
+  hy2_hop_owned && hy2_hop_table_delete_rule >/dev/null || return 1
+  [[ -s "$1" ]] || return 0
+  sockets=$(ss -H -uan) || return 1
+  occupied=$(awk '{print $4}' <<<"$sockets") || return 1
+  if [[ -f "$REALM_DIR/config.json" ]]; then
+    relay_ports=$(jq -r '.endpoints[] | select(.network.use_udp) | .listen' "$REALM_DIR/config.json") || return 1
+    occupied+=$'\n'"$relay_ports"
+  fi
+  while IFS=$'\t' read -r iface ports target; do
+    ip link show dev "$iface" >/dev/null || return 1
+    if ! awk -v ports="$ports" 'BEGIN {count=split(ports,items,",")}
+      {port=$0; sub(/^.*:/,"",port); if (port !~ /^[0-9]+$/) next;
+       for (idx=1;idx<=count;idx++) {split(items[idx],bounds,"-");
+         if (+port >= +bounds[1] && +port <= +(bounds[2] ? bounds[2] : bounds[1])) exit 1}}' <<<"$occupied"; then
+      err 'a hopping port is reserved by a UDP socket or Realm relay'; return 1
+    fi
+  done < "$1"
+}
+
+hy2_hop_apply() (
+  local plan="$1" batch nft_bin
+  hy2_hop_owned || return 1
+  batch=$(mktemp) || return 1
+  trap 'rm -f "$batch"' EXIT
+  hy2_hop_table_delete_rule > "$batch" || return 1
+  if [[ -s "$plan" ]]; then
+    hy2_hop_rules "$plan" >> "$batch" || return 1
+    nft -c -f "$batch" || return 1
+    nft_bin=$(type -P nft) || return 1
+    if [[ ! -d "$HY2_HOP_DIR" ]]; then
+      mkdir -m 700 "$HY2_HOP_DIR" && touch "$HY2_HOP_DIR/.onevps-managed" || return 1
+    fi
+    hy2_hop_rules "$plan" > "$HY2_HOP_DIR/rules.next" && mv "$HY2_HOP_DIR/rules.next" "$HY2_HOP_DIR/rules.nft" || return 1
+    if [[ ! -e "$HY2_HOP_UNIT" ]]; then
+      cat > "$HY2_HOP_UNIT" <<EOF || return 1
+# Managed by OneVPS HY2
+[Unit]
+Description=OneVPS HY2 UDP port hopping
+After=nftables.service firewalld.service ufw.service
+Before=xray.service
+[Service]
+Type=oneshot
+ExecStart=$nft_bin -f $HY2_HOP_DIR/rules.nft
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload || return 1
+    fi
+    systemctl enable onevps-hy2-hop.service >/dev/null || return 1
+    nft -f "$batch" || return 1
+  else
+    [[ ! -s "$batch" ]] || nft -f "$batch" || return 1
+    if [[ -f "$HY2_HOP_UNIT" ]]; then
+      systemctl disable --now onevps-hy2-hop.service && rm -f "$HY2_HOP_UNIT" && systemctl daemon-reload || return 1
+    fi
+    if [[ -d "$HY2_HOP_DIR" ]]; then
+      rm -f "$HY2_HOP_DIR/rules.nft" "$HY2_HOP_DIR/rules.next" "$HY2_HOP_DIR/.onevps-managed" && rmdir "$HY2_HOP_DIR" || return 1
+    fi
+  fi
+)
+
+ask_hy2_hopping() {
+  local ports iface
+  ports=$(ask 'Public UDP hopping ports (e.g. 20000-20100,21000; empty = off)')
+  if [[ -z "$ports" ]]; then printf 'null\n'; return; fi
+  iface=$(ask 'Public ingress interface (e.g. eth0)')
+  jq -nc --arg ports "$ports" --arg iface "$iface" '{ports:$ports,interface:$iface}'
+}
+
 build_hysteria_inbound() {
   local n="$1" users
   users=$(node_clients "$n") || return 1
@@ -1614,6 +1752,8 @@ prepare_hy2_change() {
   else
     jq -e --arg id "$id" 'any(.nodes[]; .id == $id and .type == "hysteria2")' "$source" >/dev/null || return 1
     case "$action" in
+      hopping) jq --arg id "$id" --argjson value "$value" '(.nodes[]|select(.id==$id)) |=
+        if $value == null then del(.hopping) else .hopping=$value end' "$source" > "$output" ;;
       port) jq --arg id "$id" --argjson port "$value" '(.nodes[]|select(.id==$id)).port=$port' "$source" > "$output" ;;
       toggle) jq --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= not' "$source" > "$output" ;;
       delete) jq --arg id "$id" 'del(.nodes[]|select(.id==$id))' "$source" > "$output" ;;
@@ -1631,7 +1771,7 @@ add_hysteria_node() {
     err 'Hysteria2 setup requires ss (iproute2) and runuser (util-linux)'; pause; return 0;
   }
   ensure_nodes_file || return 1
-  local name domain password cert key port id node
+  local name domain password cert key port id node hopping
   info 'Add Hysteria2 (native Xray, QUIC/UDP + TLS)'
   warn 'Use a DNS-only domain pointing to this server. Caddy manages TLS; public TCP 80/443 must be reachable.'
   name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
@@ -1650,15 +1790,17 @@ add_hysteria_node() {
     fi
     break
   done
+  hopping=$(ask_hy2_hopping) || return 1
   password=$(ask 'Password (Enter for random)' "$(rand_password)")
   id=$(openssl rand -hex 4)
   node=$(jq -nc --arg id "$id" --arg name "$name" --arg domain "$domain" \
-    --arg password "$password" --arg cert "$cert" --arg key "$key" --argjson port "$port" \
+    --arg password "$password" --arg cert "$cert" --arg key "$key" --argjson port "$port" --argjson hopping "$hopping" \
     '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:$password,
-      port:$port,tls_cert:$cert,tls_key:$key,enabled:true}') || return 1
+      port:$port,tls_cert:$cert,tls_key:$key,enabled:true} +
+      (if $hopping == null then {} else {hopping:$hopping} end)') || return 1
   if apply_candidate_transaction prepare_hy2_change "$id" add "$node"; then
     open_port "$port" udp
-    ok 'Hysteria2 node added; also allow this UDP port in your cloud firewall'
+    ok 'Hysteria2 node added; allow the advertised UDP ports in your cloud firewall'
     node_link "$node"
   else
     err 'Hysteria2 node not added'
@@ -1909,6 +2051,7 @@ node_link() {
       "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
 
   elif [[ "$type" == "hysteria2" ]]; then
+    port=$(jq -r '.hopping.ports // .port' <<<"$n")
     pw=$(jq -r '.password' <<<"$n")
     domain=$(jq -r '.domain' <<<"$n")
     printf '\n%s-- %s (Hysteria2 + QUIC + TLS) --%s\n' "$c_grn" "$name" "$c_rst"
@@ -1963,7 +2106,7 @@ manage_nodes() {
   require_xray
   ensure_nodes_file || return 1
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes, add one first"; pause; return; }
-  local id n type
+  local id n type hopping
   id=$(pick_node)
   [[ -n "$id" ]] || return
   n=$(node_by_id "$id")
@@ -1973,10 +2116,12 @@ manage_nodes() {
     clear
     node_link "$n" || { pause; return; }
     if [[ "$type" == "hysteria2" ]]; then
-      printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
+      printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n3) Set UDP port hopping\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
       case "$(ask 'Select')" in
         1) edit_port "$id" ;;
         2) reset_hy2_password "$id" ;;
+        3) hopping=$(ask_hy2_hopping) || return 1
+           apply_candidate_transaction prepare_hy2_change "$id" hopping "$hopping" && ok 'updated; allow advertised UDP ports in cloud firewall' || err 'port hopping unchanged'; pause ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
         7) manage_node_users "$id" || true ;;
@@ -2304,6 +2449,9 @@ uninstall() {
   warn "Uninstall removes Xray binary, config, onevps nodes and logs"
   warn "(BBR/system tuning configs and the swap file are kept)"
   confirm "Confirm uninstall?" n || return
+  if [[ -e "$HY2_HOP_DIR" || -e "$HY2_HOP_UNIT" ]]; then
+    hy2_hop_apply /dev/null || { err 'cannot remove managed hopping rules; uninstall cancelled'; return 1; }
+  fi
   systemctl disable --now onevps-caddy-sync.timer 2>/dev/null || true
   warn 'Caddy domain sites and certificates are retained; certificate sync to Xray is disabled.'
   systemctl stop xray 2>/dev/null || true
@@ -2516,6 +2664,7 @@ realm_add() {
   remote_port=$(ask 'Destination port')
   mode=$(ask 'Protocol: tcp or both (TCP+UDP)' tcp)
   endpoint=$(realm_endpoint "$port" "$host" "$remote_port" "$mode") || { err "invalid relay input"; return 1; }
+  if [[ "$mode" == both ]] && port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; fi
   command -v ss >/dev/null 2>&1 || { err "ss is required to check listening ports; install iproute2/iproute"; return 1; }
   sockets=$(ss -H -lntu) || { err "cannot inspect listening ports"; return 1; }
   if awk '{print $5}' <<<"$sockets" | grep -qE ":$port$"; then

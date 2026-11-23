@@ -55,9 +55,23 @@ Do not publish an AAAA record for an IPv4-only endpoint. BBR/TCP tuning is not Q
 Menu **2 → 4** supports changing the UDP port, resetting the default password, managing users,
 selecting node/user outbounds, enabling/disabling and deleting the node. Updates use the
 existing validation/restart/rollback transaction. Menus **2 → 4/5** emit URL-encoded
-`hysteria2://` links without disabling TLS verification. Existing supported outbound types
-remain unchanged; importing HY2 as an upstream, obfuscation and port hopping
-are not included in this implementation.
+`hysteria2://` links without disabling TLS verification. HY2 upstream import and obfuscation are not supported.
+
+### Optional UDP port hopping
+
+During HY2 creation, leave **Public UDP hopping ports** blank for single-port operation. To enable hopping,
+enter at least two public UDP ports, e.g. `20000-20100,21000`, and the public ingress interface (e.g. `eth0`).
+Choose **2 → 4 → select HY2 → 3** to replace the list or clear it. Reimport each user's updated link, e.g.
+`hysteria2://PASSWORD@example.com:20000-20100,21000/?sni=example.com`. The hopping interval is a client setting.
+
+Xray still listens on one UDP port (e.g. `443`). Keep it outside the hopping ranges. Install `nftables` and allow
+the advertised UDP ports in your cloud firewall and any pre-NAT filters; the host input firewall must permit the
+listener **after** redirection. Do not use ports reserved by another service or NAT rule. TCP is unaffected.
+OneVPS redirects IPv4 traffic only on the chosen interface and only for local destinations. It manages its own
+`ip onevps_hy2_hop` nftables table and restores it at boot via `onevps-hy2-hop.service`. Disabling the node or
+clearing hopping removes its redirects; re-enabling the node restores configured hops. When no hopping nodes are
+active, the managed table and boot unit are removed. See the
+[official guide](https://v2.hysteria.network/docs/advanced/Port-Hopping/).
 
 Implementation references: [Xray HY2 inbound](https://xtls.github.io/en/config/inbounds/hysteria.html),
 [QUIC transport](https://xtls.github.io/en/config/transports/hysteria.html),

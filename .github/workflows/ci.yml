@@ -36,7 +36,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
+          sudo apt-get install --no-install-recommends --yes jq openssl shellcheck nftables iproute2
 
       - name: Run ShellCheck
         run: shellcheck --severity=warning onevps.sh tests/*.sh
@@ -73,6 +73,7 @@ jobs:
             "$work/xray.zip" | sha256sum --check -
           unzip -q "$work/xray.zip" -d "$work/core"
           XRAY_TEST_BIN="$work/core/xray" bash tests/test_hysteria2.sh
+          sudo env XRAY_TEST_BIN="$work/core/xray" bash tests/test_hy2_hopping_linux.sh
 
       - name: Lint Markdown
         run: npx --yes markdownlint-cli2@0.23.2 "**/*.md"
