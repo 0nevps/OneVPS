@@ -9,56 +9,20 @@
 OneVPS 是一个开源的 Linux VPS Xray 节点部署与运维自动化工具。它把安装、配置生成、服务管理和日常维护步骤
 集中在一个可审阅的 Bash 工作流中。
 
-目前支持四种部署模式：
+支持两种入站：
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS**：独立部署，无需域名或证书。
-- **Trojan + WebSocket（Caddy 后端）**：复用 Caddy 的 `:443` 监听与证书，可与其他 Caddy 服务共存。
-- **VMess AEAD + WebSocket（Caddy 后端）**：UUID 认证，复用 Caddy 管理的 TLS。
 - **Hysteria2 + QUIC + TLS**：原生 Xray 入站，统一使用 Caddy 管理的证书。
 
 OneVPS 专注于基于 Xray 的部署，不是通用 VPS 控制面板，也不替代基础设施即代码、防火墙管理、监控或备份系统。
-
-## VMess（AEAD，WebSocket + TLS）
-
-选择 **2 → 6** 添加 VMess 节点，域名需解析到 VPS，并放行 TCP 80/443。
-Caddy 在 443 端口终止 TLS，通过随机 WS 路径转发到仅监听回环地址的 Xray 入站。
-沿用现有 Caddy 初始化策略，包括共享监听的 HTTP/3 限制，不改变原有菜单编号。
-通过 **2 → 4** 管理 UUID、多用户、域名、路径、路由、出站、启停和删除；**2 → 5** 显示分享链接。
-删除节点保留域名站点与证书自动化；检测到配置或服务更新失败时恢复节点配置与 Caddy 路由。
-
-分享链接采用 v2rayN v2 的 `vmess://BASE64(JSON)` 格式，固定 `aid=0`、`scy=auto`。
-导入上游仅支持该格式的 **TCP/WS + TLS + AEAD**，加密方式为 `auto`、`aes-128-gcm` 或
-`chacha20-poly1305`。支持标准 Base64/Base64URL、字符串或数字端口以及带格式的 JSON。
-未知字段、非零 alterId、跳过证书验证、TCP HTTP 伪装和不支持的传输均明确拒绝，不静默降级。
-本次不支持 URI 风格 VMess 链接、无 TLS 上游、gRPC 或 XHTTP。
-
-客户端与服务端的 UTC 时间误差须小于 120 秒。此功能面向兼容需求：当前 Xray 会提示 VMess
-缺乏前向保密，WS 文档也建议使用 XHTTP 避免明显流量特征；不迁移现有节点。
-配置沿用兼容的 `clients`/`vnext` 字段，并通过真实核心验证。
-
-参考：[VMess 入站](https://xtls.github.io/config/inbounds/vmess.html)、
-[VMess 出站](https://xtls.github.io/config/outbounds/vmess.html)、
-[WebSocket](https://xtls.github.io/config/transports/websocket.html)、
-[Xray 26.10.21 配置实现](https://github.com/XTLS/Xray-core/blob/v26.10.21/infra/conf/vmess.go)、
-[v2rayN 链接实现](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/VmessFmt.cs)。
-
-```bash
-bash tests/test_vmess.sh
-XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_vmess.sh
-```
-
-可选的真实核心测试需要 Python 3，验证 WS 后端通信、两个 UUID、无效 UUID 拒绝及按用户 SOCKS 分流。
-该测试不覆盖 Caddy 的公网 TLS 终止、Linux systemd 或防火墙，部署时仍需验证。
 
 ## Hysteria2（原生 Xray）
 
 通过菜单 **1** 更新 Xray，再选 **2 → 3** 添加 HY2 节点。OneVPS 要求 **Xray >= 26.10.21**，
 这是本功能的测试基线，不代表 HY2 首次受支持的版本。不安装独立 Hysteria 核心或服务；
-仅有 VLESS/Trojan 的配置不受该版本门槛影响。
+仅使用 Reality 的配置不受此版本门槛影响。
 
-Trojan 与 HY2 统一依赖 Caddy，由 Caddy 唯一负责申请和续期证书，不再安装或调用 acme.sh。
-两种节点的创建顺序无关：域名有一个独立、持久的 HTTPS 站点，Trojan 路由从
-`/etc/onevps-caddy/routes/<域名>/` 导入。删除任一节点不会删除域名站点或中断另一节点续期。
+Caddy 为 HY2 申请和续期证书。删除 HY2 节点会保留域名站点和证书续期配置。
 域名使用仅 DNS 解析指向服务器，公网 TCP 80/443 必须可达；签发机构及条款由 Caddy 配置决定。
 
 脚本会询问是否将共享 `:443` 监听限定为 HTTP/1.1、HTTP/2，为 HY2 保留 UDP 443。
@@ -70,8 +34,7 @@ Trojan 与 HY2 统一依赖 Caddy，由 Caddy 唯一负责申请和续期证书�
 证书变化后重启 Xray，校验或重启失败时恢复旧证书；续期时机完全由 Caddy 决定。
 菜单 **3** 提供状态、域名设置、同步重试及日志。首次申请等待约一分钟，尚未完成时可稍后重试。
 
-本流程面向新部署，不迁移旧证书配置、不管理旧 ACME 定时器，也不接管未知的已有域名站点。
-新节点只使用 Caddy；已有外部 PEM 仍由外部流程负责续期。卸载 Xray 会停用证书同步，保留
+OneVPS 不接管非自身管理的 Caddy 站点。外部 PEM 仍由外部流程负责续期。卸载 Xray 会停用证书同步，保留
 Caddy、域名站点和证书。清理不用的域名前须人工确认没有其他消费者，防火墙规则也会保留。
 
 HY2 监听 IPv4 UDP，可与 Caddy 的 TCP 443 共用端口号。
@@ -93,7 +56,7 @@ bash tests/test_acme.sh
 XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_hysteria2.sh
 ```
 
-第二条命令需要 Python 3 和 OpenSSL，实测本机 TCP/UDP 流量、两个用户认证、错误密码拒绝与按用户 SOCKS 分流。
+真实内核测试需要 Python 3 和 OpenSSL，实测本机 TCP/UDP 流量、两个用户认证、错误密码拒绝与按用户 SOCKS 分流。
 只有隔离测试配置放行 loopback 目标，正式配置仍阻断私网。
 Linux systemd、实际证书权限和外部防火墙可达性仍需在部署环境验证。
 
@@ -111,23 +74,21 @@ OneVPS 将这些步骤保留在可读的 Shell 脚本中，便于运维者在执
 - **Xray 官方安装器**：通过 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 安装或更新核心与 geodata
 - **VLESS + TCP + REALITY**：VPS 直连，使用 REALITY 目标站 TLS 握手特征
 - **XTLS Vision 与 uTLS**：生成 `xtls-rprx-vision` 用户和包含 `fp=chrome` 的分享链接
-- **Trojan + WS（Caddy 后端）**：仅由 Caddy 对外，Xray 入站保持 loopback 监听
+- **Hysteria2**：原生 QUIC 监听，TLS 证书由 Caddy 管理
 - **配置校验**：替换现有配置前先验证新生成的 Xray 配置
-- **安全默认值**：随机 UUID、X25519 密钥、short ID、密码和 WebSocket 路径
+- **安全默认值**：随机 UUID、X25519 密钥、short ID 和密码
 - **受限路由**：阻断私网地址和 BitTorrent 流量
 - **最小权限服务**：Xray 使用 `nobody` 运行，仅保留绑定低端口的能力
 - **运维能力**：节点与分享链接管理、服务重启、BBR 和可选 TCP 优化
-
-> 旧版 sing-box 节点不会自动迁移。OneVPS 使用 `/usr/local/etc/xray/` 管理 Xray。
 
 ## 支持的技术
 
 | 类别 | 支持范围 |
 | --- | --- |
 | 核心 | [Xray-core](https://github.com/XTLS/Xray-core) |
-| 协议 | VLESS、Trojan、Hysteria2、VMess |
-| 传输 | TCP、WebSocket、QUIC（UDP） |
-| 安全 | REALITY、XTLS Vision、由 Caddy 终结的 TLS |
+| 入站协议 | VLESS Reality、Hysteria2 |
+| 入站传输 | TCP、QUIC（UDP） |
+| 安全 | REALITY、XTLS Vision、由 Xray 终结的 TLS |
 | 服务管理 | systemd |
 | 架构 | amd64、arm64、armv7 |
 | 包管理器 | apt、dnf、yum、zypper |
@@ -154,13 +115,12 @@ sudo bash onevps.sh
 bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh)
 ```
 
-便捷命令需要在 root Shell 中运行。首次使用时先选择 `1` 安装或更新 Xray-core，再选择 `2` 添加 Reality 节点，
-或选择 `3` 添加 Trojan + WS 节点。
+便捷命令需要在 root Shell 中运行。首次使用时先选 `1` 安装或更新 Xray-core，再选 `2 → 1` 添加 Reality，或选 `2 → 3` 添加 HY2。
 
 ## 菜单
 
 主菜单按任务分类，节点和服务操作分别收纳在对应子菜单中。
-用户和出站管理位于 `4`，选中节点后分别选择 `7` 或 `8`。
+用户和出站管理位于 `2 → 4`，选中节点后分别选择 `7` 或 `8`。
 删除和卸载操作单独放在 **Danger zone** 分组，保留原有确认提示。
 
 ```text
@@ -214,7 +174,9 @@ Danger zone:
 - **SOCKS5：** `socks5://host:port` 或 `socks5://username:password@host:port`。
   凭据中的保留字符需要百分号编码；不支持 `socks://` 和 `socks5h://`。
 
-另支持 VMess 上游导入，其严格 v2 JSON/TLS 子集见 VMess 专节。
+VMess 上游支持 v2rayN v2 的 `vmess://BASE64(JSON)` 链接，要求 TCP 或 WS + TLS、`aid=0`。
+加密方式支持 `auto`、`aes-128-gcm` 和 `chacha20-poly1305`，编码支持标准 Base64 和 Base64URL。
+未知字段、跳过证书验证或不支持的传输会被拒绝。
 
 VLESS 参数白名单为 `encryption`、`type`、`security`、`flow`、`sni`、`fp`、`pbk`、`sid`、
 `spx`、`host`、`path`、`serviceName`、`mode`、`alpn`，并须与所选传输匹配。
@@ -235,7 +197,6 @@ SOCKS5 不加密流量或凭据，请仅通过可信或受保护的链路使用�
 检测到启用失败时，会恢复原元数据和配置，并尝试恢复原服务状态。恢复失败会单独报错；
 这不是文件替换期间断电安全的保证。非法链接或校验失败不会修改在线文件。
 规范化代理配置仍包含秘密，元数据、生成配置及恢复备份均须妥善保护；上游凭据不会附加到客户端分享链接。
-旧版脚本可能忽略出站配置并在重新生成时恢复直连；需要保留指定出口时，不要降级后重新生成配置。
 
 独立内核检查必须指定真实二进制，缺少二进制会失败：
 
@@ -249,7 +210,7 @@ CI 使用 Xray `26.3.27` 执行此检查。配置通过不代表上游可达，�
 
 在单节点管理菜单中管理该节点的用户：添加用户、删除用户及查看独立分享链接。
 用户只属于当前节点，不存在全局账号或跨节点分配；不同节点可使用相同用户名。
-新增 Reality 用户拥有独立 UUID，新增 Trojan 用户拥有独立密码，默认继承节点出口。
+新增 Reality 用户拥有独立 UUID，新增 HY2 用户拥有独立密码，默认继承节点出口。
 同一节点内的用户名、用户 ID 和凭据不得重复，凭据也不得与默认客户端冲突。
 
 原有默认客户端及其分享链接保持不变。默认客户端是保留项，不能通过用户删除菜单删除，
@@ -259,15 +220,7 @@ CI 使用 Xray `26.3.27` 执行此检查。配置通过不代表上游可达，�
 用户添加、删除与出口变更使用相同的候选校验和事务回滚流程，需要已安装 Xray，并会重启服务。
 分享链接包含对应用户的访问凭据，应视为秘密；不会包含上游出口凭据。
 
-### 旧全局用户兼容性
-
-新的节点内用户保存于 `.nodes[].users`。旧元数据中的顶层 `users` 和节点 `clients` 字段
-继续保留但忽略，不会自动迁移、清洗或重新启用。需要访问的用户应在目标节点内重新添加并使用新链接。
-仅替换脚本不会改变正在运行的 Xray 配置；下次重新生成并应用配置时，旧额外连接用户及其路由
-不会被保留，其旧分享链接不再授权访问。
-
-部署前请备份 `onevps-nodes.json` 和 `config.json`。恢复旧脚本并重新生成配置可能重新启用
-旧全局用户，同时忽略新的节点内用户和出口覆盖；不要通过降级保留本版本的访问控制或出口设置。
+节点内用户保存于 `.nodes[].users`。更改用户权限或分流前，请备份 `onevps-nodes.json` 和 `config.json`。
 
 ## Realm 端口中转
 
@@ -343,31 +296,6 @@ vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=
 添加或编辑 Reality 节点时，OneVPS 会对内置候选执行多轮 `xray tls ping`，按成功率和平均延迟排序。运维者仍可
 手动选择候选或填写自定义域名。如果全部探测失败，脚本会回退到第一个候选并显示警告。
 
-## Trojan + WebSocket（Caddy 后端）
-
-菜单 `2` → `2` 创建与 Caddy 已管理服务共享 `443` 端口的 Trojan 节点。
-
-工作方式：
-
-- Xray Trojan 入站**仅监听 `127.0.0.1`**，使用 WebSocket 传输，不终结 TLS。
-- Caddy 为独立子域终结 TLS，并把隐藏的 WebSocket 路径反向代理到本地入站。
-- 其他 Caddy 站点保持不变。
-- 隐藏路径以外的请求返回 HTTP 403，页面位于 `/var/lib/onevps/sites/<域名>/index.html`，可自行编辑。
-- 脚本向 Caddyfile 追加带标记的站点块，校验配置后 reload Caddy；reload 失败时会回滚新增块。
-- Trojan 节点不修改防火墙规则，Caddy 保持为唯一公网入口。
-
-要求：
-
-- 独立子域的 `A` 或 `AAAA` 记录指向本机
-- `80` 和 `443` 端口可达，用于 ACME 和客户端流量
-- Caddy；缺失时 OneVPS 通过受支持的软件源安装，或使用静态二进制兜底
-
-分享链接格式：
-
-```text
-trojan://PASSWORD@SUBDOMAIN:443?security=tls&sni=SUBDOMAIN&type=ws&host=SUBDOMAIN&path=PATH#NAME
-```
-
 ## 节点管理
 
 Reality 节点操作：
@@ -392,30 +320,8 @@ Danger zone:
 0) Back
 ```
 
-Trojan 节点操作：
-
-```text
-Connection settings:
-1) Reset default password
-2) Change domain
-3) Change WS path
-4) Rebuild Caddy route
-
-Users / outbound:
-7) Manage node users
-8) Set node outbound
-
-Node status:
-5) Enable/disable node
-
-Danger zone:
-6) Delete node
-
-0) Back
-```
-
-`Rebuild Caddy route` 会重新生成受管理的 Caddy 配置块，但不更改节点密码、路径或端口。轮换 Reality 密钥或
-重置 Trojan 凭据会使旧客户端链接失效，需要从菜单 `2` → `5` 重新导入链接。
+HY2 节点用 `1` 修改 UDP 端口、`2` 重置默认密码；用户管理、出站、启停和删除的编号与 Reality 相同。
+轮换密钥或重置凭据后，请从 `2 → 5` 重新导入分享链接。
 
 ## 安全模型
 
@@ -424,7 +330,6 @@ OneVPS 提供多项防御性默认设置，但执行任何 root 级部署脚本�
 - 节点凭据和私钥存储在 `/usr/local/etc/xray/onevps-nodes.json`，并限制文件权限。
 - 新生成的运行配置通过校验后才会启用。
 - Xray 安装完成后不以 root 身份运行。
-- Trojan 入站仅监听 loopback；该模式只有 Caddy 作为公网 TLS 入口。
 - 分享链接包含有效凭据，必须按秘密信息处理。
 - 安装流程会在运行时下载上游安装器或二进制文件，执行前应根据环境评估网络与上游信任要求。
 - OneVPS 不负责配置 SSH 策略、无人值守更新、入侵检测、备份或完整防火墙。
@@ -441,7 +346,7 @@ OneVPS 提供多项防御性默认设置，但执行任何 root 级部署脚本�
 | `/usr/local/share/xray/` | geoip 与 geosite 数据 |
 | `/etc/systemd/system/xray.service` | systemd 服务单元 |
 | `/var/log/xray/` | Xray 日志目录 |
-| `/var/lib/onevps/sites/<域名>/` | Trojan 子域的可编辑 403 页面 |
+| `/var/lib/onevps/sites/<域名>/` | 受管证书域名的可编辑 403 页面 |
 
 手动管理服务：
 
@@ -464,7 +369,7 @@ xray run -test -config /usr/local/etc/xray/config.json
 - amd64、arm64 或 armv7 架构
 - apt、dnf、yum 或 zypper
 - `curl`、`jq`、`openssl` 和 CA 证书；缺失依赖会自动安装
-- 仅 Trojan + WS 节点需要 Caddy；缺失时自动安装
+- HY2 使用 Caddy 管理证书；缺失时自动安装
 
 由于发行版、软件源、Xray 和 Caddy 会各自变化，兼容性支持按最大努力提供。报告兼容性问题时，请附发行版、版本、
 架构、包管理器和已脱敏的命令输出。
@@ -490,9 +395,7 @@ xray run -test -config /usr/local/etc/xray/config.json
 不会删除现有 swap、fstab 或 journald 文件，也不会猜测系统默认值来重置历史运行参数。
 重新应用仅更新 OneVPS 自己的调优文件。
 
-OneVPS 不再添加默认 UDP/443 阻断或提供其开关。历史 `block_udp443` metadata 保留但忽略。
-已安装 Xray 中的旧规则仅在重新生成配置并成功应用后消失；这不保证客户端、上游或链路支持 QUIC。
-私网、BitTorrent 和节点/用户出站规则保持不变。应用前请确认设置适合服务器上的其他工作负载。
+OneVPS 默认不阻断 UDP/443。私网、BitTorrent 阻断和节点／用户出站规则仍然生效。
 
 ## 卸载
 
@@ -506,7 +409,7 @@ BBR 设置、系统优化文件、swap、Caddy、Caddyfile 和自定义站点内
 
 - 保持生成的 Xray 与 Caddy 配置兼容受支持的上游版本
 - 改善失败处理，使主机变更更容易审计和回滚
-- 扩展配置迁移、Caddy 路由和失败路径的自动测试
+- 扩展配置校验、证书管理和失败路径的自动测试
 - 为主机级操作增加一次性跨发行版集成测试
 - 记录不同发行版与架构的兼容性结果
 - 审查运行时下载和发布完整性控制

@@ -31,7 +31,7 @@ jobs:
           ref: ${{ inputs.ref || '' }}
 
       - name: Validate Bash syntax
-        run: bash -n onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh tests/test_hysteria2.sh tests/test_acme.sh
+        run: for script in onevps.sh tests/*.sh; do bash -n "$script" || exit 1; done
 
       - name: Install test dependencies
         run: |
@@ -39,11 +39,12 @@ jobs:
           sudo apt-get install --no-install-recommends --yes jq openssl shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning onevps.sh tests/test_onevps.sh tests/test_xray_outbounds.sh tests/test_hysteria2.sh tests/test_acme.sh
+        run: shellcheck --severity=warning onevps.sh tests/*.sh
 
       - name: Test configuration generation
         run: |
           bash tests/test_onevps.sh
+          bash tests/test_vmess.sh
           bash tests/test_hysteria2.sh
           bash tests/test_acme.sh
 

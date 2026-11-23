@@ -201,7 +201,6 @@ assert_true "random passwords are 32 lowercase hex characters" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{32}$ ]]' _ "$(rand_password)"
 
 reality_node=$(jq -c '.nodes[] | select(.id == "a1b2c3d4")' "$FIXTURE")
-trojan_node=$(jq -c '.nodes[] | select(.id == "b2c3d4e5")' "$FIXTURE")
 
 reality_inbound=$(build_reality_inbound "$reality_node")
 assert_jq "builds a public VLESS Reality inbound" "$reality_inbound" \
@@ -216,15 +215,6 @@ assert_jq "enables Vision and route-only sniffing" "$reality_inbound" \
    and .sniffing.enabled == true
    and .sniffing.routeOnly == true'
 
-trojan_inbound=$(build_trojan_inbound "$trojan_node")
-assert_jq "builds a loopback-only Trojan inbound" "$trojan_inbound" \
-  '.listen == "127.0.0.1" and .port == 20001 and .protocol == "trojan"'
-assert_jq "sets Trojan WebSocket transport without TLS" "$trojan_inbound" \
-  '.settings.clients[0].password == "test+pass@example"
-   and .streamSettings.network == "ws"
-   and .streamSettings.security == "none"
-   and .streamSettings.wsSettings.path == "/secret path"'
-
 # Consumed by pub_ip() in the sourced script.
 # shellcheck disable=SC2034
 PUBIP="203.0.113.10"
@@ -233,12 +223,6 @@ assert_contains "builds a complete VLESS share link" "$reality_link_output" \
   "vless://123e4567-e89b-12d3-a456-426614174000@203.0.113.10:443?"
 assert_contains "encodes VLESS path and display name" "$reality_link_output" \
   "spx=%2F&type=tcp#Reality%20Test%20%2F%20HK"
-
-trojan_link_output=$(node_link "$trojan_node")
-assert_contains "encodes the Trojan password" "$trojan_link_output" \
-  "trojan://test%2Bpass%40example@node.example.com:443?"
-assert_contains "encodes the Trojan WebSocket path" "$trojan_link_output" \
-  "path=%2Fsecret%20path#Trojan%20Test"
 
 XRAY_DIR="$TEST_TMP/xray"
 XRAY_CONF="$XRAY_DIR/config.json"
@@ -254,7 +238,7 @@ secure_xray_files() { :; }
 
 rebuild_config
 assert_file_jq "includes only enabled nodes" "$XRAY_CONF" \
-  '.inbounds | length == 2'
+  '[.inbounds[].protocol] == ["vless", "hysteria"]'
 assert_file_jq "keeps private-network blocking" "$XRAY_CONF" \
   'any(.routing.rules[]; .ip? and (.ip | index("10.0.0.0/8")))'
 assert_file_jq "keeps BitTorrent blocking" "$XRAY_CONF" \
@@ -262,14 +246,19 @@ assert_file_jq "keeps BitTorrent blocking" "$XRAY_CONF" \
 assert_file_jq "does not block UDP/443 by default" "$XRAY_CONF" \
   'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
 
-for legacy_udp443 in true false; do
-  jq --argjson legacy "$legacy_udp443" '.settings.block_udp443 = $legacy' "$FIXTURE" > "$XRAY_NODES"
-  rebuild_config
-  assert_file_jq "ignores legacy UDP/443 setting $legacy_udp443" "$XRAY_CONF" \
-    'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
-  assert_file_jq "preserves legacy metadata $legacy_udp443" "$XRAY_NODES" \
-    ".settings.block_udp443 == $legacy_udp443"
+cp "$XRAY_CONF" "$TEST_TMP/valid-config"
+for enabled in true false; do
+  jq --argjson enabled "$enabled" '.nodes[0] |= (.type = "unknown" | .enabled = $enabled)' "$FIXTURE" > "$XRAY_NODES"
+  assert_false "reject unknown node type (enabled=$enabled)" rebuild_config
+  assert_true 'invalid input leaves active configuration intact' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
 done
+cp "$FIXTURE" "$XRAY_NODES"
+
+assert_true 'node creation menu lists only Reality and HY2' bash -c '
+  source "$1"; XRAY_NODES="$2"; ask() { printf "0\n"; }
+  output=$(node_menu)
+  [[ "$output" == *"1) Add VLESS Reality"*"3) Add Hysteria2"* && "$output" != *Trojan* && "$output" != *VMess* ]]
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
 assert_true "realm accepts maximum port" realm_valid_port 65535
 for port in 0 65536 080 -1 '22;id' ''; do
@@ -380,40 +369,19 @@ printf 'invalid json\n' > "$candidate"
 assert_false "realm rejects malformed candidate" realm_apply "$candidate"
 assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
 
-# Legacy connection-user fields are preserved, but never validated or rendered.
 cp "$FIXTURE" "$XRAY_NODES"
 node_candidate="$TEST_TMP/node-candidate.json"
-jq '.users = [{id:"old",outbound:{mode:"proxy",protocol:"invalid"}}] |
-    .nodes[0].clients = [{user_id:"old",uuid:.nodes[0].uuid}] |
-    .nodes[1].clients = [{user_id:"old",password:.nodes[1].password}] |
-    .extra = {retained:true} | .settings.block_udp443 = false' "$FIXTURE" > "$XRAY_NODES"
-assert_true "legacy fields do not require migration" validate_node_metadata "$XRAY_NODES"
-assert_true "legacy members do not affect rendering" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
+assert_true "render default node configuration" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
 assert_file_jq "each enabled node keeps only its default client" "$TEST_TMP/rendered.json" \
-  'all(.inbounds[]; .settings.clients | length == 1) and .inbounds[0].settings.clients[0].id == "123e4567-e89b-12d3-a456-426614174000" and .inbounds[1].settings.clients[0].password == "test+pass@example"'
-assert_file_jq "legacy users emit no proxies or user routes" "$TEST_TMP/rendered.json" \
+  'all(.inbounds[]; (.settings.clients // .settings.users) | length == 1) and .inbounds[0].settings.clients[0].id == "123e4567-e89b-12d3-a456-426614174000" and .inbounds[1].settings.users[0].auth == "test+pass@example"'
+assert_file_jq "default nodes emit no proxies or user routes" "$TEST_TMP/rendered.json" \
   '(.outbounds|length) == 2 and all(.routing.rules[]; has("user")|not)'
 assert_eq "Reality transport unchanged" "$(jq -c '.streamSettings' <<<"$reality_inbound")" \
   "$(jq -c '.inbounds[0].streamSettings' "$TEST_TMP/rendered.json")"
-for mutation in '.users = false' '.users = null' '.users = "obsolete"' '.nodes[0].clients = false' '.nodes[0].clients = null' '.nodes[1].clients = {invalid:true}'; do
-  jq "$mutation" "$XRAY_NODES" > "$node_candidate"
-  assert_true "ignores obsolete metadata: $mutation" render_config "$node_candidate" "$TEST_TMP/rendered.json"
-done
 for mutation in '.nodes = null' '.nodes[0].id = ""' '.nodes[1].id = .nodes[0].id' '.nodes[0].uuid = null' '.nodes[1].password = ""'; do
   jq "$mutation" "$XRAY_NODES" > "$node_candidate"
   assert_false "rejects invalid node metadata: $mutation" validate_node_metadata "$node_candidate"
 done
-# Default resets no longer consult legacy members and preserve their metadata.
-assert_true "default credential resets ignore old member collisions" bash -c '
-  source "$1"; XRAY_NODES="$2"; XRAY_DIR=$(dirname "$2")
-  secure_xray_files() { :; }; rebuild_config() { :; }; pause() { :; }
-  apply_node_user_change() { jq . >/dev/null; }
-  ask_uuid() { jq -r ".nodes[0].clients[0].uuid" "$XRAY_NODES"; }
-  ask() { jq -r ".nodes[1].clients[0].password" "$XRAY_NODES"; }
-  before=$(jq -c "{users,clients:[.nodes[].clients]}" "$2")
-  reset_uuid a1b2c3d4 && reset_trojan_password b2c3d4e5 &&
-  [[ "$before" == "$(jq -c "{users,clients:[.nodes[].clients]}" "$2")" ]]
-' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
 # Mock executable and service operations; never access host services.
 XRAY_BIN="$TEST_TMP/mock-xray"
@@ -448,8 +416,7 @@ assert_true "transaction preserves original permission modes" bash -c '
   mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
   [[ $(mode "$1") == 640 && $(mode "$2") == 600 ]]
 ' _ "$XRAY_NODES" "$XRAY_CONF"
-assert_file_jq "transaction preserves root unknown fields and settings" "$XRAY_NODES" '.extra.retained and (.settings.block_udp443 | not)'
-assert_file_jq "transaction preserves legacy metadata" "$XRAY_NODES" '.users[0].id == "old" and all(.nodes[0:2][]; .clients | length == 1) and .nodes[0].outbound.mode == "direct"'
+assert_file_jq "transaction stores the selected node outbound" "$XRAY_NODES" '.nodes[0].outbound.mode == "direct"'
 cp "$XRAY_NODES" "$TEST_TMP/before-nodes"
 cp "$XRAY_CONF" "$TEST_TMP/before-config"
 MOCK_VALIDATE_FAIL=true
@@ -575,9 +542,8 @@ render_config "$TEST_TMP/disabled.json" "$TEST_TMP/rendered.json"
 assert_file_jq "disabled node retains setting but emits no routes or proxy" "$TEST_TMP/rendered.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
 jq '.nodes[0].outbound=null' "$TEST_TMP/disabled.json" > "$TEST_TMP/invalid.json"
 assert_false "disabled node cannot hide corrupt outbound" render_config "$TEST_TMP/invalid.json" "$TEST_TMP/rendered.json"
-# No outbound settings produce exactly the legacy two outbounds / three blocks.
-render_config "$FIXTURE" "$TEST_TMP/legacy.json"
-assert_file_jq "legacy render has no extra routes or outbounds" "$TEST_TMP/legacy.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
+render_config "$FIXTURE" "$TEST_TMP/default-config.json"
+assert_file_jq "default config has no extra routes or outbounds" "$TEST_TMP/default-config.json" '(.routing.rules|length) == 2 and (.outbounds|length) == 2'
 # Shared transaction is exercised again with actual outbound candidates.
 XRAY_BIN="$TEST_TMP/mock-xray"
 MOCK_SERVICE_MODE=ok
@@ -812,7 +778,7 @@ assert_true "add second Reality user transaction" apply_node_user_change a1b2c3d
 assert_true "same user ID and name are independent across nodes" apply_node_user_change b2c3d4e5 add <<<'{"id":"alice","name":"Alice","password":"user+secret"}'
 assert_file_jq "both protocols retain default and add clients" "$XRAY_CONF" '.inbounds[0].settings.clients|length == 3'
 assert_contains "Reality user link uses independent credential" "$(node_user_link "$(node_by_id a1b2c3d4)" alice)" 'vless://123e4567-e89b-12d3-a456-426614174011@'
-assert_contains "Trojan user link encodes independent password" "$(node_user_link "$(node_by_id b2c3d4e5)" alice)" 'trojan://user%2Bsecret@'
+assert_contains "HY2 user link encodes independent password" "$(node_user_link "$(node_by_id b2c3d4e5)" alice)" 'hysteria2://user%2Bsecret@'
 for mutation in '.nodes[0].users=null' '.nodes[0].users[0].id="default"' '.nodes[0].users[0].id="bad id"' '.nodes[0].users[0].name=" "' '.nodes[0].users[1].id="alice"' '.nodes[0].users[1].name="Alice"' '.nodes[0].users[0].uuid=.nodes[0].uuid' '.nodes[0].users[0].uuid="bad"' '.nodes[1].users[0].password=.nodes[1].password' '.nodes[0].default_outbound=null' '.nodes[0].users[0].outbound=null'; do
   jq "$mutation" "$XRAY_NODES" > "$node_candidate"
   assert_false "reject invalid local user metadata $mutation" validate_node_metadata "$node_candidate"
@@ -821,7 +787,7 @@ assert_false "duplicate user addition rejected" apply_node_user_change a1b2c3d4 
 assert_false "default cannot be deleted" apply_node_user_change a1b2c3d4 delete default
 assert_false "unknown user cannot be deleted" apply_node_user_change a1b2c3d4 delete missing
 assert_false "default reset rejects local credential collision" apply_node_user_change a1b2c3d4 reset <<<'"123e4567-e89b-12d3-a456-426614174011"'
-assert_false "Trojan reset rejects local credential collision" apply_node_user_change b2c3d4e5 reset <<<'"user+secret"'
+assert_false "HY2 reset rejects local credential collision" apply_node_user_change b2c3d4e5 reset <<<'"user+secret"'
 assert_true "set inherited node proxy for all identities" apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
 assert_true "selected batch sets default and Alice only" apply_outbound_assignment a1b2c3d4 selected '["default","alice"]' <<<"$second_proxy"
 assert_file_jq "default override does not change node inheritance" "$XRAY_NODES" '.nodes[0].outbound.protocol == "socks" and .nodes[0].default_outbound.protocol == "shadowsocks" and (.nodes[0].users[1]|has("outbound")|not)'
@@ -990,5 +956,4 @@ fi
 assert_false 'failed direct call never reports success or continues' \
   command grep -Eq 'TCP tuning applied|unreachable' "$TEST_TMP/errexit-output"
 
-assert_true 'VMess configuration, links and lifecycle regressions' bash "$ROOT_DIR/tests/test_vmess.sh"
 printf '# %d tests passed\n' "$TEST_COUNT"

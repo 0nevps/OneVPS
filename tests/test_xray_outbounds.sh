@@ -26,11 +26,10 @@ done < "$TEST_TMP/keys")
 [[ -n "$private_key" && -n "$public_key" ]] || { printf 'unrecognized x25519 output\n' >&2; exit 1; }
 printf '%s\n' "$private_key" "$public_key" | jq -Rn '[inputs]' > "$TEST_TMP/key-values.json"
 jq --slurpfile keys "$TEST_TMP/key-values.json" '
-  .nodes |= map(if .type == "vless-reality" then
+  .nodes |= map(select(.type == "vless-reality") |
     .reality_private_key = $keys[0][0] | .reality_public_key = $keys[0][1]
-  else . end) |
-  .nodes[0].users = [{id:"alice",name:"Alice",uuid:"123e4567-e89b-12d3-a456-426614174011"}] |
-  .nodes[1].users = [{id:"alice",name:"Alice",password:"disposable-local-password",outbound:{mode:"direct"}}]
+  ) |
+  .nodes[0].users = [{id:"alice",name:"Alice",uuid:"123e4567-e89b-12d3-a456-426614174011"}]
 ' "$ROOT_DIR/tests/fixtures/nodes.json" > "$TEST_TMP/base.json"
 
 check_link() {
@@ -81,5 +80,3 @@ printf '%s\n' '"inherit"' | prepare_outbound_assignment "$TEST_TMP/direct.json" 
 render_config "$TEST_TMP/reset.json" "$TEST_TMP/config.json"
 "$CORE" run -test -config "$TEST_TMP/config.json" > "$TEST_TMP/check.log" 2>&1
 printf 'ok - real Xray accepts restored default node outbound\n'
-
-XRAY_TEST_BIN="$CORE" bash "$ROOT_DIR/tests/test_vmess.sh"

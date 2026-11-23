@@ -10,67 +10,24 @@ OneVPS is an open-source automation tool for deploying and operating Xray nodes 
 It turns the installation, configuration, service management, and routine maintenance steps into one
 auditable Bash workflow.
 
-Four deployment modes are supported:
+Two inbound modes are supported:
 
 - **VLESS + TCP + REALITY + XTLS Vision + uTLS** — a standalone deployment that does not require a domain
   or certificate.
-- **Trojan + WebSocket behind Caddy** — a deployment that shares Caddy's `:443` listener and certificates
-  with other Caddy-managed services.
 - **Hysteria2 + QUIC + TLS** — a native Xray inbound with Caddy-managed certificates.
-- **VMess AEAD + WebSocket behind Caddy** — UUID authentication with Caddy-managed TLS.
 
 OneVPS deliberately focuses on Xray-based deployments. It is not a general-purpose VPS control panel or a
 replacement for infrastructure-as-code, firewall management, monitoring, or backups.
-
-## VMess (AEAD, WebSocket + TLS)
-
-Choose **2 → 6** to add a VMess node. Point a domain at the VPS and allow TCP 80/443.
-Caddy terminates TLS on port 443 and proxies the secret WS path to a loopback-only Xray inbound.
-The existing Caddy setup policy applies, including its shared-listener HTTP/3 restriction.
-Menu **2 → 4** manages UUIDs, users, domains, paths, routes, outbounds and node state;
-**2 → 5** exports links. Existing menu numbers are unchanged. Deleting a node keeps its
-domain site and certificate automation. VMess route/config updates roll back on detected failures.
-
-Share links use the v2rayN v2 `vmess://BASE64(JSON)` format with `aid=0` and `scy=auto`.
-Upstream import accepts that format with TCP or WS **and TLS**, AEAD (`aid=0`), and
-`auto`, `aes-128-gcm` or `chacha20-poly1305` encryption. Standard/Base64URL encoding,
-numeric/string ports and formatted JSON are accepted. Unknown fields, nonzero alterId,
-insecure TLS, TCP HTTP camouflage and unsupported transports are rejected, not downgraded.
-URI-style VMess links, plaintext upstreams, gRPC and XHTTP are not included.
-
-Keep client and server UTC clocks within 120 seconds. VMess is offered for compatibility;
-current Xray warns about its lack of forward secrecy, and its WS documentation recommends
-XHTTP to avoid WS traffic fingerprints. This feature does not migrate existing nodes.
-Configuration uses the compatibility `clients`/`vnext` fields, tested against real Xray cores.
-
-References: [VMess inbound](https://xtls.github.io/config/inbounds/vmess.html),
-[VMess outbound](https://xtls.github.io/config/outbounds/vmess.html),
-[WebSocket](https://xtls.github.io/config/transports/websocket.html),
-[Xray 26.10.21 schema](https://github.com/XTLS/Xray-core/blob/v26.10.21/infra/conf/vmess.go),
-[v2rayN link implementation](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/VmessFmt.cs).
-
-```bash
-bash tests/test_vmess.sh
-XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_vmess.sh
-```
-
-The optional real-core test needs Python 3 and verifies WS backend traffic, two UUIDs,
-invalid-UUID rejection and per-user SOCKS routing. It does not test Caddy TLS termination
-or Linux systemd/firewall integration; verify those on the deployment host.
 
 ## Hysteria2 (native Xray)
 
 Update Xray using menu **1**, then choose **2 → 3** to add a HY2 node. OneVPS requires
 **Xray >= 26.10.21**, the tested baseline, not the first release supporting HY2.
-No separate Hysteria binary or service is installed. Existing VLESS/Trojan-only
-configurations do not acquire this version requirement.
+No separate Hysteria binary or service is installed. Reality-only deployments do not require this HY2 baseline.
 
-Caddy is required for both Trojan and HY2 and is the sole certificate issuer/renewer.
-Create either node first: the domain has one persistent HTTPS site, and Trojan routes
-are imported from `/etc/onevps-caddy/routes/<domain>/`. Deleting a node keeps the domain
-and its certificate automation, so the other protocol continues working.
+Caddy issues and renews certificates for HY2. Deleting a HY2 node keeps its domain site and certificate automation.
 Use DNS-only records pointing at the server and allow inbound TCP 80/443. Caddy's
-configured issuer and terms apply; OneVPS no longer installs or invokes acme.sh.
+configured issuer and terms apply.
 
 OneVPS asks before configuring the shared `:443` listener for HTTP/1.1 and HTTP/2 only,
 reserving UDP 443 for HY2. This also disables HTTP/3 for other sites sharing that listener.
@@ -85,8 +42,7 @@ Changed certificates restart Xray; validation/restart failures restore the previ
 Caddy alone decides when to renew. Menu **3** provides status, domain setup, sync retries,
 and Caddy/sync logs. Initial issuance waits up to about one minute; retry if still pending.
 
-This workflow targets new deployments. It does not migrate old certificate configuration,
-change old ACME timers, or adopt unknown existing domain sites. New nodes use Caddy only.
+OneVPS does not take over existing Caddy sites it does not manage.
 Existing externally managed PEM files remain the external owner's responsibility.
 Uninstalling Xray disables certificate synchronization but retains Caddy, domain sites
 and certificates. Remove unused domains manually only after checking all consumers.
@@ -114,7 +70,7 @@ bash tests/test_acme.sh
 XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_hysteria2.sh
 ```
 
-The second command requires Python 3 and OpenSSL. It exercises real TCP/UDP loopback
+The real-core command requires Python 3 and OpenSSL. It exercises real TCP/UDP loopback
 traffic, two user credentials, rejection of invalid credentials and per-user SOCKS routing.
 Only disposable test configurations permit loopback destinations; production private-IP
 blocking remains intact. Linux systemd, certificate permissions and external firewall
@@ -136,23 +92,21 @@ the same workflow on another supported host, and contribute fixes in one place.
   [XTLS/Xray-install](https://github.com/XTLS/Xray-install)
 - **VLESS + TCP + REALITY**: direct VPS connection with REALITY target-site TLS camouflage
 - **XTLS Vision and uTLS**: generates `xtls-rprx-vision` users and share links with `fp=chrome`
-- **Trojan + WS behind Caddy**: exposes only Caddy while the Xray inbound remains bound to loopback
+- **Hysteria2**: native QUIC listener with Caddy-managed TLS certificates
 - **Configuration validation**: validates generated Xray configuration before replacing the active file
-- **Secure defaults**: random UUIDs, X25519 keys, short IDs, passwords, and WebSocket paths
+- **Secure defaults**: random UUIDs, X25519 keys, short IDs, and passwords
 - **Restricted routing**: blocks private address ranges and BitTorrent traffic
 - **Least-privilege service**: runs Xray as `nobody` with only the low-port bind capability
 - **Operations**: manages nodes and share links, restarts the service, enables BBR, and applies optional TCP tuning
-
-> Legacy sing-box nodes are not migrated automatically. OneVPS manages Xray under `/usr/local/etc/xray/`.
 
 ## Supported Technologies
 
 | Area | Supported options |
 | --- | --- |
 | Core | [Xray-core](https://github.com/XTLS/Xray-core) |
-| Protocols | VLESS, Trojan, Hysteria2, VMess |
-| Transports | TCP, WebSocket, QUIC (UDP) |
-| Security | REALITY, XTLS Vision, TLS terminated by Caddy |
+| Inbound protocols | VLESS Reality, Hysteria2 |
+| Inbound transports | TCP, QUIC (UDP) |
+| Security | REALITY, XTLS Vision, TLS terminated by Xray |
 | Service manager | systemd |
 | Architectures | amd64, arm64, armv7 |
 | Package managers | apt, dnf, yum, zypper |
@@ -183,12 +137,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/0nevps/OneVPS/main/onevps.sh
 ```
 
 The convenience command must be run from a root shell. On first use, select `1` to install or update Xray-core,
-then select `2` for a Reality node or `3` for a Trojan + WS node.
+then choose `2 → 1` for Reality or `2 → 3` for HY2.
 
 ## Menu
 
 The main menu groups tasks into categories; node and service actions live in dedicated submenus.
-Node users and outbounds are under `4`, then select a node and choose `7` or `8`.
+Node users and outbounds are under `2 → 4`, then select a node and choose `7` or `8`.
 Destructive actions are separated under **Danger zone** and retain their confirmation prompts.
 
 ```text
@@ -272,9 +226,7 @@ failures restore the previous metadata/configuration and attempt to restore the 
 Recovery failures are reported separately; this is not a guarantee against power loss during file replacement.
 Invalid links or failed validation leave the active files untouched.
 Normalized proxy settings contain secrets in the metadata, generated configuration, and any recovery backups;
-protect these files. Upstream credentials are not added to client share links. Older scripts may ignore
-outbound settings and restore direct routing when rebuilding; do not downgrade and rebuild if the selected
-exit must be preserved.
+protect these files. Upstream credentials are not added to client share links.
 
 The independent core check requires a real binary and fails if it is missing:
 
@@ -282,7 +234,9 @@ The independent core check requires a real binary and fails if it is missing:
 XRAY_TEST_BIN=/absolute/path/to/xray bash tests/test_xray_outbounds.sh
 ```
 
-VMess upstream import is also available; see the VMess section for its strict v2 JSON/TLS subset.
+VMess upstream import accepts v2rayN v2 `vmess://BASE64(JSON)` links with TCP or WS over TLS and `aid=0`.
+Supported encryption: `auto`, `aes-128-gcm`, `chacha20-poly1305`. Standard Base64 and Base64URL are accepted;
+unknown fields, insecure TLS, and unsupported transports are rejected.
 
 CI runs this check with Xray `26.3.27`. Configuration acceptance is not proof of upstream reachability;
 verify traffic through your intended exit separately.
@@ -291,8 +245,8 @@ verify traffic through your intended exit separately.
 
 Use the user management entry in a node's menu to add users, delete users, and display individual
 share links. Users belong only to that node; there are no global accounts or cross-node assignments.
-Different nodes may use the same user name. Each new Reality or VMess user gets an independent UUID, and each
-Trojan user gets an independent password. New users inherit the node outbound.
+Different nodes may use the same user name. Each Reality user gets an independent UUID; each HY2 user gets
+an independent password. New users inherit the node outbound.
 Names, user IDs, and credentials must be unique within the node; credentials must not collide with
 its default client either.
 
@@ -305,18 +259,8 @@ User additions, deletions, and outbound changes use the same candidate validatio
 rollback flow, require an installed Xray binary, and restart the service. User share links contain
 access credentials and should be treated as secrets; they never contain upstream outbound credentials.
 
-### Compatibility with former global users
-
-New node-local users are stored in `.nodes[].users`. Legacy top-level `users` and node `clients`
-fields remain preserved but ignored. They are not automatically migrated, cleaned up, or reactivated.
-Add any users who still need access to their intended node and distribute their new links.
-Replacing the script alone does not change the running Xray configuration. On the next configuration
-rebuild and application, legacy extra clients and their routes are not retained, and their old links
-no longer authorize access.
-
-Back up `onevps-nodes.json` and `config.json` before deployment. Restoring an older script and rebuilding
-may reactivate retained global users while ignoring new node-local users and outbound overrides.
-Do not downgrade to preserve this version's access controls or outbound settings.
+Node-local users are stored in `.nodes[].users`. Back up `onevps-nodes.json` and `config.json`
+before changing user access or routing.
 
 ## Realm port relay
 
@@ -396,33 +340,6 @@ candidates and ranks them by success rate and average latency. Operators can sti
 or enter a custom domain. If every probe fails, the script falls back to the first candidate and displays a
 warning.
 
-## Trojan + WebSocket Behind Caddy
-
-Menu `2` → `2` creates a Trojan node that shares port `443` with services already managed by Caddy.
-
-How it works:
-
-- The Xray Trojan inbound listens on **`127.0.0.1` only**, uses WebSocket transport, and does not terminate TLS.
-- Caddy terminates TLS for a dedicated subdomain and reverse-proxies a secret WebSocket path to the local inbound.
-- Other Caddy sites remain untouched.
-- Requests outside the secret path receive an HTTP 403 response backed by an editable page in
-  `/var/lib/onevps/sites/<domain>/index.html`.
-- The script appends a marked site block to the Caddyfile, validates the configuration, and reloads Caddy. A failed
-  reload rolls the appended block back.
-- Trojan nodes do not change firewall rules; Caddy remains the public endpoint.
-
-Requirements:
-
-- A dedicated subdomain with `A` or `AAAA` records pointing at the server
-- Reachable ports `80` and `443` for ACME and client traffic
-- Caddy, which OneVPS installs when absent using a supported package repository or a static binary fallback
-
-Share link format:
-
-```text
-trojan://PASSWORD@SUBDOMAIN:443?security=tls&sni=SUBDOMAIN&type=ws&host=SUBDOMAIN&path=PATH#NAME
-```
-
 ## Node Management
 
 Reality node actions:
@@ -447,31 +364,9 @@ Danger zone:
 0) Back
 ```
 
-Trojan node actions:
-
-```text
-Connection settings:
-1) Reset default password
-2) Change domain
-3) Change WS path
-4) Rebuild Caddy route
-
-Users / outbound:
-7) Manage node users
-8) Set node outbound
-
-Node status:
-5) Enable/disable node
-
-Danger zone:
-6) Delete node
-
-0) Back
-```
-
-`Rebuild Caddy route` regenerates the managed Caddy block without changing the node password, path, or port.
-Rotating Reality secrets or resetting Trojan credentials invalidates old client links; import the updated link
-from menu `2` → `5`.
+For HY2, `1` changes the UDP port and `2` resets the default password. User management, outbound assignment,
+enable/disable and deletion use the same numbers as Reality. After rotating keys or resetting credentials,
+import the updated link from `2 → 5`.
 
 ## Security Model
 
@@ -481,7 +376,6 @@ review and normal server hardening.
 - Node credentials and private keys are stored in `/usr/local/etc/xray/onevps-nodes.json` with restricted access.
 - Generated runtime configuration is validated before activation.
 - Xray runs without root privileges after installation.
-- Trojan inbounds are loopback-only; Caddy is the only public TLS endpoint for that mode.
 - Share links contain live credentials and must be handled as secrets.
 - The installation workflow downloads upstream installers or binaries at runtime. Operators should evaluate their
   network and upstream trust requirements before execution.
@@ -499,7 +393,7 @@ Report suspected vulnerabilities privately according to the [security policy](SE
 | `/usr/local/share/xray/` | geoip and geosite data |
 | `/etc/systemd/system/xray.service` | systemd service unit |
 | `/var/log/xray/` | Xray log directory |
-| `/var/lib/onevps/sites/<domain>/` | Editable 403 page for a Trojan subdomain |
+| `/var/lib/onevps/sites/<domain>/` | Editable 403 page for a managed certificate domain |
 
 Manual service management:
 
@@ -522,7 +416,7 @@ xray run -test -config /usr/local/etc/xray/config.json
 - amd64, arm64, or armv7 architecture
 - apt, dnf, yum, or zypper
 - `curl`, `jq`, `openssl`, and CA certificates; missing dependencies are installed automatically
-- Caddy only for Trojan + WS nodes; it is installed automatically when required
+- Caddy for HY2 certificate management; it is installed automatically when required
 
 Support is best-effort because distribution releases, package repositories, Xray, and Caddy change independently.
 When reporting a compatibility problem, include the distribution, version, architecture, package manager, and
@@ -551,10 +445,7 @@ Swap creation, swappiness, journald limits, conntrack tuning, slow-start-after-i
 are no longer part of this option. Existing swap, fstab and journald files are not removed, and previously
 applied runtime values are not reset to guessed defaults. Reapplying updates only OneVPS's tuning file.
 
-OneVPS no longer adds or offers a toggle for the default UDP/443 block. Legacy `block_udp443` metadata is
-ignored and retained. An installed Xray configuration loses the old rule only after regeneration and successful
-application; this does not guarantee QUIC support in clients, upstreams or the network. Private-address,
-BitTorrent and node/user outbound rules remain. Review settings against other server workloads before applying.
+OneVPS does not block UDP/443 by default. Private-address, BitTorrent and node/user outbound rules still apply.
 
 ## Uninstall
 
@@ -570,7 +461,7 @@ maintenance priorities are:
 
 - Keep generated Xray and Caddy configuration compatible with supported upstream releases
 - Improve failure handling and make host changes easier to audit or roll back
-- Expand automated coverage for configuration migrations, Caddy routes, and failure paths
+- Expand automated coverage for configuration validation, certificate management, and failure paths
 - Add disposable cross-distribution integration tests for host-level operations
 - Document compatibility results from different distributions and architectures
 - Review runtime downloads and release-integrity controls

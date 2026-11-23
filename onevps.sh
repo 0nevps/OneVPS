@@ -3,8 +3,6 @@
 # OneVPS - Xray node setup script
 # Protocols:
 #   - VLESS + TCP + REALITY + XTLS Vision + uTLS (standalone)
-#   - Trojan + WebSocket behind Caddy (coexists with Caddy-proxied sites)
-#   - VMess AEAD + WebSocket behind Caddy
 #   - Hysteria2 + QUIC + TLS (native Xray inbound)
 #
 set -euo pipefail
@@ -314,7 +312,7 @@ install_xray() {
   mkdir -p "$XRAY_DIR"
   [[ -f "$XRAY_NODES" ]] || echo '{"nodes":[]}' > "$XRAY_NODES"
   write_service
-  rebuild_config
+  rebuild_config || return 1
   ok "Xray $(installed_version) installed"
 }
 
@@ -363,7 +361,7 @@ port_taken_by_node() {
 }
 
 # ----------------------------------------------------------------------------
-# Caddy integration (for Trojan + WS nodes; shares Caddy's :443 + certs)
+# Caddy integration (HY2 certificates)
 # ----------------------------------------------------------------------------
 caddy_present() { command -v caddy >/dev/null 2>&1; }
 
@@ -474,7 +472,7 @@ EOF
 # failure. Sets CADDYFILE on success.
 ensure_caddy() {
   if ! caddy_present; then
-    warn "Caddy not found; installing (required for Trojan nodes)"
+    warn "Caddy not found; installing (required for HY2 certificate management)"
     if ! caddy_install_repo; then
       warn "repo install unavailable; falling back to static binary"
       caddy_install_binary || { err "Caddy install failed"; return 1; }
@@ -490,7 +488,7 @@ ensure_caddy() {
     mkdir -p /etc/caddy
     cat > "$cf" <<'EOF'
 # Managed alongside OneVPS. Caddy reverse-proxies real services here;
-# OneVPS appends marked Trojan-WS site blocks below.
+# OneVPS appends managed certificate domains below.
 :80 {
 	respond "OK" 200
 }
@@ -597,51 +595,19 @@ HTML
     chmod a+r "$root/index.html"
 }
 
-# Append a marked site block routing a secret WS path to a local Xray inbound.
-# Requests to the secret path are proxied to Xray (reverse_proxy handles the
-# WebSocket upgrade); every other path returns HTTP 403 with the styled 403
-# page, so the rest of the subdomain looks like a locked-down site.
-# Reverts the append if Caddy reload fails. Returns non-zero on failure.
-caddy_add_route() {
-  local id="$1" domain="$2" path="$3" port="$4" file="$5" route backup
-  [[ "$id" =~ ^[a-f0-9]+$ && "$path" =~ ^/[a-zA-Z0-9_/-]+$ && "$port" =~ ^[0-9]+$ ]] || return 1
-  caddy_domain_ensure "$domain" "$file" || return 1
-  route="$CADDY_STATE/routes/$domain/$id.caddy"
-  backup=$(mktemp "$CADDY_STATE/.route.XXXXXXXX") || return 1
-  [[ ! -f "$route" ]] || cp -p "$route" "$backup" || return 1
-  printf 'handle %s {\n    reverse_proxy 127.0.0.1:%s\n}\n' "$path" "$port" > "$route" || return 1
-  chmod 644 "$route" || return 1
-  if ! caddy_reload "$file"; then
-    if [[ -s "$backup" ]]; then cp -p "$backup" "$route"; else rm -f "$route"; fi
-    caddy_reload "$file" || true
-    rm -f "$backup"; return 1
-  fi
-  rm -f "$backup"
-}
-
-# Removing a node never removes the domain's certificate automation.
-caddy_remove_route() {
-  local id="$1" route
-  [[ "$id" =~ ^[a-f0-9]+$ ]] || return 1
-  for route in "$CADDY_STATE/routes/"*/"$id.caddy"; do
-    [[ ! -f "$route" ]] || rm -f "$route" || return 1
-  done
-
-}
-
 # ----------------------------------------------------------------------------
 # [3] Node storage + config generation
 # ----------------------------------------------------------------------------
 ensure_nodes_file() {
-  mkdir -p "$XRAY_DIR"
-  [[ -f "$XRAY_NODES" ]] || echo '{"nodes":[]}' > "$XRAY_NODES"
+  [[ ! -f "$XRAY_NODES" ]] || return 0
+  mkdir -p "$XRAY_DIR" && echo '{"nodes":[]}' > "$XRAY_NODES"
 }
 
 jq_update_nodes() {
-  ensure_nodes_file
+  ensure_nodes_file || return 1
   local t
   t=$(mktemp)
-  jq "$@" "$XRAY_NODES" > "$t" && mv "$t" "$XRAY_NODES"
+  jq "$@" "$XRAY_NODES" > "$t" && mv "$t" "$XRAY_NODES" || { rm -f "$t"; return 1; }
   secure_xray_files
 }
 
@@ -903,7 +869,7 @@ build_proxy_outbound() {
 build_outbound_routes() {
   local source="$1" rows row object tag proxy proxies='[]' rules assignments
   assignments=$(jq -c '
-    [.nodes[] | select(.enabled == true and (.type == "vless-reality" or .type == "vmess-ws" or .type == "trojan-ws" or .type == "hysteria2")) | . as $n |
+    [.nodes[] | select(.enabled == true) | . as $n |
       (if has("default_outbound") then
         {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
        else empty end),
@@ -938,9 +904,8 @@ render_config() {
     type=$(jq -r '.type' <<<"$n") || return 1
     case "$type" in
       vless-reality) ib=$(build_reality_inbound "$n") || return 1 ;;
-      trojan-ws|vmess-ws) ib=$(build_trojan_inbound "$n") || return 1 ;;
       hysteria2)     ib=$(build_hysteria_inbound "$n") || return 1 ;;
-      *) continue ;;
+      *) return 1 ;;
     esac
     inbounds=$(printf '%s\n%s\n' "$inbounds" "$ib" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
@@ -979,7 +944,7 @@ render_config() {
 }
 
 rebuild_config() {
-  ensure_nodes_file
+  ensure_nodes_file || return 1
   local tmp_conf chk_err
   tmp_conf=$(mktemp_json)
   render_config "$XRAY_NODES" "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
@@ -998,16 +963,14 @@ rebuild_config() {
   fi
 }
 
-# Legacy top-level users and node.clients remain ignored.
 node_clients() {
   jq -c '
     . as $n |
     [{uuid:.uuid,password:.password,email:(.tag + "@onevps")}] +
       [(.users // [])[] | . + {email:(([ $n.id, .id ] | tojson | @base64) + "@onevps-user")}] |
     map(if $n.type == "vless-reality" then {id:.uuid,flow:"xtls-rprx-vision",email}
-        elif $n.type == "vmess-ws" then {id:.uuid,email}
         elif $n.type == "hysteria2" then {auth:.password,email}
-        else {password,email} end)' <<<"$1"
+        else error("unsupported inbound") end)' <<<"$1"
 }
 
 validate_node_metadata() {
@@ -1024,14 +987,6 @@ validate_node_metadata() {
     all(.nodes[];
       . as $n |
       (.id | nonempty) and
-      (if .type == "vmess-ws" then
-        (.id | test("^[a-f0-9]+$")) and (.tag | nonempty) and (.name | nonempty) and
-        (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
-        (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
-        (.domain | type == "string" and test("^[a-z0-9.-]+$")) and
-        (.ws_path | type == "string" and test("^/[a-zA-Z0-9_/-]+$")) and
-        (.caddy_file | type == "string" and startswith("/")) and (.enabled | type == "boolean")
-       else true end) and
       (if .type == "hysteria2" then
         (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
         (.domain | type == "string" and test("^[A-Za-z0-9.-]+$")) and
@@ -1039,9 +994,9 @@ validate_node_metadata() {
         (.tls_key | type == "string" and startswith("/")) and
         (.enabled | type == "boolean") and (.tag | nonempty)
        else true end) and
-      (if .type == "vless-reality" or .type == "vmess-ws" then (.uuid | nonempty)
-       elif .type == "trojan-ws" or .type == "hysteria2" then (.password | nonempty)
-       else true end) and
+      (if .type == "vless-reality" then (.uuid | nonempty)
+       elif .type == "hysteria2" then (.password | nonempty)
+       else false end) and
       (if has("users") then (.users | type == "array") else true end) and
       ((.users // []) as $users |
         ([$users[].id] | length == (unique | length)) and
@@ -1049,11 +1004,11 @@ validate_node_metadata() {
         all($users[];
           (.id | type == "string" and test("^[A-Za-z0-9_-]+$") and . != "default") and
           (.name | type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]") | not)) and
-          (if $n.type == "vless-reality" or $n.type == "vmess-ws" then
+          (if $n.type == "vless-reality" then
              (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))
-           elif $n.type == "trojan-ws" or $n.type == "hysteria2" then (.password | nonempty)
+           elif $n.type == "hysteria2" then (.password | nonempty)
            else false end)) and
-        (if .type == "vless-reality" or .type == "vmess-ws" then ([.uuid, $users[].uuid] | map(ascii_downcase))
+        (if .type == "vless-reality" then ([.uuid, $users[].uuid] | map(ascii_downcase))
          else [.password, $users[].password] end | length == (unique | length))))
   ' "$1" >/dev/null 2>&1
 }
@@ -1156,7 +1111,7 @@ validate_node_selection() {
 prepare_node_user_change() {
   local source="$1" output="$2" id="$3" action="$4" uid="${5:-}" payload
   validate_node_metadata "$source" || return 1
-  jq -e --arg id "$id" 'any(.nodes[]; .id == $id and (.type == "vless-reality" or .type == "vmess-ws" or .type == "trojan-ws" or .type == "hysteria2"))' "$source" >/dev/null || return 1
+  jq -e --arg id "$id" 'any(.nodes[]; .id == $id)' "$source" >/dev/null || return 1
   case "$action" in
     add|reset) payload=$(jq -cse 'select(length == 1) | .[0]') || return 1 ;;
     delete)
@@ -1165,14 +1120,14 @@ prepare_node_user_change() {
       payload=null ;;
     *) return 1 ;;
   esac
-  if [[ "$action" == reset ]] && jq -e --arg id "$id" '.nodes[] | select(.id == $id) | (.type == "vless-reality" or .type == "vmess-ws")' "$source" >/dev/null; then
+  if [[ "$action" == reset ]] && jq -e --arg id "$id" '.nodes[] | select(.id == $id) | (.type == "vless-reality")' "$source" >/dev/null; then
     jq -e 'type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")' <<<"$payload" >/dev/null || return 1
   fi
   printf '%s\n' "$payload" | jq --slurpfile source "$source" --arg id "$id" --arg uid "$uid" --arg action "$action" '
     . as $payload | $source[0] | (.nodes[] | select(.id == $id)) |=
     if $action == "add" then .users = ((.users // []) + [$payload])
     elif $action == "delete" then .users |= map(select(.id != $uid))
-    elif .type == "vless-reality" or .type == "vmess-ws" then .uuid = $payload
+    elif .type == "vless-reality" then .uuid = $payload
     else .password = $payload end' > "$output" || return 1
   validate_node_metadata "$output"
 }
@@ -1186,7 +1141,7 @@ node_user_link() {
   if [[ "$uid" == default ]]; then node_link "$n"; return; fi
   selected=$(jq -ce --arg uid "$uid" '. as $n | (.users // [])[] | select(.id == $uid) |
     . as $u | $n | .name += (" / " + $u.name) |
-    if .type == "vless-reality" or .type == "vmess-ws" then .uuid = $u.uuid else .password = $u.password end' <<<"$n") || return 1
+    if .type == "vless-reality" then .uuid = $u.uuid else .password = $u.password end' <<<"$n") || return 1
   node_link "$selected"
 }
 
@@ -1222,7 +1177,7 @@ manage_node_users() {
       1)
         name=$(ask 'User name (Enter to cancel)'); [[ -n "$name" ]] || continue
         uid=$(openssl rand -hex 8) || return 1
-        if jq -e '.type == "vless-reality" or .type == "vmess-ws"' <<<"$n" >/dev/null; then
+        if jq -e '.type == "vless-reality"' <<<"$n" >/dev/null; then
           credential=$(rand_uuid) || return 1
           payload=$(printf '%s\n' "$credential" | jq -Rc --arg id "$uid" --arg name "$name" '{id:$id,name:$name,uuid:.}') || return 1
         else
@@ -1301,8 +1256,8 @@ caddy_state_init() {
     mkdir -p "$CADDY_STATE" && touch "$CADDY_STATE/.onevps-owned" || return 1
   fi
   [[ ! -L "$CADDY_STATE" ]] || return 1
-  mkdir -p "$CADDY_STATE/domains" "$CADDY_STATE/routes" "$CADDY_STATE/staging" "$ACME_CERT_DIR" || return 1
-  chmod 755 "$CADDY_STATE" "$CADDY_STATE/routes" || return 1
+  mkdir -p "$CADDY_STATE/domains" "$CADDY_STATE/staging" "$ACME_CERT_DIR" || return 1
+  chmod 755 "$CADDY_STATE" || return 1
   chmod 700 "$CADDY_STATE/domains" || return 1
   chmod 750 "$ACME_CERT_DIR" && chown root:"$(id -gn nobody)" "$ACME_CERT_DIR" || return 1
 }
@@ -1358,7 +1313,7 @@ caddy_domain_ensure() {
     jq -e --arg file "$file" '.caddy_file == $file' "$CADDY_STATE/domains/$domain.json" >/dev/null &&
       [[ $(grep -cxF "# OneVPS-domain:$domain BEGIN" "$file") == 1 ]] &&
       [[ $(grep -cxF "# OneVPS-domain:$domain END" "$file") == 1 ]] &&
-      grep -qxF "    import $CADDY_STATE/routes/$domain/*.caddy" "$file" || return 1
+      grep -qxF "$domain {" "$file" || return 1
     return 0
   fi
   if grep -qiF "$domain" "$file"; then err "unmanaged domain already appears in Caddyfile: $domain"; return 1; fi
@@ -1367,13 +1322,11 @@ caddy_domain_ensure() {
   ensure_site_content "$domain" || return 1
   backup=$(mktemp "$CADDY_STATE/.domain.XXXXXXXX") || return 1
   cp -p "$file" "$backup" || return 1
-  mkdir -p "$CADDY_STATE/routes/$domain" && chmod 755 "$CADDY_STATE/routes/$domain" || return 1
   cat >> "$file" <<EOF_SITE
 
 # OneVPS-domain:$domain BEGIN
 $domain {
     root * $site_root
-    import $CADDY_STATE/routes/$domain/*.caddy
     handle {
         error 403
     }
@@ -1454,7 +1407,7 @@ EOF_TIMER
 caddy_certificate_issue() (
   local domain="$1" file i
   acme_domain_valid "$domain" || return 1
-  prepare_caddy_for_trojan || return 1
+  prepare_caddy_for_certificates || return 1
   exec 9> "$CADDY_STATE/operation.lock"
   flock -n 9 || { err 'another Caddy certificate operation is running'; return 1; }
   file=$(find_caddyfile)
@@ -1468,8 +1421,7 @@ caddy_certificate_issue() (
   return 1
 )
 
-# Configure Caddy for new deployments without inspecting or migrating old resources.
-prepare_caddy_for_trojan() (
+prepare_caddy_for_certificates() (
   local file backup active=false enabled=false committed=false sync_enabled=false
   caddy_state_init || return 1
   exec 8> "$CADDY_STATE/operation.lock"
@@ -1678,7 +1630,7 @@ add_hysteria_node() {
   command -v ss >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 || {
     err 'Hysteria2 setup requires ss (iproute2) and runuser (util-linux)'; pause; return 0;
   }
-  ensure_nodes_file
+  ensure_nodes_file || return 1
   local name domain password cert key port id node
   info 'Add Hysteria2 (native Xray, QUIC/UDP + TLS)'
   warn 'Use a DNS-only domain pointing to this server. Caddy manages TLS; public TCP 80/443 must be reachable.'
@@ -1742,35 +1694,6 @@ build_reality_inbound() {
           privateKey: $pk,
           shortIds: [$sid]
         }
-      },
-      sniffing: {
-        enabled: true,
-        destOverride: ["http", "tls"],
-        routeOnly: true
-      }
-    }'
-}
-
-# Trojan inbound: listens on loopback only; Caddy terminates TLS on :443 and
-# reverse-proxies the WS path here. No TLS at the Xray layer.
-build_trojan_inbound() {
-  local n="$1" clients
-  clients=$(node_clients "$n") || return 1
-  printf '%s\n%s\n' "$n" "$clients" | jq -s '
-    .[0] as $n | .[1] as $clients |
-    $n.tag as $tag | $n.port as $port | $n.ws_path as $path |
-    {
-      tag: $tag,
-      listen: "127.0.0.1",
-      port: $port,
-      protocol: (if $n.type == "vmess-ws" then "vmess" else "trojan" end),
-      settings: {
-        clients: $clients
-      },
-      streamSettings: {
-        network: "ws",
-        security: "none",
-        wsSettings: { path: $path }
       },
       sniffing: {
         enabled: true,
@@ -1891,7 +1814,7 @@ pick_reality_target() {
 # ----------------------------------------------------------------------------
 add_reality_node() {
   require_xray
-  ensure_nodes_file
+  ensure_nodes_file || return 1
   echo; info "Add node - VLESS + TCP + REALITY + Vision + uTLS"
 
   local name uuid id default_port port target pk pubk sid node
@@ -1944,7 +1867,7 @@ add_reality_node() {
       enabled: true
     }')
 
-  jq_update_nodes --argjson node "$node" '.nodes += [$node]'
+  jq_update_nodes --argjson node "$node" '.nodes += [$node]' || return 1
   open_port "$port" tcp
 
   if rebuild_config; then
@@ -1960,99 +1883,10 @@ add_reality_node() {
 }
 
 # ----------------------------------------------------------------------------
-# [4b] Add Trojan + WS node (behind Caddy)
-# ----------------------------------------------------------------------------
-add_trojan_node() {
-  local node_type="${1:-trojan-ws}"
-  require_xray
-  ensure_nodes_file
-  echo; info "Add node - $node_type + WebSocket (behind Caddy)"
-
-  if ! prepare_caddy_for_trojan; then
-    err "Caddy required for WebSocket nodes but could not be installed"
-    pause; return
-  fi
-  local cfile
-  cfile=$(find_caddyfile)
-  if [[ -z "$cfile" ]]; then
-    err "Caddyfile still not found after install"
-    pause; return
-  fi
-  info "using Caddyfile: $cfile"
-
-  local name domain password path id port node
-  name=$(ask "Node name" "${node_type%-ws}-$(openssl rand -hex 2)")
-
-  domain=$(normalize_domain "$(ask "Subdomain (DNS A/AAAA -> this server)")")
-  while ! is_valid_domain "$domain"; do
-    warn "invalid domain"
-    domain=$(normalize_domain "$(ask "Subdomain")")
-  done
-  if grep -qiF "$domain" "$cfile" 2>/dev/null && [[ ! -f "$CADDY_STATE/domains/$domain.json" ]]; then
-    err "$domain already appears in $cfile; pick another subdomain or remove the existing block first"
-    pause; return
-  fi
-
-  if [[ "$node_type" == vmess-ws ]]; then
-    password=$(ask_uuid)
-    warn 'VMess requires synchronized clocks (UTC error below 120 seconds).'
-  else
-    password=$(ask "Password (Enter for random)" "$(rand_password)")
-  fi
-  path="/$(openssl rand -hex 8)"
-  id=$(openssl rand -hex 4)
-  port=$(rand_port)   # loopback-only inbound; firewall untouched
-
-  node=$(jq -n \
-    --arg id "$id" --arg name "$name" --arg tag "trojan-$id" \
-    --argjson port "$port" --arg pw "$password" \
-    --arg domain "$domain" --arg path "$path" --arg cfile "$cfile" '
-    {
-      id: $id,
-      type: "trojan-ws",
-      name: $name,
-      tag: $tag,
-      port: $port,
-      password: $pw,
-      domain: $domain,
-      ws_path: $path,
-      caddy_file: $cfile,
-      enabled: true
-    }')
-
-  if [[ "$node_type" == vmess-ws ]]; then
-    node=$(jq -c '.type = "vmess-ws" | .tag = ("vmess-" + .id) | .uuid = .password | del(.password)' <<<"$node") || return 1
-    if apply_vmess_change "$id" add <<<"$node"; then
-      ok 'VMess node added'; node_link "$node"
-    else err 'VMess node not added'; fi
-    pause; return
-  fi
-  jq_update_nodes --argjson node "$node" '.nodes += [$node]'
-
-  if ! caddy_add_route "$id" "$domain" "$path" "$port" "$cfile"; then
-    err "Caddy update failed, rolled back"
-    jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
-    pause; return
-  fi
-
-  if rebuild_config; then
-    ok "Trojan node added"
-    info "ensure DNS A/AAAA for $domain points here so Caddy can issue its cert"
-    node_link "$(node_by_id "$id")"
-  else
-    err "Xray config generation failed, rolled back"
-    caddy_remove_route "$id" "$cfile"; caddy_reload "$cfile" || true
-    jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
-    rebuild_config || true
-  fi
-  pause
-}
-
-# ----------------------------------------------------------------------------
 # Share links
 # ----------------------------------------------------------------------------
 node_link() {
-  local n="$1" type name port link addr uuid sni pubk sid spx fp pw domain path
+  local n="$1" type name port link addr uuid sni pubk sid spx fp pw domain
   type=$(jq -r '.type' <<<"$n")
   name=$(jq -r '.name' <<<"$n")
   port=$(jq -r '.port' <<<"$n")
@@ -2074,32 +1908,20 @@ node_link() {
       "$(jq -r '.reality_target' <<<"$n")" "$(jq -r '.reality_target_port // 443' <<<"$n")" \
       "$(jq -r '.fingerprint // "chrome"' <<<"$n")" "$(jq -r '.reality_short_id' <<<"$n")" "$c_rst"
 
-  elif [[ "$type" == "vmess-ws" ]]; then
-    link=$(jq -cj '{v:"2",ps:.name,add:.domain,port:"443",id:.uuid,aid:"0",scy:"auto",
-      net:"ws",type:"none",host:.domain,path:.ws_path,tls:"tls",sni:.domain}' <<<"$n" | openssl base64 -A) || return 1
-    printf '\n%s-- %s (VMess AEAD + WS behind Caddy) --%s\nvmess://%s\n' "$c_grn" "$name" "$c_rst" "$link"
   elif [[ "$type" == "hysteria2" ]]; then
     pw=$(jq -r '.password' <<<"$n")
     domain=$(jq -r '.domain' <<<"$n")
     printf '\n%s-- %s (Hysteria2 + QUIC + TLS) --%s\n' "$c_grn" "$name" "$c_rst"
     printf 'hysteria2://%s@%s:%s/?sni=%s#%s\n' \
       "$(urlenc "$pw")" "$domain" "$port" "$(urlenc "$domain")" "$(urlenc "$name")"
-  elif [[ "$type" == "trojan-ws" ]]; then
-    pw=$(jq -r '.password' <<<"$n")
-    domain=$(jq -r '.domain' <<<"$n")
-    path=$(jq -r '.ws_path' <<<"$n")
-    link="trojan://$(urlenc "$pw")@${domain}:443?security=tls&sni=${domain}&type=ws&host=${domain}&path=$(urlenc "$path")#$(urlenc "$name")"
-    echo
-    printf '%s-- %s (Trojan + WS behind Caddy) --%s\n' "$c_grn" "$name" "$c_rst"
-    echo "$link"
-    printf '%sDomain: %s  path: %s  upstream: 127.0.0.1:%s%s\n' "$c_ylw" \
-      "$domain" "$path" "$port" "$c_rst"
+  else
+    err 'invalid node type'; return 1
   fi
 }
 
 show_links() {
   require_xray
-  ensure_nodes_file
+  ensure_nodes_file || return 1
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes"; pause; return; }
   local n
   while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$XRAY_NODES")
@@ -2115,10 +1937,9 @@ list_nodes() {
     i=$((i+1))
     en=$(jq -r '.enabled' <<<"$n"); st="enabled"; [[ "$en" == true ]] || st="disabled"
     case "$(jq -r '.type' <<<"$n")" in
-      vmess-ws) kind="vmess"; dest=$(jq -r '.domain' <<<"$n") ;;
-      trojan-ws) kind="trojan"; dest=$(jq -r '.domain' <<<"$n") ;;
       hysteria2) kind="hy2"; dest=$(jq -r '.domain' <<<"$n") ;;
-      *)         kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
+      vless-reality) kind="reality"; dest=$(jq -r '.reality_target' <<<"$n") ;;
+      *) kind="invalid"; dest="-" ;;
     esac
     printf '  %d) %-18s %-8s port:%-6s %-26s %s\n' \
       "$i" "$(jq -r '.name' <<<"$n")" "$kind" "$(jq -r '.port' <<<"$n")" \
@@ -2140,7 +1961,7 @@ pick_node() {
 
 manage_nodes() {
   require_xray
-  ensure_nodes_file
+  ensure_nodes_file || return 1
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes, add one first"; pause; return; }
   local id n type
   id=$(pick_node)
@@ -2150,12 +1971,12 @@ manage_nodes() {
 
   while :; do
     clear
-    node_link "$n"
+    node_link "$n" || { pause; return; }
     if [[ "$type" == "hysteria2" ]]; then
       printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
       case "$(ask 'Select')" in
         1) edit_port "$id" ;;
-        2) reset_trojan_password "$id" ;;
+        2) reset_hy2_password "$id" ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id"; return ;;
         7) manage_node_users "$id" || true ;;
@@ -2163,40 +1984,7 @@ manage_nodes() {
         0|"") return ;;
         *) continue ;;
       esac
-    elif [[ "$type" == "trojan-ws" || "$type" == "vmess-ws" ]]; then
-      cat <<EOF
-
-  Connection settings:
-   1) Reset default credential (password / UUID)
-   2) Change domain
-   3) Change WS path
-   4) Rebuild Caddy route
-
-  Users / outbound:
-   7) Manage node users
-   8) Set node outbound
-
-  Node status:
-   5) Enable/disable node
-
-  Danger zone:
-   6) Delete node
-
-   0) Back
-EOF
-      case "$(ask 'Select')" in
-        1) if [[ "$type" == vmess-ws ]]; then reset_uuid "$id"; else reset_trojan_password "$id"; fi ;;
-        2) edit_trojan_domain "$id" ;;
-        3) edit_trojan_path "$id" ;;
-        4) rebuild_trojan_route "$id" ;;
-        5) toggle_enabled "$id" ;;
-        6) del_node "$id"; return ;;
-        7) manage_node_users "$id" || true ;;
-        8) manage_outbound "$id" || true ;;
-        0|"") return ;;
-        *) continue ;;
-      esac
-    else
+    elif [[ "$type" == "vless-reality" ]]; then
       cat <<EOF
 
   Connection settings:
@@ -2262,7 +2050,7 @@ edit_port() {
     else err 'port unchanged'; fi
     pause; return
   fi
-  jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p'
+  jq_update_nodes --arg id "$id" --argjson p "$newp" '(.nodes[]|select(.id==$id)).port = $p' || return 1
   if [[ "$newp" != "$oldp" ]]; then close_port "$oldp" tcp; fi
   open_port "$newp" tcp
   rebuild_config && ok "port changed to $newp" || err "apply failed"
@@ -2284,7 +2072,7 @@ rotate_reality_secret() {
   sid=$(rand_short_id)
   jq_update_nodes --arg id "$id" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
     (.nodes[]|select(.id==$id)) |=
-      (.reality_private_key=$pk | .reality_public_key=$pubk | .reality_short_id=$sid)'
+      (.reality_private_key=$pk | .reality_public_key=$pubk | .reality_short_id=$sid)' || return 1
   rebuild_config && ok "Reality keypair rotated" || err "apply failed"
   pause
 }
@@ -2293,89 +2081,12 @@ edit_reality_target() {
   local id="$1" target
   target=$(pick_reality_target)
   jq_update_nodes --arg id "$id" --arg target "$target" '
-    (.nodes[]|select(.id==$id)) |= (.reality_sni=$target | .reality_target=$target | .reality_target_port=443)'
+    (.nodes[]|select(.id==$id)) |= (.reality_sni=$target | .reality_target=$target | .reality_target_port=443)' || return 1
   rebuild_config && ok "target changed to $target" || err "apply failed"
   pause
 }
 
-prepare_vmess_change() {
-  local source="$1" output="$2" id="$3" action="$4" value
-  validate_node_metadata "$source" || return 1
-  value=$(jq -cs 'if length == 1 then .[0] else error("one value required") end') || return 1
-  if [[ "$action" == add ]]; then
-    jq -e --arg id "$id" 'all(.nodes[]; .id != $id)' "$source" >/dev/null || return 1
-    jq -e --arg id "$id" '.id == $id and .type == "vmess-ws"' <<<"$value" >/dev/null || return 1
-  else
-    jq -e --arg id "$id" 'any(.nodes[]; .id == $id and .type == "vmess-ws")' "$source" >/dev/null || return 1
-  fi
-  printf '%s\n' "$value" | jq --slurpfile source "$source" --arg id "$id" --arg action "$action" '
-    . as $v | $source[0] |
-    if $action == "add" then .nodes += [$v]
-    elif $action == "delete" then .nodes |= map(select(.id != $id))
-    else (.nodes[] | select(.id == $id)) |=
-      if $action == "domain" then .domain = $v
-      elif $action == "path" then .ws_path = $v
-      elif $action == "toggle" then .enabled |= not
-      elif $action == "route" then .
-      else error("unsupported VMess action") end end' > "$output" || return 1
-  validate_node_metadata "$output"
-}
-
-# Preserve the route tree as well as the Xray transaction. Domain sites and
-# certificate automation deliberately survive node removal and failed setup.
-apply_vmess_change() (
-  local id="$1" action="$2" value work old new cf changed=false committed=false
-  value=$(jq -cs 'if length == 1 then .[0] else error("one value required") end') || return 1
-  work=$(mktemp -d) || return 1
-  rollback_vmess_route() {
-    local status=$?
-    trap - EXIT INT TERM HUP
-    if $changed && ! $committed; then
-      if ! caddy_remove_route "$id" ||
-         ! cp -Rp "$work/routes/." "$CADDY_STATE/routes/" || ! caddy_reload "$cf"; then
-        err "Caddy rollback failed; recovery retained at $work"; exit 1
-      fi
-    fi
-    rm -rf "$work"
-    exit "$status"
-  }
-  trap rollback_vmess_route EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM HUP
-  prepare_vmess_change "$XRAY_NODES" "$work/nodes.json" "$id" "$action" <<<"$value" || return 1
-  if [[ "$action" != delete ]]; then
-    jq -e --arg id "$id" '
-      .nodes as $nodes | $nodes[] | select(.id == $id) | . as $n |
-      all($nodes[]; .id == $id or
-        ((.type != "trojan-ws" and .type != "vmess-ws") or
-         (.domain != $n.domain or .ws_path != $n.ws_path)))
-    ' "$work/nodes.json" >/dev/null || { err 'WebSocket route already belongs to another node'; return 1; }
-  fi
-  render_config "$work/nodes.json" "$work/config.json" || return 1
-  validate_xray_config "$work/config.json" "$work/check.log" || return 1
-  old=$(node_by_id "$id") || return 1
-  new=$(jq -c --arg id "$id" '.nodes[] | select(.id == $id)' "$work/nodes.json") || return 1
-  if [[ "$action" != toggle ]]; then
-    cf=$(jq -r '.caddy_file' <<<"${new:-$old}") || return 1
-    mkdir -p "$work/routes" "$CADDY_STATE/routes" || return 1
-    # Save only this node's routes; never roll back unrelated nodes.
-    local route domain
-    for route in "$CADDY_STATE/routes/"*/"$id.caddy"; do
-      [[ -f "$route" ]] || continue
-      domain=$(basename "$(dirname "$route")")
-      mkdir -p "$work/routes/$domain" && cp -p "$route" "$work/routes/$domain/" || return 1
-    done
-    changed=true
-    caddy_remove_route "$id" || return 1
-    if [[ -n "$new" ]]; then
-      caddy_add_route "$id" "$(jq -r '.domain' <<<"$new")" "$(jq -r '.ws_path' <<<"$new")" "$(jq -r '.port' <<<"$new")" "$cf" || return 1
-    else caddy_reload "$cf" || return 1; fi
-  fi
-  apply_candidate_transaction prepare_vmess_change "$id" "$action" <<<"$value" || return 1
-  committed=true
-)
-
-reset_trojan_password() {
+reset_hy2_password() {
   local id="$1" pw
   pw=$(ask "New default password (Enter for random)" "$(rand_password)")
   printf '%s\n' "$pw" | jq -R . | apply_node_user_change "$id" reset || { err 'apply failed'; return 1; }
@@ -2383,117 +2094,23 @@ reset_trojan_password() {
   pause
 }
 
-edit_trojan_domain() {
-  local id="$1" n cf port path olddom newdom
-  n=$(node_by_id "$id")
-  cf=$(jq -r '.caddy_file' <<<"$n")
-  port=$(jq -r '.port' <<<"$n")
-  path=$(jq -r '.ws_path' <<<"$n")
-  olddom=$(jq -r '.domain' <<<"$n")
-  newdom=$(normalize_domain "$(ask "New subdomain (DNS A/AAAA -> this server)" "$olddom")")
-  while ! is_valid_domain "$newdom"; do
-    warn "invalid domain"
-    newdom=$(normalize_domain "$(ask "New subdomain")")
-  done
-  if [[ "$newdom" == "$olddom" ]]; then warn "unchanged"; pause; return; fi
-  if [[ $(jq -r '.type' <<<"$n") == vmess-ws ]]; then
-    printf '%s\n' "$newdom" | jq -R . | apply_vmess_change "$id" domain && ok 'domain changed' || err 'domain unchanged'
-    pause; return
-  fi
-
-  # Drop our old block first so the collision check ignores it.
-  caddy_remove_route "$id" "$cf"
-  if grep -qiF "$newdom" "$cf" 2>/dev/null && [[ ! -f "$CADDY_STATE/domains/$newdom.json" ]]; then
-    err "$newdom already appears in $cf; restoring old route"
-    caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
-    pause; return
-  fi
-  if ! caddy_add_route "$id" "$newdom" "$path" "$port" "$cf"; then
-    err "Caddy update failed; restoring old route"
-    caddy_add_route "$id" "$olddom" "$path" "$port" "$cf" || true
-    pause; return
-  fi
-  jq_update_nodes --arg id "$id" --arg d "$newdom" \
-    '(.nodes[]|select(.id==$id)).domain = $d'
-  rebuild_config && ok "domain changed to $newdom" || err "apply failed"
-  info "ensure DNS for $newdom points here so Caddy can issue its cert"
-  pause
-}
-
-edit_trojan_path() {
-  local id="$1" n cf port domain newpath
-  n=$(node_by_id "$id")
-  cf=$(jq -r '.caddy_file' <<<"$n")
-  port=$(jq -r '.port' <<<"$n")
-  domain=$(jq -r '.domain' <<<"$n")
-  newpath=$(ask "New WS path" "$(jq -r '.ws_path' <<<"$n")")
-  [[ "$newpath" == /* ]] || newpath="/$newpath"
-  if [[ $(jq -r '.type' <<<"$n") == vmess-ws ]]; then
-    printf '%s\n' "$newpath" | jq -R . | apply_vmess_change "$id" path && ok 'path changed' || err 'path unchanged'
-    pause; return
-  fi
-  caddy_remove_route "$id" "$cf"
-  if ! caddy_add_route "$id" "$domain" "$newpath" "$port" "$cf"; then
-    err "Caddy update failed"; pause; return
-  fi
-  jq_update_nodes --arg id "$id" --arg p "$newpath" \
-    '(.nodes[]|select(.id==$id)).ws_path = $p'
-  rebuild_config && ok "WS path changed to $newpath" || err "apply failed"
-  pause
-}
-
-# Regenerate the Caddy block for an existing node from its stored fields,
-# without changing the password/path/port (share link stays valid). Use after
-# updating the script to roll an old node onto the current Caddy template.
-rebuild_trojan_route() {
-  local id="$1" n cf domain path port
-  n=$(node_by_id "$id")
-  if [[ $(jq -r '.type' <<<"$n") == vmess-ws ]]; then
-    apply_vmess_change "$id" route <<<null && ok 'route rebuilt' || err 'rebuild failed'
-    pause; return
-  fi
-  cf=$(jq -r '.caddy_file' <<<"$n")
-  domain=$(jq -r '.domain' <<<"$n")
-  path=$(jq -r '.ws_path' <<<"$n")
-  port=$(jq -r '.port' <<<"$n")
-  if [[ ! -f "$cf" ]]; then
-    cf=$(find_caddyfile)
-    [[ -n "$cf" ]] || { err "Caddyfile not found"; pause; return; }
-  fi
-  caddy_remove_route "$id" "$cf"
-  if caddy_add_route "$id" "$domain" "$path" "$port" "$cf"; then
-    ok "Caddy route rebuilt for $domain"
-  else
-    err "rebuild failed"
-  fi
-  pause
-}
-
 toggle_enabled() {
   local id="$1"
-  if [[ $(node_by_id "$id" | jq -r '.type') == vmess-ws ]]; then
-    apply_vmess_change "$id" toggle <<<null && ok 'enabled state toggled' || err 'apply failed'
-    pause; return
-  fi
   if [[ $(node_by_id "$id" | jq -r '.type') == hysteria2 ]]; then
     apply_candidate_transaction prepare_hy2_change "$id" toggle && ok 'enabled state toggled' || err 'apply failed'
     pause; return
   fi
-  jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)'
+  jq_update_nodes --arg id "$id" '(.nodes[]|select(.id==$id)).enabled |= (.|not)' || return 1
   rebuild_config && ok "enabled state toggled" || err "apply failed"
   pause
 }
 
 del_node() {
-  local id="$1" n port type cf
+  local id="$1" n port type
   confirm "Delete this node?" n || return
   n=$(node_by_id "$id")
   port=$(jq -r '.port' <<<"$n")
   type=$(jq -r '.type' <<<"$n")
-  if [[ "$type" == vmess-ws ]]; then
-    apply_vmess_change "$id" delete <<<null && ok 'deleted; Caddy domain and certificates kept' || err 'delete failed'
-    pause; return
-  fi
   if [[ "$type" == hysteria2 ]]; then
     if apply_candidate_transaction prepare_hy2_change "$id" delete; then
       close_port "$port" udp
@@ -2501,13 +2118,8 @@ del_node() {
     else err 'delete failed'; fi
     pause; return
   fi
-  jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))'
-  if [[ "$type" == "trojan-ws" ]]; then
-    cf=$(jq -r '.caddy_file' <<<"$n")
-    caddy_remove_route "$id" "$cf"; caddy_reload "$cf" || true
-  else
-    close_port "$port" tcp
-  fi
+  jq_update_nodes --arg id "$id" 'del(.nodes[]|select(.id==$id))' || return 1
+  close_port "$port" tcp
   rebuild_config && ok "deleted" || err "apply failed"
   pause
 }
@@ -2692,14 +2304,6 @@ uninstall() {
   warn "Uninstall removes Xray binary, config, onevps nodes and logs"
   warn "(BBR/system tuning configs and the swap file are kept)"
   confirm "Confirm uninstall?" n || return
-  local node route_id route_file
-  while IFS= read -r node; do
-    route_id=$(jq -r '.id' <<< "$node")
-    route_file=$(jq -r '.caddy_file' <<< "$node")
-    caddy_remove_route "$route_id" "$route_file" && caddy_reload "$route_file" || {
-      err 'Caddy route cleanup failed; Xray uninstall cancelled'; return 1;
-    }
-  done < <(jq -c '.nodes[] | select(.type == "trojan-ws" or .type == "vmess-ws")' "$XRAY_NODES")
   systemctl disable --now onevps-caddy-sync.timer 2>/dev/null || true
   warn 'Caddy domain sites and certificates are retained; certificate sync to Xray is disabled.'
   systemctl stop xray 2>/dev/null || true
@@ -3044,14 +2648,12 @@ status_line() {
 
 node_menu() {
   while :; do
-    printf '\nNodes / share links:\n1) Add VLESS Reality\n2) Add Trojan WS\n3) Add Hysteria2\n4) Manage nodes / users / outbound\n5) Show share links\n6) Add VMess WS\n0) Back\n'
+    printf '\nNodes / share links:\n1) Add VLESS Reality\n3) Add Hysteria2\n4) Manage nodes / users / outbound\n5) Show share links\n0) Back\n'
     case "$(ask 'Select')" in
       1) add_reality_node ;;
-      2) add_trojan_node ;;
       3) add_hysteria_node ;;
       4) manage_nodes ;;
       5) show_links ;;
-      6) add_trojan_node vmess-ws ;;
       0|"") return ;;
       *) warn 'invalid selection' ;;
     esac

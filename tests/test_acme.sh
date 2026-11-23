@@ -84,19 +84,15 @@ check 'error handler serves index internally' grep -q 'rewrite \* /index.html' "
 mkdir -p "$TMP/sites/other.example.com"
 printf 'custom forbidden page\n' > "$TMP/sites/other.example.com/index.html"
 cp "$TMP/sites/other.example.com/index.html" "$TMP/custom-index"
-check 'Trojan reuses HY2 domain' caddy_add_route abcd example.com /secret 12345 "$CADDYFILE"
+check 'reuse managed certificate domain' caddy_domain_ensure example.com "$CADDYFILE"
 check 'only one domain site' test "$(grep -c '^example.com {' "$CADDYFILE")" = 1
-check 'Trojan path fragment exists' grep -q 'reverse_proxy' "$CADDY_STATE/routes/example.com/abcd.caddy"
-caddy_remove_route abcd "$CADDYFILE"
-check 'deleting Trojan preserves certificate site' grep -q '^example.com {' "$CADDYFILE"
-reject 'deleting Trojan removes only fragment' test -f "$CADDY_STATE/routes/example.com/abcd.caddy"
-check 'Trojan-first domain created' caddy_add_route bcde other.example.com /other 12346 "$CADDYFILE"
+reject 'new domain has no proxy route import' grep -q 'import .*routes/' "$CADDYFILE"
+check 'second certificate domain created' caddy_domain_ensure other.example.com "$CADDYFILE"
 check 'existing custom index preserved' cmp "$TMP/custom-index" "$TMP/sites/other.example.com/index.html"
-check 'HY2 reuses Trojan domain' caddy_domain_ensure other.example.com "$CADDYFILE"
-check 'Trojan-first site remains unique' test "$(grep -c '^other.example.com {' "$CADDYFILE")" = 1
 printf '\nexternal.example.com {\n respond 200\n}\n' >> "$CADDYFILE"
-reject 'unknown site not overwritten' caddy_domain_ensure external.example.com "$CADDYFILE"
 cp "$CADDYFILE" "$TMP/before-domain-failure"
+reject 'unknown site not overwritten' caddy_domain_ensure external.example.com "$CADDYFILE"
+check 'external site is untouched' cmp "$CADDYFILE" "$TMP/before-domain-failure"
 RELOAD_STATUS=1
 reject 'failed domain reload' caddy_domain_ensure failed.example.com "$CADDYFILE"
 check 'failed domain reload restores file' cmp "$CADDYFILE" "$TMP/before-domain-failure"
@@ -125,20 +121,14 @@ check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
   ensure_caddy() { return 0; }
   caddy_tcp_https() { echo '# changed' >> "$1"; return 0; }
   caddy_reload() { return 1; }
-  reject 'setup reload failure' prepare_caddy_for_trojan
+  reject 'setup reload failure' prepare_caddy_for_certificates
   check 'setup restores original Caddyfile' cmp "$CADDYFILE" "$TMP/setup-original"
   check 'setup stops newly started Caddy after failure' grep -qx 'stop caddy' "$TMP/setup-services"
   caddy_reload() { return 0; }
   caddy_sync_install() { return 1; }
-  reject 'sync install failure rolls back setup' prepare_caddy_for_trojan
+  reject 'sync install failure rolls back setup' prepare_caddy_for_certificates
   check 'sync failure restores original configuration' cmp "$CADDYFILE" "$TMP/setup-original"
   caddy_sync_install() { return 0; }
-  check 'new deployment setup succeeds' prepare_caddy_for_trojan
-  check 'setup is repeatable' prepare_caddy_for_trojan
-  reject 'setup never manages old ACME timer' grep -q 'onevps-acme' "$TMP/setup-services"
-  printf '# OneVPS-trojan:abcd BEGIN\nold.example.com {\n respond 200\n}\n# OneVPS-trojan:abcd END\n' > "$CADDYFILE"
-  cp "$CADDYFILE" "$TMP/old-untouched"
-  caddy_remove_route abcd "$CADDYFILE"
-  check 'route removal does not rewrite old resources' cmp "$CADDYFILE" "$TMP/old-untouched"
-  reject 'existing old site is not adopted' caddy_domain_ensure old.example.com "$CADDYFILE"
+  check 'new deployment setup succeeds' prepare_caddy_for_certificates
+  check 'setup is repeatable' prepare_caddy_for_certificates
 )
