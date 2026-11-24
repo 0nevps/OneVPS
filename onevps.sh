@@ -266,8 +266,8 @@ ensure_deps() {
 # [2] Install / update Xray
 # ----------------------------------------------------------------------------
 write_service() {
-  mkdir -p "$XRAY_DIR" /var/log/xray
-  cat > "$XRAY_SERVICE" <<EOF
+  mkdir -p "$XRAY_DIR" /var/log/xray || return 1
+  cat > "$XRAY_SERVICE" <<EOF || return 1
 [Unit]
 Description=Xray Service (OneVPS)
 Documentation=https://github.com/XTLS/Xray-core
@@ -292,8 +292,7 @@ ReadWritePaths=/var/log/xray
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable xray >/dev/null 2>&1 || true
+  systemctl daemon-reload && systemctl enable xray >/dev/null
 }
 
 secure_xray_files() {
@@ -316,8 +315,7 @@ install_xray() (
     || { rm -f "$tmp"; die "Xray install failed"; }
   rm -f "$tmp"
 
-  mkdir -p "$XRAY_DIR"
-  write_service
+  write_service || { err 'Cannot configure Xray service; installation did not finish'; return 1; }
   rebuild_config_locked || return 1
   ok "Xray $(installed_version) installed"
 )
@@ -2996,7 +2994,7 @@ EOF
    0) Exit
 EOF
     case "$(ask 'Select')" in
-      1) install_xray; pause ;;
+      1) install_xray || err 'Xray installation failed'; pause ;;
       2) node_menu ;;
       3) certificate_menu ;;
       4) realm_menu ;;

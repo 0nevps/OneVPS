@@ -518,6 +518,21 @@ printf 'active\n' > "$SERVICE_STATE"
 ) || fail 'restart action restarts once and propagates service failures'
 pass 'restart action restarts once and propagates service failures'
 (
+  XRAY_SERVICE="$TEST_TMP/install-test.service"
+  mkdir() { :; }
+  systemctl() {
+    printf '%s\n' "$1" >> "$TEST_TMP/service-setup-steps"
+    [[ "$1" != "$fail_step" ]]
+  }
+  fail_step=daemon-reload
+  if write_service; then exit 1; fi
+  [[ $(cat "$TEST_TMP/service-setup-steps") == daemon-reload ]] || exit 1
+  fail_step=enable
+  if write_service; then exit 1; fi
+  [[ -s "$XRAY_SERVICE" && $(tail -1 "$TEST_TMP/service-setup-steps") == enable ]]
+) || fail 'Xray service setup propagates reload and enable failures'
+pass 'Xray service setup propagates reload and enable failures'
+(
   xray_write_lock() { :; }; confirm() { :; }; pause() { :; }
   HY2_HOP_DIR="$TEST_TMP/hop-present"; mkdir "$HY2_HOP_DIR" || exit 1
   hy2_hop_apply() { echo hopping >> "$TEST_TMP/uninstall-steps"; }
