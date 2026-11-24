@@ -151,6 +151,14 @@ reject 'unknown site not overwritten' caddy_domain_ensure external.example.com "
 reject 'matching wildcard site not shadowed' caddy_domain_ensure one.wild.example.com "$CADDYFILE"
 check 'external site is untouched' cmp "$CADDYFILE" "$TMP/before-domain-failure"
 (
+  cat() { if (($# == 0)); then printf '# partial site block\n'; return 1; fi; command cat "$@"; }
+  caddy_reload() { touch "$TMP/unexpected-site-reload"; }
+  reject 'partial site write fails before reload' caddy_domain_ensure write.example.org "$CADDYFILE" static
+  check 'partial site write restores file' cmp "$CADDYFILE" "$TMP/before-domain-failure"
+  reject 'partial site write never reloaded' test -e "$TMP/unexpected-site-reload"
+  reject 'partial site not enrolled' test -e "$CADDY_STATE/sites/write.example.org.json"
+)
+(
   caddy() { return 1; }
   reject 'failed Caddy adaptation stops setup' caddy_domain_ensure inspect.example.com "$CADDYFILE" static
   check 'unreadable routes leave file intact' cmp "$CADDYFILE" "$TMP/before-domain-failure"

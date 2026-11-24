@@ -1412,8 +1412,8 @@ caddy_domain_ensure() {
   site_root=$(caddy_site_root "$domain")
   ensure_site_content "$domain" || return 1
   backup=$(mktemp "$CADDY_STATE/.domain.XXXXXXXX") || return 1
-  cp -p "$file" "$backup" || return 1
-  cat >> "$file" <<EOF_SITE
+  cp -p "$file" "$backup" || { rm -f "$backup"; return 1; }
+  if ! cat >> "$file" <<EOF_SITE
 
 # OneVPS-domain:$domain BEGIN
 $domain {
@@ -1428,6 +1428,11 @@ $domain {
 }
 # OneVPS-domain:$domain END
 EOF_SITE
+  then
+    if cp -p "$backup" "$file"; then rm -f "$backup"; err 'Cannot write Caddy site configuration';
+    else err "Cannot restore Caddyfile after write failure; backup retained: $backup"; fi
+    return 1
+  fi
   if ! caddy_reload "$file"; then
     cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup"; return 1
   fi
