@@ -222,11 +222,35 @@ check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
       python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' "$2" "$3"
     else command mv "$@"; fi
   }
-  systemctl() { touch "$TMP/unexpected-sync-publish-systemctl"; }
+  systemctl() { case "$1" in is-enabled|is-active) return 1 ;; esac; touch "$TMP/unexpected-sync-publish-systemctl"; }
   reject 'failed timer publication stops installation' caddy_sync_install
   check 'failed publication restores old runner' grep -Fxq 'old runner' "$CADDY_SYNC_RUNNER"
   check 'failed publication restores old service' grep -Fxq 'old service' "$ACME_UNIT_DIR/onevps-caddy-sync.service"
-  reject 'failed publication never calls systemctl' test -e "$TMP/unexpected-sync-publish-systemctl"
+  reject 'failed publication never changes systemd state' test -e "$TMP/unexpected-sync-publish-systemctl"
+)
+(
+  ACME_UNIT_DIR="$TMP/activate-units"; mkdir "$ACME_UNIT_DIR"
+  CADDY_SYNC_RUNNER="$TMP/activate-runner"
+  printf 'old runner\n' > "$CADDY_SYNC_RUNNER"
+  printf 'old service\n' > "$ACME_UNIT_DIR/onevps-caddy-sync.service"
+  printf 'old timer\n' > "$ACME_UNIT_DIR/onevps-caddy-sync.timer"
+  enabled=false; active=false
+  systemctl() {
+    case "$1" in
+      is-enabled) "$enabled" ;;
+      is-active) "$active" ;;
+      enable) enabled=true; active=true; return 1 ;;
+      disable) enabled=false; echo disable >> "$TMP/sync-rollback-steps" ;;
+      stop) active=false; echo stop >> "$TMP/sync-rollback-steps" ;;
+      daemon-reload) echo reload >> "$TMP/sync-rollback-steps" ;;
+      *) return 1 ;;
+    esac
+  }
+  reject 'timer activation failure rolls back' caddy_sync_install
+  check 'activation failure restores old runner' grep -Fxq 'old runner' "$CADDY_SYNC_RUNNER"
+  check 'activation failure restores old service' grep -Fxq 'old service' "$ACME_UNIT_DIR/onevps-caddy-sync.service"
+  check 'activation failure restores old timer' grep -Fxq 'old timer' "$ACME_UNIT_DIR/onevps-caddy-sync.timer"
+  check 'partly enabled timer is disabled and stopped' test "$(cat "$TMP/sync-rollback-steps")" = $'reload\ndisable\nstop\nreload'
 )
 (
   cp "$CADDY_SYNC_RUNNER" "$TMP/working-runner"

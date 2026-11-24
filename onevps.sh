@@ -1549,7 +1549,7 @@ validate_onevps_script() {
 
 caddy_sync_install() (
   local runner_work='' units service="$ACME_UNIT_DIR/onevps-caddy-sync.service" timer="$ACME_UNIT_DIR/onevps-caddy-sync.timer"
-  local published=0 complete=false index
+  local published=0 complete=false activation_started=false was_enabled=false was_active=false index
   local -a targets backups staged
   if [[ ! -f "$ONEVPS_SCRIPT_PATH" || ! -s "$ONEVPS_SCRIPT_PATH" ]]; then
     err 'Certificate sync requires the complete onevps.sh file. Download it before running bash.'; return 1
@@ -1561,6 +1561,14 @@ caddy_sync_install() (
     local result=$? restored=true entry
     trap - EXIT INT TERM HUP
     if ! $complete; then
+      if $activation_started; then
+        if ! $was_enabled && systemctl is-enabled --quiet onevps-caddy-sync.timer; then
+          systemctl disable onevps-caddy-sync.timer || restored=false
+        fi
+        if ! $was_active && systemctl is-active --quiet onevps-caddy-sync.timer; then
+          systemctl stop onevps-caddy-sync.timer || restored=false
+        fi
+      fi
       for ((entry=published-1; entry>=0; entry--)); do
         if [[ -e "${backups[entry]}" || -L "${backups[entry]}" ]]; then
           mv -Tf "${backups[entry]}" "${targets[entry]}" || restored=false
@@ -1568,6 +1576,11 @@ caddy_sync_install() (
           rm -f "${targets[entry]}" || restored=false
         fi
       done
+      if $activation_started; then
+        systemctl daemon-reload || restored=false
+        if $was_enabled; then systemctl enable onevps-caddy-sync.timer || restored=false; fi
+        if $was_active; then systemctl start onevps-caddy-sync.timer || restored=false; fi
+      fi
     fi
     if ! $restored; then
       err "Certificate sync rollback failed; recovery directories retained: $units and $runner_work"
@@ -1613,12 +1626,17 @@ EOF_TIMER
       cp -pP "${targets[index]}" "${backups[index]}" || return 1
     fi
   done
+  systemctl is-enabled --quiet onevps-caddy-sync.timer && was_enabled=true
+  systemctl is-active --quiet onevps-caddy-sync.timer && was_active=true
   for index in "${!targets[@]}"; do
     published=$((index + 1))
     mv -Tf "${staged[index]}" "${targets[index]}" || { err 'Cannot publish certificate sync files'; return 1; }
   done
+  activation_started=true
+  systemctl daemon-reload && systemctl enable --now onevps-caddy-sync.timer || {
+    err 'Cannot activate certificate sync timer'; return 1;
+  }
   complete=true
-  systemctl daemon-reload && systemctl enable --now onevps-caddy-sync.timer
 )
 
 caddy_certificate_issue() (
@@ -1639,7 +1657,7 @@ caddy_certificate_issue() (
 )
 
 prepare_caddy_for_certificates() (
-  local file backup active=false enabled=false committed=false sync_enabled=false
+  local file backup active=false enabled=false committed=false
   caddy_state_init || return 1
   exec 8> "$CADDY_STATE/operation.lock"
   flock -n 8 || { err 'another Caddy operation is running'; return 1; }
@@ -1648,13 +1666,11 @@ prepare_caddy_for_certificates() (
   [[ -z "$file" ]] || cp -p "$file" "$backup/Caddyfile" || return 1
   systemctl is-active --quiet caddy && active=true
   systemctl is-enabled --quiet caddy && enabled=true
-  systemctl is-enabled --quiet onevps-caddy-sync.timer && sync_enabled=true
   rollback_caddy_setup() {
     local status=$? failed=false current
     trap - EXIT INT TERM HUP
     if ! $committed; then
       status=1
-      if ! $sync_enabled; then systemctl disable --now onevps-caddy-sync.timer || failed=true; fi
       current=$(find_caddyfile)
       if [[ -f "$backup/Caddyfile" ]]; then cp -p "$backup/Caddyfile" "$file" || failed=true
       elif [[ -n "$current" ]]; then rm -f "$current" || failed=true; fi
