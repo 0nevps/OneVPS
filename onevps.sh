@@ -1016,9 +1016,10 @@ validate_node_metadata() {
     [[ -n "$outbound" ]] || continue
     validate_outbound <<<"$outbound" || return 1
   done <<<"$outbounds"
-  jq -e '
+  jq -es '
     def nonempty: type == "string" and length > 0;
     def port: type == "number" and floor == . and . >= 1 and . <= 65535;
+    select(length == 1) | .[0] |
     (.nodes | type == "array") and
     ([.nodes[].id] | length == (unique | length)) and
     all(.nodes[];

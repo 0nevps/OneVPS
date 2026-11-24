@@ -256,6 +256,15 @@ assert_file_jq "does not block UDP/443 by default" "$XRAY_CONF" \
   'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
 
 cp "$XRAY_CONF" "$TEST_TMP/valid-config"
+for documents in empty truncated concatenated; do
+  case "$documents" in
+    empty) : > "$XRAY_NODES" ;;
+    truncated) printf '{"nodes":[' > "$XRAY_NODES" ;;
+    concatenated) cat "$FIXTURE" "$FIXTURE" > "$XRAY_NODES" ;;
+  esac
+  assert_false "reject $documents node metadata" rebuild_config
+  assert_true 'invalid document count or syntax leaves active config intact' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
+done
 for enabled in true false; do
   jq --argjson enabled "$enabled" '.nodes[0] |= (.type = "unknown" | .enabled = $enabled)' "$FIXTURE" > "$XRAY_NODES"
   assert_false "reject unknown node type (enabled=$enabled)" rebuild_config
