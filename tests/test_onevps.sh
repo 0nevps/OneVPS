@@ -738,6 +738,28 @@ assert_true "interruption restores metadata" cmp "$XRAY_NODES" "$TEST_TMP/before
 assert_true "interruption restores runtime config" cmp "$XRAY_CONF" "$TEST_TMP/before-config"
 assert_true "transaction cleanup removes secret staging directories" bash -c 'shopt -s nullglob; paths=("$1"/.transaction.*); (( ${#paths[@]} == 0 ))' _ "$XRAY_DIR"
 printf 'active\n' > "$SERVICE_STATE"
+(
+  cp() {
+    if [[ "${!#}" == */nodes.restore ]]; then printf 'partial restore\n' > "${!#}"; return 1; fi
+    command cp "$@"
+  }
+  systemctl() {
+    case "$1" in
+      is-active) return 0 ;;
+      restart) echo restart >> "$TEST_TMP/restore-restarts"; return 1 ;;
+      *) return 0 ;;
+    esac
+  }
+  if apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'; then exit 1; fi
+  jq -e '.nodes | type=="array"' "$XRAY_NODES" >/dev/null || exit 1
+  [[ $(wc -l < "$TEST_TMP/restore-restarts") -eq 1 ]] || exit 1
+  shopt -s nullglob; recovery_paths=("$XRAY_DIR"/.transaction.*)
+  [[ ${#recovery_paths[@]} -eq 1 && -f "${recovery_paths[0]}/nodes.backup" ]] || exit 1
+  command cp -p "${recovery_paths[0]}/nodes.backup" "$XRAY_NODES" &&
+    command cp -p "${recovery_paths[0]}/config.backup" "$XRAY_CONF" || exit 1
+  rm -rf "${recovery_paths[0]}"
+) || fail 'partial recovery writes cannot truncate live metadata or restart Xray'
+pass 'partial recovery writes cannot truncate live metadata or restart Xray'
 MOCK_SERVICE_MODE=fail
 assert_false "rollback restart failure is not reported as success" apply_outbound_assignment b2c3d4e5 <<<'{"mode":"direct"}'
 recovery=$(printf '%s\n' "$XRAY_DIR"/.transaction.*)

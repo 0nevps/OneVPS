@@ -1089,14 +1089,19 @@ apply_candidate_transaction_locked() (
     local status=$? failed=false
     trap - EXIT INT TERM HUP
     if $touched && ! $committed; then
-      cp -p "$tx/nodes.backup" "$XRAY_NODES" || failed=true
-      cp -p "$tx/config.backup" "$XRAY_CONF" || failed=true
+      if ! cp -p "$tx/nodes.backup" "$tx/nodes.restore" || ! cp -p "$tx/config.backup" "$tx/config.restore"; then
+        failed=true
+      elif ! mv -f "$tx/nodes.restore" "$XRAY_NODES" || ! mv -f "$tx/config.restore" "$XRAY_CONF"; then
+        failed=true
+      fi
       if $hop_touched; then hy2_hop_apply "$tx/hop.before" || failed=true; fi
-      if $active; then
-        run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || failed=true
-      else
-        systemctl stop xray || failed=true
-        if systemctl is-active --quiet xray; then failed=true; fi
+      if ! $failed; then
+        if $active; then
+          run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || failed=true
+        else
+          systemctl stop xray || failed=true
+          if systemctl is-active --quiet xray; then failed=true; fi
+        fi
       fi
       if $failed; then
         preserve=true
