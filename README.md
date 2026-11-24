@@ -208,6 +208,13 @@ Choose **Set node outbound** (`8`) from a node's management menu, select **All u
   An explicit direct override bypasses the node's proxy outbound, but not safety blocks.
   Operations never change another node's users or outbounds.
 
+Choose **Set direct outbound IP family** (`9`) on a VLESS Reality or Hysteria2 node to allow
+**IPv4 only**, **IPv6 only**, or **IPv4 & IPv6** (default, preserves existing behavior).
+Single-family modes require Xray `26.10.21` or newer and a working VPS route for the selected family.
+If a destination has no address in that family, the connection fails without switching families.
+This setting applies to all traffic routed directly by the node, including explicit direct user
+overrides. An upstream proxy still controls its own exit IP. The setting does not change how clients connect to the VPS.
+
 Supported links:
 
 - **Shadowsocks:** SIP002 with `aes-128-gcm`, `aes-256-gcm`, or `chacha20-ietf-poly1305`;
@@ -370,6 +377,7 @@ Connection settings:
 Users / outbound:
 7) Manage node users
 8) Set node outbound
+9) Set direct outbound IP family
 
 Node status:
 5) Enable/disable node

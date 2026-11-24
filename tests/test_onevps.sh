@@ -1261,6 +1261,46 @@ MOCK_SERVICE_MODE=ok
 pass 'real menus add/link/select multiple/all/delete on both protocols'
 assert_file_jq "menu deletion preserves other users and removes all overrides" "$XRAY_NODES" 'all(.nodes[0:2][]; (has("outbound")|not) and (has("default_outbound")|not) and all(.users[]; .name != "Menu user" and (has("outbound")|not)))'
 
+test_direct_ip_modes() {
+  cp "$XRAY_NODES" "$TEST_TMP/before-direct-ip"
+  choose_ip() { apply_candidate_transaction prepare_direct_ip "$@"; }
+  assert_false 'invalid direct IP mode is rejected' choose_ip a1b2c3d4 invalid
+  assert_false 'unknown node cannot set direct IP mode' choose_ip missing ipv4
+  jq '.nodes[0].direct_ip = null' "$XRAY_NODES" > "$node_candidate"
+  assert_false 'invalid stored direct IP mode is rejected' validate_node_metadata "$node_candidate"
+  assert_true 'Reality sets IPv4' choose_ip a1b2c3d4 ipv4
+  assert_true 'HY2 sets IPv6 independently' choose_ip b2c3d4e5 ipv6
+  assert_file_jq 'direct IP routing follows the inbound after security blocks' "$XRAY_CONF" '
+    [.routing.rules[].outboundTag] == ["block","block","direct-ipv4","direct-ipv6"] and
+    [.outbounds[2:][] | .streamSettings.sockopt.domainStrategy] == ["ForceIPv4","ForceIPv6"] and
+    [.outbounds[2:][] | .settings.finalRules[0].ip[0]] == ["::/0","0.0.0.0/0"]'
+  assert_true 'node proxy leaves direct IP setting intact' apply_outbound_assignment a1b2c3d4 <<<"$node_proxy"
+  assert_true 'default client direct override' apply_outbound_assignment a1b2c3d4 selected '["default"]' <<<'{"mode":"direct"}'
+  assert_true 'individual user direct override' apply_outbound_assignment a1b2c3d4 selected '["alice"]' <<<'{"mode":"direct"}'
+  assert_file_jq 'direct overrides use node IP family before node proxy fallback' "$XRAY_CONF" '
+    [.routing.rules[].outboundTag] == ["block","block","direct-ipv4","direct-ipv4","node-out-a1b2c3d4","direct-ipv6"] and
+    all(.routing.rules[2:4][]; has("user")) and (.routing.rules[4] | has("user") | not)'
+  cp "$XRAY_NODES" "$TEST_TMP/before-ip-failure"
+  cp "$XRAY_CONF" "$TEST_TMP/config-before-ip-failure"
+  rm -f "$TEST_TMP/restart-failed"
+  MOCK_SERVICE_MODE=once
+  assert_false 'direct IP change rolls back after restart failure' choose_ip a1b2c3d4 ipv6
+  assert_true 'failed IP change restores metadata' cmp "$XRAY_NODES" "$TEST_TMP/before-ip-failure"
+  assert_true 'failed IP change restores config' cmp "$XRAY_CONF" "$TEST_TMP/config-before-ip-failure"
+  MOCK_SERVICE_MODE=ok
+  (
+    ask() { local answer; IFS= read -r answer || return 1; printf '%s\n' "$answer"; }
+    confirm() { return 0; }
+    manage_direct_ip a1b2c3d4 <<<3 && manage_direct_ip b2c3d4e5 <<<3
+  ) || fail 'menu restores dual stack for both node types'
+  pass 'menu restores dual stack for both node types'
+  assert_file_jq 'dual stack removes only the direct IP setting' "$XRAY_NODES" '
+    all(.nodes[]; has("direct_ip") | not) and .nodes[0].outbound.mode == "proxy" and .nodes[0].default_outbound.mode == "direct"'
+  cp "$TEST_TMP/before-direct-ip" "$XRAY_NODES"
+  render_config "$XRAY_NODES" "$XRAY_CONF"
+}
+test_direct_ip_modes
+
 printf '3\n0\n' > "$TEST_TMP/network-choices"
 assert_true 'network menu option 3 sets up a static site' bash -c '
   source "$1"; exec 3< "$2"; pause() { :; }

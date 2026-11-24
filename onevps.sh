@@ -26,6 +26,7 @@ REALM_BIN=/usr/local/bin/onevps-realm
 REALM_SERVICE=/etc/systemd/system/onevps-realm.service
 REALM_VERSION=v2.9.6
 HY2_MIN_VERSION=26.10.21
+DIRECT_IP_MIN_VERSION=26.10.21
 HY2_HOP_DIR=/etc/onevps-hy2-hop
 HY2_HOP_UNIT=/etc/systemd/system/onevps-hy2-hop.service
 ACME_CERT_DIR=/etc/onevps-certs
@@ -660,6 +661,8 @@ validate_xray_config() {
   [[ -x "$XRAY_BIN" ]] || return 0
   if jq -e 'any(.inbounds[]; .protocol == "hysteria")' "$conf" >/dev/null; then
     require_hy2_core || return 1
+  elif jq -e 'any(.outbounds[]; .tag == "direct-ipv4" or .tag == "direct-ipv6")' "$conf" >/dev/null; then
+    require_xray_version "$DIRECT_IP_MIN_VERSION" 'Single-family direct outbound' || return 1
   fi
   "$XRAY_BIN" run -test -config "$conf" >"$err_file" 2>&1
 }
@@ -897,16 +900,21 @@ build_proxy_outbound() {
 
 # Identity overrides precede node inheritance; security blocks are prepended by render_config.
 build_outbound_routes() {
-  local source="$1" rows row object tag proxy proxies='[]' rules assignments
+  local source="$1" rows row object tag proxy proxies='[]' rules assignments directs
   assignments=$(jq -c '
-    [.nodes[] | select(.enabled == true) | . as $n |
+    [.nodes[] | select(.enabled == true) | . as $n | (.direct_ip // "dual") as $family |
+     (if $family == "dual" then "direct" else "direct-" + $family end) as $direct |
+     (
       (if has("default_outbound") then
         {tag:("default-out-" + (.id|@base64)),inbound:.tag,user:(.tag + "@onevps"),outbound:.default_outbound}
        else empty end),
       ((.users // [])[] | select(has("outbound")) |
         ([$n.id,.id]|tojson|@base64) as $key |
         {tag:("user-out-" + $key),inbound:$n.tag,user:($key + "@onevps-user"),outbound}),
-      (if has("outbound") then {tag:("node-out-" + .id),inbound:.tag,outbound} else empty end)]' "$source") || return 1
+      (if has("outbound") or $family != "dual" then
+        {tag:("node-out-" + .id),inbound:.tag,outbound:(.outbound // {mode:"direct"})}
+       else empty end)
+     ) | .directTag = $direct]' "$source") || return 1
   rows=$(jq -c '.[] | select(.outbound.mode == "proxy")' <<<"$assignments") || return 1
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
@@ -916,9 +924,14 @@ build_outbound_routes() {
     proxies=$(printf '%s\n%s\n' "$proxies" "$proxy" | jq -sc '.[0] + [.[1]]') || return 1
   done <<<"$rows"
   rules=$(jq -c '[.[] | {type:"field",inboundTag:[.inbound],
-    outboundTag:(if .outbound.mode == "direct" then "direct" else .tag end)} +
+    outboundTag:(if .outbound.mode == "direct" then .directTag else .tag end)} +
     (if has("user") then {user:[.user]} else {} end)]' <<<"$assignments") || return 1
-  printf '%s\n%s\n' "$proxies" "$rules" | jq -sc '{outbounds:.[0],rules:.[1]}'
+  directs=$(jq -c '[.[] | .outboundTag | select(. == "direct-ipv4" or . == "direct-ipv6")] | unique | map(
+    . as $tag | ($tag == "direct-ipv4") as $ipv4 |
+    {tag:$tag,protocol:"freedom",
+     streamSettings:{sockopt:{domainStrategy:(if $ipv4 then "ForceIPv4" else "ForceIPv6" end)}},
+     settings:{finalRules:[{action:"block",ip:[(if $ipv4 then "::/0" else "0.0.0.0/0" end)],blockDelay:0}]}})' <<<"$rules") || return 1
+  printf '%s\n%s\n%s\n' "$proxies" "$rules" "$directs" | jq -sc '{outbounds:(.[0]+.[2]),rules:.[1]}'
 }
 
 render_config() {
@@ -1059,6 +1072,7 @@ validate_node_metadata() {
       . as $n |
       (.id | nonempty) and
       (.enabled | type == "boolean") and (.tag | nonempty) and (.port | port) and
+      (if has("direct_ip") then (.direct_ip == "ipv4" or .direct_ip == "ipv6") else true end) and
       (if .type == "hysteria2" then
         (.domain | type == "string" and test("^[A-Za-z0-9.-]+$")) and
         (.tls_cert | type == "string" and startswith("/")) and
@@ -1191,6 +1205,16 @@ apply_outbound_assignment() {
   apply_candidate_transaction prepare_outbound_assignment "$@"
 }
 
+prepare_direct_ip() {
+  local source="$1" output="$2" id="$3" family="$4"
+  [[ "$family" == ipv4 || "$family" == ipv6 || "$family" == dual ]] || return 1
+  jq -e --arg id "$id" --arg family "$family" '
+    select(any(.nodes[]; .id == $id)) |
+    (.nodes[] | select(.id == $id)) |=
+      if $family == "dual" then del(.direct_ip) else .direct_ip = $family end' "$source" > "$output" || return 1
+  validate_node_metadata "$output"
+}
+
 validate_node_selection() {
   jq -e --arg id "$2" --argjson selected "$3" '
     .nodes[] | select(.id == $id) |
@@ -1321,6 +1345,23 @@ manage_outbound() {
   confirm 'Apply outbound setting?' n || return 0
   if apply_outbound_assignment "$id" "$scope" "$selected" <<<"$outbound"; then ok 'outbound applied'
   else err 'outbound not applied'; return 1; fi
+}
+
+manage_direct_ip() {
+  local id="$1" current family
+  current=$(node_by_id "$id" | jq -er '(.direct_ip // "dual") | {ipv4:"IPv4",ipv6:"IPv6",dual:"IPv4 & IPv6"}[.]') || return 1
+  info "Current direct outbound IP family: $current"
+  info 'Applies to direct connections only; upstream proxy exits are unchanged.'
+  printf '1) IPv4 only\n2) IPv6 only\n3) IPv4 & IPv6 (default)\n0) Cancel\n'
+  case "$(ask 'Select')" in
+    1) family=ipv4 ;;
+    2) family=ipv6 ;;
+    3) family=dual ;;
+    *) return 0 ;;
+  esac
+  confirm 'Apply direct outbound IP family?' n || return 0
+  if apply_candidate_transaction prepare_direct_ip "$id" "$family"; then ok 'direct outbound IP family applied'
+  else err 'direct outbound IP family not applied'; return 1; fi
 }
 
 # ----------------------------------------------------------------------------
@@ -1810,24 +1851,28 @@ certificate_menu() {
 }
 
 require_hy2_core() {
-  local version minimum major minor patch status
+  require_xray_version "$HY2_MIN_VERSION" Hysteria2
+}
+
+require_xray_version() {
+  local required="$1" feature="$2" version major minor patch status min_major min_minor min_patch
+  IFS=. read -r min_major min_minor min_patch <<<"$required"
   if version=$("$XRAY_BIN" version); then
     # Consume all output before selecting the first line to avoid SIGPIPE.
     version=${version%%$'\n'*}
   else
     status=$?
-    err "Cannot read Xray version from $XRAY_BIN (exit $status); Hysteria2 setup aborted"
+    err "Cannot read Xray version from $XRAY_BIN (exit $status); $feature requires Xray >= $required"
     return 1
   fi
   if [[ "$version" =~ ^Xray[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
     major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]})); patch=$((10#${BASH_REMATCH[3]}))
-    minimum=$((26 * 10000 + 10 * 100 + 21))
-    (( major * 10000 + minor * 100 + patch >= minimum )) && return 0
+    (( major > min_major || (major == min_major && (minor > min_minor || (minor == min_minor && patch >= min_patch))) )) && return 0
   else
-    err "Cannot parse Xray version: ${version:-<empty output>}; Hysteria2 setup aborted"
+    err "Cannot parse Xray version: ${version:-<empty output>}; $feature requires Xray >= $required"
     return 1
   fi
-  err "Hysteria2 requires tested Xray >= $HY2_MIN_VERSION; update Xray first"
+  err "$feature requires tested Xray >= $required; update Xray first"
   return 1
 }
 
@@ -2410,7 +2455,7 @@ manage_nodes() {
     clear
     node_link "$n" || warn 'Share link unavailable; node management is still available'
     if [[ "$type" == "hysteria2" ]]; then
-      printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n3) Set UDP port hopping\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
+      printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n3) Set UDP port hopping\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n9) Set direct outbound IP family\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
       case "$(ask 'Select')" in
         1) edit_port "$id" || continue ;;
         2) reset_hy2_password "$id" || continue ;;
@@ -2420,6 +2465,7 @@ manage_nodes() {
         6) del_node "$id" || true; return 0 ;;
         7) manage_node_users "$id" || true ;;
         8) manage_outbound "$id" || true ;;
+        9) manage_direct_ip "$id" || true; pause ;;
         0|"") return ;;
         *) continue ;;
       esac
@@ -2435,6 +2481,7 @@ manage_nodes() {
   Users / outbound:
    7) Manage node users
    8) Set node outbound
+   9) Set direct outbound IP family
 
   Node status:
    5) Enable/disable node
@@ -2453,6 +2500,7 @@ EOF
         6) del_node "$id" || true; return 0 ;;
         7) manage_node_users "$id" || true ;;
         8) manage_outbound "$id" || true ;;
+        9) manage_direct_ip "$id" || true; pause ;;
         0|"") return ;;
         *) continue ;;
       esac

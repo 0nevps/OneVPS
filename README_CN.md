@@ -178,6 +178,13 @@ Danger zone:
 - 出口优先级为安全阻断、用户独立出口、节点出口、默认直连。显式直连可覆盖节点代理出口。
   操作仅影响当前节点，不会修改其他节点的用户或出口。
 
+在 VLESS Reality 或 Hysteria2 节点的管理菜单中选择 `9`（Set direct outbound IP family），
+可选 **仅 IPv4**、**仅 IPv6** 或 **IPv4 & IPv6**（默认，保留原有行为）。
+单栈模式要求 Xray `26.10.21` 或更新版本，且 VPS 对所选地址族有可用的网络路由。
+如果目标没有该地址族的地址，连接会失败，不会改走另一种 IP。
+此设置适用于节点的所有直连流量，包括用户单独指定的直连。上游代理仍决定自己的出口 IP；
+客户端连接 VPS 的方式不受影响。
+
 支持的链接：
 
 - **Shadowsocks：** SIP002，支持 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`；
@@ -325,6 +332,7 @@ Connection settings:
 Users / outbound:
 7) Manage node users
 8) Set node outbound
+9) Set direct outbound IP family
 
 Node status:
 5) Enable/disable node

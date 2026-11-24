@@ -88,6 +88,8 @@ reject 'empty version rejected' require_hy2_core 2> "$TEST_TMP/version-error"
 check 'empty version has diagnostic' grep -q 'Cannot parse Xray version: <empty output>' "$TEST_TMP/version-error"
 printf '#!/usr/bin/env bash\nprintf "Xray 26.3.27\\n"\n' > "$TEST_TMP/core"
 reject 'older core rejected' require_hy2_core
+jq 'del(.inbounds[]) | .outbounds += [{tag:"direct-ipv4"}]' "$XRAY_CONF" > "$TEST_TMP/direct-ip-version.json"
+reject 'old core rejected for single-family direct routes without HY2' validate_xray_config "$TEST_TMP/direct-ip-version.json" "$TEST_TMP/check.log"
 printf '#!/usr/bin/env bash\nprintf "Xray 26.10.21\\n"\n' > "$TEST_TMP/core"
 restart_count=0
 systemctl() {
@@ -239,6 +241,13 @@ if [[ -n "${XRAY_TEST_BIN:-}" ]]; then
   render_config "$TEST_TMP/real.json" "$TEST_TMP/server.json"
   check 'real core config validation' validate_xray_config "$TEST_TMP/server.json" "$TEST_TMP/check.log"
   python3 "$ROOT_DIR/tests/hy2_runtime.py" "$XRAY_BIN" "$TEST_TMP/server.json" "$TEST_TMP"
+  jq '.nodes[0] as $base | .nodes = (["ipv4","ipv6","dual"] | map(. as $mode |
+    $base | .id=$mode | .tag=$mode | del(.users) |
+    if $mode == "dual" then . else .direct_ip=$mode | .port += (if $mode == "ipv4" then 1 else 2 end) end))' \
+    "$TEST_TMP/real.json" > "$TEST_TMP/direct-ip-nodes.json"
+  render_config "$TEST_TMP/direct-ip-nodes.json" "$TEST_TMP/direct-ip.json"
+  check 'real core accepts all direct IP modes' validate_xray_config "$TEST_TMP/direct-ip.json" "$TEST_TMP/check.log"
+  python3 "$ROOT_DIR/tests/direct_ip_runtime.py" "$XRAY_BIN" "$TEST_TMP/direct-ip.json" "$TEST_TMP"
 else
   printf 'SKIP real HY2 tests: set XRAY_TEST_BIN to Xray >= %s\n' "$HY2_MIN_VERSION"
 fi
