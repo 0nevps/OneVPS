@@ -596,6 +596,16 @@ pass 'Xray service setup propagates reload and enable failures'
   grep -qx remove "$TEST_TMP/uninstall-steps"
 ) || fail 'uninstall preserves files and hopping rules when Xray cannot stop'
 pass 'uninstall preserves files and hopping rules when Xray cannot stop'
+(
+  realm_owned() { :; }; realm_write_lock() { :; }; confirm() { :; }
+  systemctl() { [[ "$1" != "$failed_action" ]]; }
+  rm() { [[ "$failed_action" != remove ]]; }
+  for failed_action in remove daemon-reload; do
+    if realm_uninstall > "$TEST_TMP/realm-remove-output" 2>&1; then exit 1; fi
+    if grep -q '\[+\].*realm removed' "$TEST_TMP/realm-remove-output"; then exit 1; fi
+  done
+) || fail 'Realm cleanup failures cannot report successful uninstall'
+pass 'Realm cleanup failures cannot report successful uninstall'
 MOCK_SERVICE_MODE=ok
 systemctl() {
   case "$1" in

@@ -2948,9 +2948,9 @@ realm_uninstall() (
   confirm 'Remove OneVPS realm and all its relay rules?' || return 0
   realm_write_lock && realm_owned || return 1
   systemctl stop onevps-realm && systemctl disable onevps-realm || return 1
-  rm -f "$REALM_BIN" "$REALM_SERVICE"
-  rm -rf "$REALM_DIR"
-  systemctl daemon-reload
+  rm -f "$REALM_BIN" "$REALM_SERVICE" && rm -rf "$REALM_DIR" && systemctl daemon-reload || {
+    err 'Realm cleanup did not finish; inspect remaining files and retry'; return 1;
+  }
   ok "realm removed; firewall rules were not changed"
 )
 
