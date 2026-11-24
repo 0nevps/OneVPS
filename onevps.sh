@@ -1035,6 +1035,7 @@ validate_node_metadata() {
   jq -es '
     def nonempty: type == "string" and length > 0;
     def port: type == "number" and floor == . and . >= 1 and . <= 65535;
+    def uuid: type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\\z");
     select(length == 1) | .[0] |
     (.nodes | type == "array") and
     ([.nodes[].id] | length == (unique | length)) and
@@ -1051,7 +1052,7 @@ validate_node_metadata() {
         all(.reality_sni, .reality_target, .reality_public_key, .reality_private_key, .reality_short_id; nonempty) and
         (if has("reality_target_port") then .reality_target_port | port else true end)
        else true end) and
-      (if .type == "vless-reality" then (.uuid | nonempty)
+      (if .type == "vless-reality" then (.uuid | uuid)
        elif .type == "hysteria2" then (.password | nonempty)
        else false end) and
       (if has("users") then (.users | type == "array") else true end) and
@@ -1062,7 +1063,7 @@ validate_node_metadata() {
           (.id | type == "string" and test("^[A-Za-z0-9_-]+$") and . != "default") and
           (.name | type == "string" and test("\\S") and (test("[\\x00-\\x1f\\x7f]") | not)) and
           (if $n.type == "vless-reality" then
-             (.uuid | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))
+             (.uuid | uuid)
            elif $n.type == "hysteria2" then (.password | nonempty)
            else false end)) and
         (if .type == "vless-reality" then ([.uuid, $users[].uuid] | map(ascii_downcase))

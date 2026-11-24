@@ -309,6 +309,11 @@ for malformed in '"true"' 'null' '1'; do
   assert_false "reject non-boolean Reality enabled=$malformed with proxy assigned" rebuild_config
   assert_true 'invalid Reality flag cannot replace live routing' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
 done
+for credential in malformed 123e4567-e89b-12d3-a456-42661417400G $'123e4567-e89b-12d3-a456-426614174000\n'; do
+  jq --arg credential "$credential" '.nodes[0].uuid=$credential' "$FIXTURE" > "$XRAY_NODES"
+  assert_false 'invalid default Reality UUID rejected before activation' rebuild_config
+  assert_true 'invalid default UUID preserves active configuration' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
+done
 for enabled in true false; do
   jq --argjson enabled "$enabled" '.nodes[1] |= (.tag="reality-a1b2c3d4" | .enabled=$enabled) |
     .nodes[0].outbound={mode:"proxy",protocol:"socks",server:"proxy.example.com",port:1080}' "$FIXTURE" > "$XRAY_NODES"
