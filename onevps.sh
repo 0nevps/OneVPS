@@ -1750,7 +1750,10 @@ acme_deploy() (
   xray_write_lock || return 1
   if [[ -e "$XRAY_NODES" ]]; then
     used=$(jq -sr --arg path "$dir/current/fullchain.pem" '
-      if length==1 and (.[0].nodes | type=="array") then any(.[0].nodes[]; .enabled==true and .tls_cert==$path)
+      if length==1 and (.[0].nodes | type=="array") and
+        all(.[0].nodes[]; type=="object" and (.enabled|type=="boolean") and
+          (if has("tls_cert") then .tls_cert|type=="string" and startswith("/") else true end))
+      then any(.[0].nodes[]; .enabled==true and .tls_cert==$path)
       else error("invalid node metadata") end' "$XRAY_NODES") || { err 'Cannot determine which nodes use the certificate'; return 1; }
   fi
   if $used && systemctl is-active --quiet xray; then active=true; fi

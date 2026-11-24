@@ -63,6 +63,14 @@ printf 'invalid json\n' > "$XRAY_NODES"
 reject 'unreadable metadata blocks renewal' acme_deploy example.com
 check 'metadata failure preserves current certificate' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
 cp "$TMP/good-metadata" "$XRAY_NODES"
+(
+  for mutation in '.nodes[0].enabled="true"' '.nodes[0].enabled=null' '.nodes[0].tls_cert=123'; do
+    jq "$mutation" "$TMP/good-metadata" > "$XRAY_NODES"
+    reject 'invalid node activation metadata blocks certificate switching' acme_deploy example.com
+    check 'invalid activation metadata preserves previous pair' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
+  done
+  cp "$TMP/good-metadata" "$XRAY_NODES"
+)
 restarts=0
 systemctl() {
   if [[ "$1" == restart ]]; then restarts=$((restarts+1)); (( restarts > 1 )); else return 0; fi
