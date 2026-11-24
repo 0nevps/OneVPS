@@ -163,7 +163,9 @@ printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
 )
 (
   CADDYFILE="$TMP/menu-Caddyfile"; printf ':80 {\n respond 200\n}\n' > "$CADDYFILE"
-  ask() { printf '%s\n' site.example.com; }; ensure_deps() { :; }; flock() { :; }
+  cp "$CADDYFILE" "$TMP/menu-Caddyfile-original"
+  ask() { printf '%s\n' "${site_domain:-site.example.com}"; }; ensure_deps() { :; }; flock() { :; }
+  caddy_present() { return 0; }; confirm() { return "${confirm_status:-0}"; }
   ensure_caddy() { touch "$TMP/caddy-prepared"; }; ss() { printf '%s' "${SOCKETS:-}"; }
   systemctl() { case "$1" in show) echo 123 ;; is-active) return "${active_status:-0}" ;; *) return 1 ;; esac; }
   XRAY_NODES="$TMP/site-nodes.json"
@@ -181,8 +183,43 @@ printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
   check 'repeat static setup' setup_static_site
   active_status=1; reject 'existing site with inactive Caddy cannot report success' setup_static_site; active_status=0
   check 'custom content retained' grep -qx 'my custom 403' "$TMP/sites/site.example.com/index.html"
+  printf 'external.example.org {\n respond 200\n}\n' > "$TMP/external-site"
+  cat "$TMP/external-site" >> "$CADDYFILE"
+  cp "$CADDYFILE" "$TMP/menu-Caddyfile-before-remove"
+  site_domain=external.example.org
+  reject 'unmanaged site cannot be removed' remove_static_site
+  unset site_domain
+  (
+    sed '/^# OneVPS-domain:site.example.com END$/d' "$CADDYFILE" > "$TMP/malformed-site"
+    printf '# OneVPS-domain:site.example.com END\n' >> "$TMP/malformed-site"
+    cp "$TMP/malformed-site" "$CADDYFILE"
+    reject 'misplaced end marker cannot consume another site' remove_static_site
+    check 'malformed block leaves Caddyfile intact' cmp "$CADDYFILE" "$TMP/malformed-site"
+    cp "$TMP/menu-Caddyfile-before-remove" "$CADDYFILE"
+  )
+  confirm_status=1; check 'removal can be cancelled' remove_static_site; confirm_status=0
+  check 'cancelled removal leaves Caddyfile intact' cmp "$CADDYFILE" "$TMP/menu-Caddyfile-before-remove"
+  (
+    caddy_reload() {
+      if grep -qx 'site.example.com {' "$CADDYFILE"; then touch "$TMP/site-rollback-reload"; return 0; fi
+      return 1
+    }
+    reject 'failed removal reload reports failure' remove_static_site
+    check 'failed removal restores Caddyfile' cmp "$CADDYFILE" "$TMP/menu-Caddyfile-before-remove"
+    check 'failed removal reloads restored Caddyfile' test -f "$TMP/site-rollback-reload"
+    check 'failed removal retains site metadata' test -f "$CADDY_STATE/sites/site.example.com.json"
+  )
+  check 'managed static site removed' remove_static_site
+  reject 'removed site metadata is gone' test -e "$CADDY_STATE/sites/site.example.com.json"
+  check 'removed site page is preserved' grep -qx 'my custom 403' "$TMP/sites/site.example.com/index.html"
+  { cat "$TMP/menu-Caddyfile-original"; printf '\n'; cat "$TMP/external-site"; } > "$TMP/menu-Caddyfile-after-remove"
+  check 'other Caddy routes preserved' cmp "$CADDYFILE" "$TMP/menu-Caddyfile-after-remove"
+  check 'removed static site can be set up again' setup_static_site
+  check 'recreated site serves preserved page' grep -qx 'my custom 403' "$TMP/sites/site.example.com/index.html"
   check 'HY2 can reuse static domain' caddy_domain_ensure site.example.com "$CADDYFILE"
   check 'explicit certificate request enrolls site for sync' test -f "$CADDY_STATE/domains/site.example.com.json"
+  reject 'HY2 certificate domain cannot be removed' remove_static_site
+  check 'shared site metadata survives refusal' test -f "$CADDY_STATE/sites/site.example.com.json"
   check 'single shared site definition' test "$(grep -cx 'site.example.com {' "$CADDYFILE")" = 1
 )
 check 'HY2-first domain created' caddy_domain_ensure example.com "$CADDYFILE"

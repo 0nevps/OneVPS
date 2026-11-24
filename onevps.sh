@@ -1571,6 +1571,70 @@ setup_static_site() (
   info "Edit $(caddy_site_root "$domain")/index.html; allow TCP 80/443 in your cloud firewall."
 )
 
+remove_static_site() (
+  local domain file record certificate_record backup candidate
+  domain=$(normalize_domain "$(ask 'Static site domain to remove')")
+  acme_domain_valid "$domain" || { err 'Enter a valid domain name'; return 1; }
+  [[ -f "$CADDY_STATE/.onevps-owned" && ! -L "$CADDY_STATE" ]] || {
+    err 'No managed Caddy state found'; return 1;
+  }
+  exec 9> "$CADDY_STATE/operation.lock" || return 1
+  flock -n 9 || { err 'another Caddy operation is running'; return 1; }
+  certificate_record="$CADDY_STATE/domains/$domain.json"
+  [[ ! -e "$certificate_record" && ! -L "$certificate_record" ]] || {
+    err "$domain is used for HY2 certificate sync; static site was not removed"; return 1;
+  }
+  record="$CADDY_STATE/sites/$domain.json"
+  [[ -f "$record" && ! -L "$record" ]] || { err "No managed static site for $domain"; return 1; }
+  file=$(find_caddyfile)
+  [[ -f "$file" && ! -L "$file" ]] &&
+    jq -e --arg file "$file" '.caddy_file == $file' "$record" >/dev/null || {
+      err "Cannot verify the active Caddyfile for $domain"; return 1;
+    }
+  caddy_present || { err 'Caddy is required to validate the updated configuration'; return 1; }
+  confirm "Remove the HTTPS static site for $domain? Page files will be kept." n || return 0
+
+  candidate=$(mktemp "$CADDY_STATE/.remove-site.XXXXXXXX") || return 1
+  trap 'rm -f -- "$candidate"' EXIT
+  if ! awk -v domain="$domain" '
+    $0 == "# OneVPS-domain:" domain " BEGIN" {
+      if (++starts != 1 || getline != 1 || $0 != domain " {") exit 1
+      inside = 1
+      next
+    }
+    $0 == "# OneVPS-domain:" domain " END" {
+      if (!inside || previous != "}") exit 1
+      inside = 0
+      ends++
+      next
+    }
+    inside { if (previous == "}" || $0 ~ /^# OneVPS-domain:/) exit 1; previous = $0; next }
+    { print }
+    END { if (starts != 1 || ends != 1) exit 1 }
+  ' "$file" > "$candidate"; then
+    err "Cannot identify a single managed Caddy block for $domain"; return 1
+  fi
+  backup=$(mktemp "$CADDY_STATE/.domain.XXXXXXXX") || return 1
+  cp -p "$file" "$backup" || { rm -f "$backup"; return 1; }
+  if ! cat "$candidate" > "$file"; then
+    err 'Cannot write Caddy site configuration'
+    caddy_restore_site "$backup" "$file" false || return 1
+    return 1
+  fi
+  if ! caddy_reload "$file"; then
+    caddy_restore_site "$backup" "$file" true || return 1
+    return 1
+  fi
+  if ! rm -- "$record"; then
+    err "Cannot remove Caddy site record: $record"
+    caddy_restore_site "$backup" "$file" true || return 1
+    return 1
+  fi
+  rm -f "$backup"
+  ok "Removed static site: $domain"
+  info "Page files kept in $(caddy_site_root "$domain")."
+)
+
 caddy_sync_domain() {
   local domain="$1" file root cert key found=false stage="$CADDY_STATE/staging/$1"
   acme_domain_valid "$domain" || return 1
@@ -3145,11 +3209,12 @@ node_menu() {
 
 network_menu() {
   while :; do
-    printf '\nService / network:\n1) Restart Xray service\n2) Enable BBR / show status\n3) Set up HTTPS static site (403)\n0) Back\n'
+    printf '\nService / network:\n1) Restart Xray service\n2) Enable BBR / show status\n3) Set up HTTPS static site (403)\n4) Remove HTTPS static site\n0) Back\n'
     case "$(ask 'Select')" in
       1) restart_service || { err 'Xray restart failed'; pause; } ;;
       2) enable_bbr || { err 'BBR configuration failed; some settings may already be applied'; pause; } ;;
       3) setup_static_site || err 'Static site setup failed'; pause ;;
+      4) remove_static_site || err 'Static site removal failed'; pause ;;
       0|"") return ;;
       *) warn 'invalid selection' ;;
     esac

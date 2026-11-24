@@ -462,6 +462,9 @@ the static page with HTTP status `403`. Xray is not required.
 Edit `/var/lib/onevps/sites/<domain>/index.html` to customize the page. Running setup again preserves that file.
 If Reality or another service owns either TCP port, setup stops; it does not stop the service or change any node.
 
+Choose **5 → 4** to remove a OneVPS-managed static site. OneVPS keeps the page files and refuses to remove a
+domain enrolled in HY2 certificate sync. Remove the DNS record separately if you no longer need it.
+
 OneVPS does not block UDP/443 by default. Private-address, BitTorrent and node/user outbound rules still apply.
 
 ## Uninstall

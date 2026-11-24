@@ -1310,6 +1310,15 @@ assert_true 'network menu option 3 sets up a static site' bash -c '
   [[ "$output" == *"3) Set up HTTPS static site (403)"*SITE_SETUP* ]]
 ' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/network-choices"
 
+printf '4\n0\n' > "$TEST_TMP/network-choices"
+assert_true 'network menu option 4 removes a static site' bash -c '
+  source "$1"; exec 3< "$2"; pause() { :; }
+  ask() { local choice; read -r choice <&3; printf "%s\n" "$choice"; }
+  remove_static_site() { printf "SITE_REMOVE\n"; }
+  output=$(network_menu)
+  [[ "$output" == *"4) Remove HTTPS static site"*SITE_REMOVE* ]]
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/network-choices"
+
 (
   BBR_CONF="$TEST_TMP/bbr.conf"
   pause() { :; }; confirm() { return 0; }

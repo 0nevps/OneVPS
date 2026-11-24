@@ -411,6 +411,9 @@ xray run -test -config /usr/local/etc/xray/config.json
 编辑 `/var/lib/onevps/sites/<域名>/index.html` 即可自定义页面，重复建站会保留文件内容。
 如果 Reality 或其他服务占用这两个 TCP 端口中的任意一个，脚本会提示冲突并退出，不会停止服务或更改节点。
 
+选择 **5 → 4** 删除 OneVPS 管理的静态站点。脚本保留网页文件；如果域名已加入 HY2 证书同步，则拒绝删除。
+不再使用该域名时，可另行删除 DNS 记录。
+
 OneVPS 默认不阻断 UDP/443。私网、BitTorrent 阻断和节点／用户出站规则仍然生效。
 
 ## 卸载
