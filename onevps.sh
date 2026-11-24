@@ -2231,17 +2231,18 @@ list_nodes() {
       "$i" "$(jq -r '.name' <<<"$n")" "$kind" "$(jq -r '.port' <<<"$n")" \
       "$dest" \
       "$([[ "$en" == true ]] && echo "$st" || echo "${c_ylw}$st${c_rst}")"
-  done < <(jq -c '.nodes[]' "$XRAY_NODES")
+  done
 }
 
 pick_node() {
-  local cnt sel
-  cnt=$(node_count)
+  local cnt sel snapshot
+  snapshot=$(jq -ce '.nodes | select(type=="array")' "$XRAY_NODES") || return 1
+  cnt=$(jq 'length' <<<"$snapshot") || return 1
   [[ "$cnt" -gt 0 ]] || { echo ""; return; }
-  list_nodes >&2
+  list_nodes < <(jq -c '.[]' <<<"$snapshot") >&2
   sel=$(ask $'Select node number (Enter to go back)' "")
   valid_menu_index "$sel" "$cnt" || { echo ""; return; }
-  jq -r --argjson i "$((sel-1))" '.nodes[$i].id' "$XRAY_NODES"
+  jq -r --argjson i "$((sel-1))" '.[$i].id' <<<"$snapshot"
 }
 
 manage_nodes() {
@@ -2252,6 +2253,7 @@ manage_nodes() {
   id=$(pick_node)
   [[ -n "$id" ]] || return
   n=$(node_by_id "$id")
+  [[ -n "$n" ]] || { warn 'Selected node no longer exists'; pause; return 0; }
   type=$(jq -r '.type' <<<"$n")
 
   while :; do

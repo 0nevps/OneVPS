@@ -286,6 +286,13 @@ cp "$FIXTURE" "$XRAY_NODES"
   choice=2; [[ $(pick_node) == b2c3d4e5 ]]
 ) || fail 'invalid node selection cannot wrap to a valid index'
 pass 'invalid node selection cannot wrap to a valid index'
+(
+  XRAY_NODES="$TEST_TMP/selection.json"; cp "$FIXTURE" "$XRAY_NODES" || exit 1
+  ask() { jq '.nodes |= .[1:]' "$FIXTURE" > "$XRAY_NODES"; echo 1; }
+  selected=$(pick_node 2> "$TEST_TMP/displayed") || exit 1
+  grep -q '1) Reality Test' "$TEST_TMP/displayed" && [[ "$selected" == a1b2c3d4 && -z $(node_by_id "$selected") ]]
+) || fail 'node selection remains bound to the displayed identity after concurrent deletion'
+pass 'node selection remains bound to the displayed identity after concurrent deletion'
 
 assert_true 'node creation menu lists only Reality and HY2' bash -c '
   source "$1"; XRAY_NODES="$2"; ask() { printf "0\n"; }
