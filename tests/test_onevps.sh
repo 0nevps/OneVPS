@@ -494,20 +494,27 @@ printf 'active\n' > "$SERVICE_STATE"
   pause() { :; }
   systemctl() {
     case "$1" in
-      restart) echo restart >> "$TEST_TMP/menu-restarts"; return "$restart_status" ;;
+      restart)
+        echo restart >> "$TEST_TMP/menu-restarts"
+        if [[ "$fail_next" == true ]]; then fail_next=false; return 1; fi
+        ;;
       is-active) return "$active_status" ;;
+      stop) echo stop >> "$TEST_TMP/menu-restarts" ;;
       *) return 0 ;;
     esac
   }
-  restart_status=0; active_status=0
+  fail_next=false; active_status=0
   restart_service > "$TEST_TMP/restart-output" || exit 1
   [[ $(wc -l < "$TEST_TMP/menu-restarts") -eq 1 ]] || exit 1
   for failure in restart inactive; do
-    if [[ "$failure" == restart ]]; then restart_status=1; else restart_status=0; active_status=1; fi
+    printf '{"previous":true}\n' > "$TEST_TMP/restart-baseline"; cp "$TEST_TMP/restart-baseline" "$XRAY_CONF"
+    if [[ "$failure" == restart ]]; then fail_next=true; else active_status=1; fi
     if restart_service > "$TEST_TMP/restart-output" 2>&1; then exit 1; fi
     if grep -q '\[+\].*restarted' "$TEST_TMP/restart-output"; then exit 1; fi
+    cmp "$XRAY_CONF" "$TEST_TMP/restart-baseline" || exit 1
   done
-  [[ $(wc -l < "$TEST_TMP/menu-restarts") -eq 3 ]]
+  [[ $(cat "$TEST_TMP/menu-restarts") == $'restart\nrestart\nrestart\nrestart\nstop' ]] &&
+    render_config "$XRAY_NODES" "$XRAY_CONF"
 ) || fail 'restart action restarts once and propagates service failures'
 pass 'restart action restarts once and propagates service failures'
 (

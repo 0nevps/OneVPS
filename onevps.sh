@@ -966,21 +966,54 @@ rebuild_config() (
 
 rebuild_config_locked() (
   ensure_nodes_file_locked || return 1
-  local work
+  local work had_config=false was_active=false replaced=false committed=false
   work=$(mktemp -d "$XRAY_DIR/.rebuild.XXXXXXXX") || return 1
-  trap 'rm -rf "$work"' EXIT
+  rebuild_cleanup() {
+    local status=$? restored=true
+    trap - EXIT INT TERM HUP
+    if $replaced && ! $committed; then
+      if $had_config; then
+        cp -p "$work/config.backup" "$work/config.restore" && mv "$work/config.restore" "$XRAY_CONF" || restored=false
+      else
+        rm -f "$XRAY_CONF" || restored=false
+      fi
+      if $restored && [[ -x "$XRAY_BIN" ]]; then
+        if $was_active; then
+          run_with_progress 'Restoring previous Xray service' systemctl restart xray && systemctl is-active --quiet xray || restored=false
+        else
+          systemctl stop xray || restored=false
+          if systemctl is-active --quiet xray; then restored=false; fi
+        fi
+      fi
+      if ! $restored; then err "Xray rollback failed; recovery directory retained: $work"; exit 1; fi
+      err 'Restored previous Xray configuration and service state'
+    fi
+    rm -rf "$work"
+    exit "$status"
+  }
+  trap rebuild_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   render_config "$XRAY_NODES" "$work/config.json" || return 1
   if ! validate_xray_config "$work/config.json" "$work/check.log"; then
     err "generated config failed validation (details withheld to protect credentials)"
     return 1
   fi
   secure_xray_files "$work/config.json" || { err 'Cannot prepare Xray file permissions'; return 1; }
+  if [[ -f "$XRAY_CONF" ]]; then
+    cp -p "$XRAY_CONF" "$work/config.backup" || return 1
+    had_config=true
+  fi
+  if [[ -x "$XRAY_BIN" ]] && systemctl is-active --quiet xray; then was_active=true; fi
+  replaced=true
   mv "$work/config.json" "$XRAY_CONF" || return 1
   if [[ -x "$XRAY_BIN" ]]; then
     run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || {
       err 'Xray did not restart successfully'; return 1;
     }
   fi
+  committed=true
 )
 
 node_clients() {
