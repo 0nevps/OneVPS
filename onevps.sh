@@ -205,10 +205,10 @@ is_valid_domain() {
 gen_x25519() {
   require_xray
   local kp pk pubk
-  kp=$("$XRAY_BIN" x25519)
+  kp=$("$XRAY_BIN" x25519) || { err 'Xray key generation failed'; return 1; }
   pk=$(awk -F': ' 'tolower($1) ~ /private/ {print $2; exit}' <<<"$kp")
   pubk=$(awk -F': ' 'tolower($1) ~ /public/ {print $2; exit}' <<<"$kp")
-  [[ -n "$pk" && -n "$pubk" ]] || die "failed to parse Xray x25519 keypair"
+  [[ -n "$pk" && -n "$pubk" ]] || { err 'failed to parse Xray x25519 keypair'; return 1; }
   printf '%s %s\n' "$pk" "$pubk"
 }
 
@@ -2205,7 +2205,7 @@ add_reality_node() {
   ensure_nodes_file || return 1
   echo; info "Add node - VLESS + TCP + REALITY + Vision + uTLS"
 
-  local name uuid id default_port port target pk pubk sid node
+  local name uuid id default_port port target pk pubk sid node keypair
   name=$(ask "Node name" "reality-$(openssl rand -hex 2)")
   uuid=$(ask_uuid)
   id=$(openssl rand -hex 4)
@@ -2227,7 +2227,7 @@ add_reality_node() {
 
   target=$(pick_reality_target)
   info "generating X25519 Reality keypair..."
-  read -r pk pubk < <(gen_x25519)
+  keypair=$(gen_x25519) && read -r pk pubk <<< "$keypair" || { err 'key generation failed'; pause; return 1; }
   sid=$(rand_short_id)
 
   node=$(jq -n \
@@ -2393,7 +2393,7 @@ EOF
       case "$(ask 'Select')" in
         1) edit_port "$id" || continue ;;
         2) reset_uuid "$id" ;;
-        3) rotate_reality_secret "$id" ;;
+        3) rotate_reality_secret "$id" || continue ;;
         4) edit_reality_target "$id" ;;
         5) toggle_enabled "$id" ;;
         6) del_node "$id" || true; return 0 ;;
@@ -2460,9 +2460,9 @@ reset_uuid() {
 }
 
 rotate_reality_secret() {
-  local id="$1" pk pubk sid secrets
+  local id="$1" pk pubk sid secrets keypair
   confirm "Rotate Reality keypair and shortId? Existing links for this node will stop working." n || return
-  read -r pk pubk < <(gen_x25519) || { err 'key generation failed'; pause; return; }
+  keypair=$(gen_x25519) && read -r pk pubk <<< "$keypair" || { err 'key generation failed'; pause; return 1; }
   sid=$(rand_short_id)
   secrets=$(printf '%s\n' "$pk" "$pubk" "$sid" | jq -Rsc 'split("\n") | {private:.[0],public:.[1],short:.[2]}') || return 1
   apply_candidate_transaction prepare_reality_change "$id" secrets "$secrets" && ok "Reality keypair rotated" || err "apply failed"
@@ -3019,7 +3019,7 @@ node_menu() {
   while :; do
     printf '\nNodes / share links:\n1) Add VLESS Reality\n3) Add Hysteria2\n4) Manage nodes / users / outbound\n5) Show share links\n0) Back\n'
     case "$(ask 'Select')" in
-      1) add_reality_node ;;
+      1) add_reality_node || warn 'Reality setup did not finish' ;;
       3) add_hysteria_node ;;
       4) manage_nodes ;;
       5) show_links ;;

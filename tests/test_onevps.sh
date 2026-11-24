@@ -199,6 +199,13 @@ assert_true "short IDs are 16 lowercase hex characters" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{16}$ ]]' _ "$(rand_short_id)"
 assert_true "random passwords are 32 lowercase hex characters" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{32}$ ]]' _ "$(rand_password)"
+(
+  XRAY_BIN=keygen_test_core
+  keygen_test_core() { printf 'PrivateKey: test-private\nPassword (PublicKey): test-public\n'; return 42; }
+  if gen_x25519 > "$TEST_TMP/rejected-pair"; then exit 1; fi
+  [[ ! -s "$TEST_TMP/rejected-pair" ]]
+) || fail 'failed core command cannot return a Reality keypair'
+pass 'failed core command cannot return a Reality keypair'
 
 reality_node=$(jq -c '.nodes[] | select(.id == "a1b2c3d4")' "$FIXTURE")
 
@@ -642,6 +649,13 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
   : > "$TEST_TMP/fw"
   ask() { case "$1" in 'Node name') echo mixed ;; 'Listen port') echo "$2" ;; *) return 1 ;; esac; }
   ask_uuid() { echo '123e4567-e89b-12d3-a456-426614174099'; }; pick_reality_target() { echo example.org; }
+  (
+    cp "$XRAY_NODES" "$TEST_TMP/before-keygen"
+    cp "$XRAY_CONF" "$TEST_TMP/config-before-keygen"
+    gen_x25519() { echo 'fixture-private fixture-public'; return 42; }
+    if add_reality_node > "$TEST_TMP/keygen-failed" 2>&1; then exit 1; fi
+    cmp "$XRAY_NODES" "$TEST_TMP/before-keygen" && cmp "$XRAY_CONF" "$TEST_TMP/config-before-keygen" && [[ ! -s "$TEST_TMP/fw" ]]
+  ) || exit 1
   gen_x25519() { echo 'fixture-private fixture-public'; }; pub_ip() { echo 192.0.2.20; }
   add_reality_node > "$TEST_TMP/add-reality" || exit 1
   [[ $(cat "$TEST_TMP/fw") == 'open 443 tcp' ]] || exit 1
