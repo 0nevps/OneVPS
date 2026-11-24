@@ -1547,18 +1547,21 @@ validate_onevps_script() {
     bash -n "$file"
 }
 
-caddy_sync_install() {
-  local tmp
+caddy_sync_install() (
+  local tmp units service="$ACME_UNIT_DIR/onevps-caddy-sync.service" timer="$ACME_UNIT_DIR/onevps-caddy-sync.timer"
   if [[ ! -f "$ONEVPS_SCRIPT_PATH" || ! -s "$ONEVPS_SCRIPT_PATH" ]]; then
     err 'Certificate sync requires the complete onevps.sh file. Download it before running bash.'; return 1
   fi
+  if [[ -d "$service" || -d "$timer" ]]; then err 'Certificate sync unit path is a directory'; return 1; fi
   mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
+  units=$(mktemp -d "$ACME_UNIT_DIR/.onevps-caddy-sync.XXXXXXXX") || return 1
+  tmp=''
+  trap 'rm -rf "$units"; if [[ -n "$tmp" ]]; then rm -f "$tmp"; fi' EXIT
   tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
   if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! validate_onevps_script "$tmp"; then
-    rm -f "$tmp"; err 'Incomplete OneVPS script; certificate sync runner not installed'; return 1
+    err 'Incomplete OneVPS script; certificate sync runner not installed'; return 1
   fi
-  chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || { rm -f "$tmp"; return 1; }
-  cat > "$ACME_UNIT_DIR/onevps-caddy-sync.service" <<EOF_SERVICE
+  cat > "$units/sync.service" <<EOF_SERVICE || return 1
 [Unit]
 Description=Deploy Caddy certificates to OneVPS Xray
 After=caddy.service
@@ -1567,7 +1570,7 @@ Type=oneshot
 ExecStart=/bin/bash $CADDY_SYNC_RUNNER --caddy-sync
 UMask=0077
 EOF_SERVICE
-  cat > "$ACME_UNIT_DIR/onevps-caddy-sync.timer" <<'EOF_TIMER'
+  cat > "$units/sync.timer" <<'EOF_TIMER' || return 1
 [Unit]
 Description=Check Caddy certificate deployment every minute
 [Timer]
@@ -1577,8 +1580,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
+  chmod 644 "$units/sync.service" "$units/sync.timer" && chmod 700 "$tmp" && mv -Tf "$tmp" "$CADDY_SYNC_RUNNER" &&
+    mv -Tf "$units/sync.service" "$service" && mv -Tf "$units/sync.timer" "$timer" || return 1
   systemctl daemon-reload && systemctl enable --now onevps-caddy-sync.timer
-}
+)
 
 caddy_certificate_issue() (
   local domain="$1" file i

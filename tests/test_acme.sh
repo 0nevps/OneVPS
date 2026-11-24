@@ -199,6 +199,19 @@ check 'timer syncs every minute' grep -q '^OnUnitActiveSec=1min' "$ACME_UNIT_DIR
 check 'runner dispatches Caddy sync' grep -q -- '--caddy-sync' "$CADDY_SYNC_RUNNER"
 check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
 (
+  ACME_UNIT_DIR="$TMP/blocked-units"; mkdir -p "$ACME_UNIT_DIR/onevps-caddy-sync.service"
+  CADDY_SYNC_RUNNER="$TMP/blocked-sync-runner"
+  systemctl() { touch "$TMP/unexpected-sync-systemctl"; }
+  reject 'failed sync unit write stops installation' caddy_sync_install
+  reject 'failed sync unit write never calls systemctl' test -e "$TMP/unexpected-sync-systemctl"
+  reject 'failed sync unit write does not publish runner' test -e "$CADDY_SYNC_RUNNER"
+  rmdir "$ACME_UNIT_DIR/onevps-caddy-sync.service"
+  cat() { if (($# == 0)); then return 1; fi; command cat "$@"; }
+  reject 'failed staging write stops sync installation' caddy_sync_install
+  reject 'failed staging write leaves runner unpublished' test -e "$CADDY_SYNC_RUNNER"
+  reject 'failed staging write never calls systemctl' test -e "$TMP/unexpected-sync-systemctl"
+)
+(
   cp "$CADDY_SYNC_RUNNER" "$TMP/working-runner"
   ONEVPS_SCRIPT_PATH="$TMP/incomplete-script"
   : > "$ONEVPS_SCRIPT_PATH"
