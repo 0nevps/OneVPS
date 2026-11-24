@@ -2058,7 +2058,7 @@ add_hysteria_node() {
   hopping=$(ask_hy2_hopping) || return 1
   default_password=$(rand_password) && [[ -n "$default_password" ]] || { err 'Password generation failed'; pause; return 1; }
   password=$(ask 'Password (Enter for random)' "$default_password")
-  id=$(openssl rand -hex 4)
+  id=$(openssl rand -hex 4) && [[ "$id" =~ ^[a-f0-9]{8}$ ]] || { err 'Node ID generation failed'; pause; return 1; }
   node=$(printf '%s\n' "$password" | jq -Rc --arg id "$id" --arg name "$name" --arg domain "$domain" \
     --arg cert "$cert" --arg key "$key" --argjson port "$port" --argjson hopping "$hopping" \
     '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:.,
@@ -2251,7 +2251,7 @@ add_reality_node() {
   local name uuid id default_port port target pk pubk sid node keypair
   name=$(ask "Node name" "reality-$(openssl rand -hex 2)")
   uuid=$(ask_uuid) || { pause; return 1; }
-  id=$(openssl rand -hex 4)
+  id=$(openssl rand -hex 4) && [[ "$id" =~ ^[a-f0-9]{8}$ ]] || { err 'Node ID generation failed'; pause; return 1; }
 
   default_port=443
   if port_taken_by_node "$default_port" tcp; then

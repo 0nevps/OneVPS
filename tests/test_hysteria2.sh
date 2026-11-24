@@ -193,6 +193,12 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
       *) return 1 ;;
     esac
   }
+  (
+    openssl() { if [[ "$*" == 'rand -hex 4' ]]; then echo deadbeef; return 42; fi; command openssl "$@"; }
+    apply_node_add() { touch "$TEST_TMP/unexpected-node-after-id-failure"; }
+    reject 'failed random node ID aborts HY2 creation' add_hysteria_node
+    reject 'failed random node ID never publishes node' test -e "$TEST_TMP/unexpected-node-after-id-failure"
+  )
   check 'creation flow integrates storage, service and UDP firewall' add_hysteria_node
   check 'created HY2 retained alongside existing node' jq -e '.nodes | length == 2' "$XRAY_NODES"
   check 'creation opens UDP only' grep -qx 'open 24445 udp' "$TEST_TMP/firewall"
