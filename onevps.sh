@@ -115,10 +115,10 @@ ask() {
   local q="$1" def="${2:-}" ans
   if [[ -n "$def" ]]; then
     read -rp "$q [$def]: " ans || true
-    echo "${ans:-$def}"
+    printf '%s\n' "${ans:-$def}"
   else
     read -rp "$q: " ans || true
-    echo "$ans"
+    printf '%s\n' "$ans"
   fi
 }
 
