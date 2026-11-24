@@ -216,7 +216,7 @@ assert_true "short IDs are 16 lowercase hex characters" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{16}$ ]]' _ "$(rand_short_id)"
 assert_true "random passwords are 32 lowercase hex characters" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{32}$ ]]' _ "$(rand_password)"
-for literal in -n -e '-n -e' 'literal\password'; do
+for literal in -n -e '-n -e' 'literal\password' '  secret with spaces  ' $'\tsecret\t'; do
   assert_eq 'input helper preserves option-like and backslash values' "$literal" "$(ask Password <<< "$literal")"
   assert_eq 'input helper preserves option-like defaults' "$literal" "$(ask Password "$literal" <<< '')"
 done

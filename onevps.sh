@@ -114,10 +114,10 @@ confirm() {
 ask() {
   local q="$1" def="${2:-}" ans
   if [[ -n "$def" ]]; then
-    read -rp "$q [$def]: " ans || true
+    IFS= read -rp "$q [$def]: " ans || true
     printf '%s\n' "${ans:-$def}"
   else
-    read -rp "$q: " ans || true
+    IFS= read -rp "$q: " ans || true
     printf '%s\n' "$ans"
   fi
 }
