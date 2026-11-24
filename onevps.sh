@@ -2368,7 +2368,7 @@ manage_nodes() {
       printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n3) Set UDP port hopping\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
       case "$(ask 'Select')" in
         1) edit_port "$id" || continue ;;
-        2) reset_hy2_password "$id" ;;
+        2) reset_hy2_password "$id" || continue ;;
         3) hopping=$(ask_hy2_hopping) || return 1
            apply_candidate_transaction prepare_hy2_change "$id" hopping "$hopping" && ok 'updated; allow advertised UDP ports in cloud firewall' || err 'port hopping unchanged'; pause ;;
         5) toggle_enabled "$id" ;;

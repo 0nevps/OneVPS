@@ -907,6 +907,16 @@ for node_id in a1b2c3d4 b2c3d4e5; do
   ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES" "$node_id" "$TEST_TMP/menu-input" "$TEST_TMP/menu-applied"
 done
 # Script updates use local fixtures only; no download or host operation runs.
+printf '2\n0\n' > "$TEST_TMP/password-menu-input"
+assert_true 'failed HY2 password reset keeps the node menu usable under errexit' bash -c '
+  source "$1"; exec 3< "$2"
+  require_xray() { :; }; ensure_nodes_file() { :; }; node_count() { echo 1; }; pick_node() { echo hy2; }
+  node_by_id() { printf "{\"type\":\"hysteria2\"}\n"; }; clear() { :; }; node_link() { :; }
+  ask() { local selection; read -r selection <&3; printf "%s\n" "$selection"; }
+  reset_hy2_password() { return 1; }
+  manage_nodes
+  printf "MENU_SURVIVED\n"
+' _ "$ROOT_DIR/onevps.sh" "$TEST_TMP/password-menu-input"
 (
   ONEVPS_SCRIPT_PATH="$TEST_TMP/update-target.sh"
   printf '#!/usr/bin/env bash\nprintf "old script\\n"\n' > "$ONEVPS_SCRIPT_PATH"
