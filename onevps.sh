@@ -2852,7 +2852,7 @@ realm_restart() {
 realm_apply() {
   local candidate="$1" backup was_active=false was_enabled=false
   realm_owned || { err "realm is not managed by OneVPS"; return 1; }
-  jq -e '.endpoints | type == "array"' "$candidate" >/dev/null || return 1
+  jq -es 'length == 1 and (.[0].endpoints | type == "array")' "$candidate" >/dev/null || return 1
   backup=$(mktemp "$REALM_DIR/.backup.XXXXXX") || return 1
   cp -p "$REALM_DIR/config.json" "$backup" || { rm -f "$backup"; return 1; }
   systemctl is-active --quiet onevps-realm && was_active=true

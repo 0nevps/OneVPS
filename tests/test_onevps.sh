@@ -467,6 +467,14 @@ assert_eq "realm enable failure restores config" "$before" "$(cat "$REALM_DIR/co
 printf 'invalid json\n' > "$candidate"
 assert_false "realm rejects malformed candidate" realm_apply "$candidate"
 assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
+(
+  systemctl() { touch "$TEST_TMP/invalid-relay-service-change"; return 0; }
+  realm_restart() { touch "$TEST_TMP/invalid-relay-service-change"; return 0; }
+  printf '{"endpoints":[]}\n{"endpoints":[]}\n' > "$candidate"
+  if realm_apply "$candidate"; then exit 1; fi
+  [[ ! -e "$TEST_TMP/invalid-relay-service-change" ]] && [[ $(cat "$REALM_DIR/config.json") == "$before" ]]
+) || fail 'concatenated Realm documents cannot trigger activation'
+pass 'concatenated Realm documents cannot trigger activation'
 
 (
   cp "$REALM_DIR/config.json" "$TEST_TMP/saved-relays"
