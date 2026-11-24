@@ -2761,7 +2761,7 @@ realm_write_lock() {
 }
 
 realm_add() (
-  local port host remote_port mode endpoint candidate sockets
+  local port host remote_port mode endpoint candidate sockets flags=-lnt
   port=$(ask 'Local listening port')
   host=$(ask 'Destination IP or hostname (IPv6 without brackets)')
   remote_port=$(ask 'Destination port')
@@ -2770,9 +2770,13 @@ realm_add() (
   warn "relay listens on all IPv4 interfaces; it adds no authentication or encryption"
   confirm "Forward port $port to $host:$remote_port ($mode)?" || return 0
   realm_write_lock || return 1
-  if [[ "$mode" == both ]] && port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; fi
+  if port_taken_by_node "$port" tcp; then err 'TCP port reserved by Xray'; return 1; fi
+  if [[ "$mode" == both ]]; then
+    flags=-lntu
+    if port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; fi
+  fi
   command -v ss >/dev/null 2>&1 || { err "ss is required to check listening ports; install iproute2/iproute"; return 1; }
-  sockets=$(ss -H -lntu) || { err "cannot inspect listening ports"; return 1; }
+  sockets=$(ss -H "$flags") || { err "cannot inspect listening ports"; return 1; }
   if socket_list_has_port "$port" <<<"$sockets"; then
     err "port $port is already in use"; return 1
   fi

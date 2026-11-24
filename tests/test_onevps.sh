@@ -444,6 +444,21 @@ assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DI
 ) || fail 'Realm deletion checks the selected rule against the current configuration'
 pass 'Realm deletion checks the selected rule against the current configuration'
 
+(
+  REALM_DIR="$TEST_TMP/relay-port-test"; mkdir "$REALM_DIR" || exit 1
+  printf '{"endpoints":[]}' > "$REALM_DIR/config.json"
+  XRAY_NODES="$FIXTURE"; relay_port=12345; relay_mode=both
+  ask() { case "$1" in 'Local listening port') echo "$relay_port" ;; 'Destination port') echo 443 ;; 'Destination IP'*) echo example.com ;; *) echo "$relay_mode" ;; esac; }
+  confirm() { :; }; realm_install() { :; }; realm_apply() { mv "$1" "$REALM_DIR/config.json"; }
+  ss() { if [[ "$2" == *u* ]]; then printf 'udp UNCONN 0 0 0.0.0.0:12345 0.0.0.0:*\n'; fi; }
+  if realm_add; then exit 1; fi
+  relay_mode=tcp; realm_add || exit 1
+  jq -e '.endpoints|length==1' "$REALM_DIR/config.json" >/dev/null || exit 1
+  relay_port=24443; if realm_add; then exit 1; fi
+  jq -e '.endpoints|length==1' "$REALM_DIR/config.json" >/dev/null
+) || fail 'Realm checks only required transports and respects reserved Xray TCP ports'
+pass 'Realm checks only required transports and respects reserved Xray TCP ports'
+
 cp "$FIXTURE" "$XRAY_NODES"
 node_candidate="$TEST_TMP/node-candidate.json"
 assert_true "render default node configuration" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
