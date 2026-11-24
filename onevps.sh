@@ -2031,7 +2031,7 @@ add_hysteria_node() {
     err 'Hysteria2 setup requires ss (iproute2) and runuser (util-linux)'; pause; return 0;
   }
   ensure_nodes_file || return 1
-  local name domain password cert key port id node hopping
+  local name domain password cert key port id node hopping default_password
   info 'Add Hysteria2 (native Xray, QUIC/UDP + TLS)'
   warn 'Use a DNS-only domain pointing to this server. Caddy manages TLS; public TCP 80/443 must be reachable.'
   name=$(ask 'Node name' "hy2-$(openssl rand -hex 2)")
@@ -2056,7 +2056,8 @@ add_hysteria_node() {
     break
   done
   hopping=$(ask_hy2_hopping) || return 1
-  password=$(ask 'Password (Enter for random)' "$(rand_password)")
+  default_password=$(rand_password) && [[ -n "$default_password" ]] || { err 'Password generation failed'; pause; return 1; }
+  password=$(ask 'Password (Enter for random)' "$default_password")
   id=$(openssl rand -hex 4)
   node=$(printf '%s\n' "$password" | jq -Rc --arg id "$id" --arg name "$name" --arg domain "$domain" \
     --arg cert "$cert" --arg key "$key" --argjson port "$port" --argjson hopping "$hopping" \
@@ -2279,7 +2280,7 @@ add_reality_node() {
   target=$(pick_reality_target)
   info "generating X25519 Reality keypair..."
   keypair=$(gen_x25519) && read -r pk pubk <<< "$keypair" || { err 'key generation failed'; pause; return 1; }
-  sid=$(rand_short_id)
+  sid=$(rand_short_id) && [[ -n "$sid" ]] || { err 'Short ID generation failed'; pause; return 1; }
 
   node=$(printf '%s\n' "$uuid" "$pk" "$pubk" "$sid" | jq -Rsc \
     --arg id "$id" --arg name "$name" --arg tag "reality-$id" \
@@ -2520,7 +2521,7 @@ rotate_reality_secret() {
   local id="$1" pk pubk sid secrets keypair
   confirm "Rotate Reality keypair and shortId? Existing links for this node will stop working." n || return
   keypair=$(gen_x25519) && read -r pk pubk <<< "$keypair" || { err 'key generation failed'; pause; return 1; }
-  sid=$(rand_short_id)
+  sid=$(rand_short_id) && [[ -n "$sid" ]] || { err 'Short ID generation failed'; pause; return 1; }
   secrets=$(printf '%s\n' "$pk" "$pubk" "$sid" | jq -Rsc 'split("\n") | {private:.[0],public:.[1],short:.[2]}') || return 1
   apply_candidate_transaction prepare_reality_change "$id" secrets "$secrets" && ok "Reality keypair rotated" || err "apply failed"
   pause
@@ -2534,8 +2535,9 @@ edit_reality_target() {
 }
 
 reset_hy2_password() {
-  local id="$1" pw
-  pw=$(ask "New default password (Enter for random)" "$(rand_password)")
+  local id="$1" pw default_password
+  default_password=$(rand_password) && [[ -n "$default_password" ]] || { err 'Password generation failed'; pause; return 1; }
+  pw=$(ask "New default password (Enter for random)" "$default_password")
   printf '%s\n' "$pw" | jq -R . | apply_node_user_change "$id" reset || { err 'apply failed'; return 1; }
   ok "password reset"
   pause

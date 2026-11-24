@@ -238,6 +238,19 @@ pass 'failed core command cannot return a Reality keypair'
 ) || fail 'failed or invalid UUID generation cannot supply a default credential'
 pass 'failed or invalid UUID generation cannot supply a default credential'
 (
+  pause() { :; }; confirm() { return 0; }
+  rand_password() { echo failed-password-output; return 42; }
+  ask() { touch "$TEST_TMP/unexpected-random-password-prompt"; echo "$2"; }
+  apply_node_user_change() { touch "$TEST_TMP/unexpected-random-password-update"; }
+  if reset_hy2_password test; then exit 1; fi
+  [[ ! -e "$TEST_TMP/unexpected-random-password-prompt" && ! -e "$TEST_TMP/unexpected-random-password-update" ]] || exit 1
+  gen_x25519() { echo 'private public'; }; rand_short_id() { echo failed-short-id; return 42; }
+  apply_candidate_transaction() { touch "$TEST_TMP/unexpected-random-secret-update"; }
+  if rotate_reality_secret test; then exit 1; fi
+  [[ ! -e "$TEST_TMP/unexpected-random-secret-update" ]]
+) || fail 'failed password and short ID generation cannot update credentials'
+pass 'failed password and short ID generation cannot update credentials'
+(
   rand_uuid() { echo 123e4567-e89b-12d3-a456-426614174000; }
   ask() { if [[ ! -e "$TEST_TMP/uuid-first-prompt" ]]; then touch "$TEST_TMP/uuid-first-prompt"; echo invalid; else echo "$2"; fi; }
   selected=$(ask_uuid 2> "$TEST_TMP/uuid-warning") || exit 1
