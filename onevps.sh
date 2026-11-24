@@ -157,7 +157,9 @@ rand_port() {
   local p
   while :; do
     p=$(( ( (RANDOM << 15) | RANDOM ) % 55535 + 10000 ))
-    port_taken_by_node "$p" tcp 2>/dev/null && continue
+    if port_taken_by_node "$p" tcp; then continue; else
+      [[ $? == 1 ]] || return 1
+    fi
     if port_in_use "$p" tcp; then continue; else
       [[ $? == 1 ]] || return 1
     fi
@@ -372,13 +374,16 @@ socket_list_has_port() {
 }
 
 port_taken_by_node() {
-  [[ -f "$XRAY_NODES" ]] || return 1
-  jq -e --argjson p "$1" --arg proto "${2:-both}" --arg exclude "${3:-}" '
+  local result
+  [[ -e "$XRAY_NODES" || -L "$XRAY_NODES" ]] || return 1
+  result=$(jq -sr --argjson p "$1" --arg proto "${2:-both}" --arg exclude "${3:-}" '
+    if length!=1 or (.[0].nodes|type)!="array" then error("invalid node reservations") else .[0] end |
     any(.nodes[]; .id != $exclude and
       ($proto == "both" or (if .type == "hysteria2" then "udp" else "tcp" end) == $proto) and
       (.port == $p or (.hopping != null and any(.hopping.ports | split(",")[] | split("-") | map(tonumber);
         first <= $p and last >= $p))))
-  ' "$XRAY_NODES" >/dev/null 2>&1
+  ' "$XRAY_NODES") || { err 'Cannot inspect Xray port reservations'; return 2; }
+  [[ "$result" == true ]]
 }
 
 # ----------------------------------------------------------------------------
@@ -2042,6 +2047,8 @@ add_hysteria_node() {
     port=$((10#$port))
     if port_taken_by_node "$port" udp; then
       warn 'UDP port is already in use'; continue
+    else
+      [[ $? == 1 ]] || { pause; return 1; }
     fi
     if port_in_use "$port" udp; then warn 'UDP port is already in use'; continue; else
       [[ $? == 1 ]] || { pause; return 1; }
@@ -2248,16 +2255,19 @@ add_reality_node() {
   default_port=443
   if port_taken_by_node "$default_port" tcp; then
     default_port=$(rand_port) || { pause; return 1; }
-  elif port_in_use "$default_port" tcp; then
-    default_port=$(rand_port) || { pause; return 1; }
   else
     [[ $? == 1 ]] || { pause; return 1; }
+    if port_in_use "$default_port" tcp; then default_port=$(rand_port) || { pause; return 1; }; else
+      [[ $? == 1 ]] || { pause; return 1; }
+    fi
   fi
 
   while :; do
     port=$(ask "Listen port" "$default_port")
     realm_valid_port "$port" || { warn 'invalid TCP port (1-65535)'; continue; }
-    if port_taken_by_node "$port" tcp; then warn "TCP port $port already used by another node"; continue; fi
+    if port_taken_by_node "$port" tcp; then warn "TCP port $port already used by another node"; continue; else
+      [[ $? == 1 ]] || { pause; return 1; }
+    fi
     if port_in_use "$port" tcp; then
       confirm "Port $port appears to be in use. Use anyway?" n || continue
     else
@@ -2481,6 +2491,8 @@ edit_port() {
     realm_valid_port "$newp" || { warn 'invalid port (1-65535)'; continue; }
     if port_taken_by_node "$newp" "$proto" "$id"; then
       warn "port used by another node"; continue
+    else
+      [[ $? == 1 ]] || { pause; return 1; }
     fi
     if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]]; then
       if port_in_use "$newp" "$proto"; then
@@ -2921,10 +2933,14 @@ realm_add() (
   warn "relay listens on all IPv4 interfaces; it adds no authentication or encryption"
   confirm "Forward port $port to $host:$remote_port ($mode)?" || return 0
   realm_write_lock || return 1
-  if port_taken_by_node "$port" tcp; then err 'TCP port reserved by Xray'; return 1; fi
+  if port_taken_by_node "$port" tcp; then err 'TCP port reserved by Xray'; return 1; else
+    [[ $? == 1 ]] || return 1
+  fi
   if [[ "$mode" == both ]]; then
     flags=-lntu
-    if port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; fi
+    if port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; else
+      [[ $? == 1 ]] || return 1
+    fi
   fi
   command -v ss >/dev/null 2>&1 || { err "ss is required to check listening ports; install iproute2/iproute"; return 1; }
   sockets=$(ss -H "$flags") || { err "cannot inspect listening ports"; return 1; }
