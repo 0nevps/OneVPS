@@ -206,6 +206,23 @@ assert_true "random passwords are 32 lowercase hex characters" \
   [[ ! -s "$TEST_TMP/rejected-pair" ]]
 ) || fail 'failed core command cannot return a Reality keypair'
 pass 'failed core command cannot return a Reality keypair'
+(
+  ask() { printf '%s\n' "$2"; }
+  rand_uuid() { echo 123e4567-e89b-12d3-a456-426614174000; return 42; }
+  if ask_uuid > "$TEST_TMP/rejected-uuid"; then exit 1; fi
+  [[ ! -s "$TEST_TMP/rejected-uuid" ]] || exit 1
+  rand_uuid() { echo invalid; }
+  if ask_uuid > "$TEST_TMP/rejected-uuid"; then exit 1; fi
+  [[ ! -s "$TEST_TMP/rejected-uuid" ]]
+) || fail 'failed or invalid UUID generation cannot supply a default credential'
+pass 'failed or invalid UUID generation cannot supply a default credential'
+(
+  rand_uuid() { echo 123e4567-e89b-12d3-a456-426614174000; }
+  ask() { if [[ ! -e "$TEST_TMP/uuid-first-prompt" ]]; then touch "$TEST_TMP/uuid-first-prompt"; echo invalid; else echo "$2"; fi; }
+  selected=$(ask_uuid 2> "$TEST_TMP/uuid-warning") || exit 1
+  [[ "$selected" == 123e4567-e89b-12d3-a456-426614174000 ]] && grep -q 'invalid UUID format' "$TEST_TMP/uuid-warning"
+) || fail 'UUID retry warnings stay out of the selected credential'
+pass 'UUID retry warnings stay out of the selected credential'
 
 reality_node=$(jq -c '.nodes[] | select(.id == "a1b2c3d4")' "$FIXTURE")
 

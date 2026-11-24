@@ -140,10 +140,10 @@ rand_uuid() {
 
 ask_uuid() {
   local input default
-  default=$(rand_uuid)
+  default=$(rand_uuid) && is_valid_uuid "$default" || { err 'UUID generation failed'; return 1; }
   input=$(ask "UUID (Enter for random)" "$default")
   while ! is_valid_uuid "$input"; do
-    warn "invalid UUID format (expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+    warn "invalid UUID format (expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)" >&2
     input=$(ask "UUID (Enter for random)" "$default")
   done
   echo "$input"
@@ -2207,7 +2207,7 @@ add_reality_node() {
 
   local name uuid id default_port port target pk pubk sid node keypair
   name=$(ask "Node name" "reality-$(openssl rand -hex 2)")
-  uuid=$(ask_uuid)
+  uuid=$(ask_uuid) || { pause; return 1; }
   id=$(openssl rand -hex 4)
 
   default_port=443
@@ -2392,7 +2392,7 @@ manage_nodes() {
 EOF
       case "$(ask 'Select')" in
         1) edit_port "$id" || continue ;;
-        2) reset_uuid "$id" ;;
+        2) reset_uuid "$id" || continue ;;
         3) rotate_reality_secret "$id" || continue ;;
         4) edit_reality_target "$id" ;;
         5) toggle_enabled "$id" ;;
@@ -2453,7 +2453,7 @@ edit_port() {
 
 reset_uuid() {
   local id="$1" new_uuid
-  new_uuid=$(ask_uuid)
+  new_uuid=$(ask_uuid) || { pause; return 1; }
   printf '%s\n' "$new_uuid" | jq -R . | apply_node_user_change "$id" reset || { err 'apply failed'; return 1; }
   ok "UUID reset"
   pause
