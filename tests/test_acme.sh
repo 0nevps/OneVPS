@@ -38,6 +38,29 @@ if [[ $(uname -s) == Darwin ]]; then
 fi
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
   -days 2 -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
+(
+  mkdir "$TMP/test-ca"; touch "$TMP/test-ca/index"; echo 01 > "$TMP/test-ca/serial"
+  cat > "$TMP/test-ca/config" <<EOF
+[ca]
+default_ca = test
+[test]
+database = $TMP/test-ca/index
+serial = $TMP/test-ca/serial
+new_certs_dir = $TMP/test-ca
+default_md = sha256
+policy = names
+x509_extensions = leaf
+[names]
+commonName = supplied
+[leaf]
+subjectAltName = DNS:example.com
+EOF
+  openssl req -new -key "$TMP/key.pem" -out "$TMP/test-ca/request" -subj /CN=example.com >/dev/null 2>&1
+  openssl ca -batch -selfsign -config "$TMP/test-ca/config" -keyfile "$TMP/key.pem" \
+    -in "$TMP/test-ca/request" -out "$TMP/test-ca/future.pem" \
+    -startdate 20990101000000Z -enddate 20990201000000Z >/dev/null 2>&1
+  reject 'not-yet-valid certificate cannot be deployed' validate_hy2_pem example.com "$TMP/test-ca/future.pem" "$TMP/key.pem"
+)
 cp "$TMP/cert.pem" "$CADDY_STATE/staging/example.com/fullchain.pem"
 cp "$TMP/key.pem" "$CADDY_STATE/staging/example.com/key.pem"
 (

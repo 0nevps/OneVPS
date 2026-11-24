@@ -1842,8 +1842,9 @@ validate_hy2_certificate() {
 validate_hy2_pem() {
   local domain="$1" cert="$2" key="$3" cert_pub key_pub
   openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 &&
+    openssl verify -partial_chain -trusted "$cert" "$cert" >/dev/null 2>&1 &&
     openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1 || {
-      err 'certificate is expired, invalid or does not match the domain'; return 1;
+      err 'certificate is outside its validity period, invalid or does not match the domain'; return 1;
     }
   cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null) || return 1
   key_pub=$(openssl pkey -in "$key" -passin pass: -pubout 2>/dev/null) || return 1
