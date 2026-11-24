@@ -1548,17 +1548,44 @@ validate_onevps_script() {
 }
 
 caddy_sync_install() (
-  local tmp units service="$ACME_UNIT_DIR/onevps-caddy-sync.service" timer="$ACME_UNIT_DIR/onevps-caddy-sync.timer"
+  local runner_work='' units service="$ACME_UNIT_DIR/onevps-caddy-sync.service" timer="$ACME_UNIT_DIR/onevps-caddy-sync.timer"
+  local published=0 complete=false index
+  local -a targets backups staged
   if [[ ! -f "$ONEVPS_SCRIPT_PATH" || ! -s "$ONEVPS_SCRIPT_PATH" ]]; then
     err 'Certificate sync requires the complete onevps.sh file. Download it before running bash.'; return 1
   fi
   if [[ -d "$service" || -d "$timer" ]]; then err 'Certificate sync unit path is a directory'; return 1; fi
   mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
   units=$(mktemp -d "$ACME_UNIT_DIR/.onevps-caddy-sync.XXXXXXXX") || return 1
-  tmp=''
-  trap 'rm -rf "$units"; if [[ -n "$tmp" ]]; then rm -f "$tmp"; fi' EXIT
-  tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
-  if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! validate_onevps_script "$tmp"; then
+  sync_publish_cleanup() {
+    local result=$? restored=true entry
+    trap - EXIT INT TERM HUP
+    if ! $complete; then
+      for ((entry=published-1; entry>=0; entry--)); do
+        if [[ -e "${backups[entry]}" || -L "${backups[entry]}" ]]; then
+          mv -Tf "${backups[entry]}" "${targets[entry]}" || restored=false
+        else
+          rm -f "${targets[entry]}" || restored=false
+        fi
+      done
+    fi
+    if ! $restored; then
+      err "Certificate sync rollback failed; recovery directories retained: $units and $runner_work"
+      exit 1
+    fi
+    rm -rf "$units"
+    if [[ -n "$runner_work" ]]; then rm -rf "$runner_work"; fi
+    exit "$result"
+  }
+  trap sync_publish_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  runner_work=$(mktemp -d "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
+  targets=("$CADDY_SYNC_RUNNER" "$service" "$timer")
+  backups=("$runner_work/runner.backup" "$units/service.backup" "$units/timer.backup")
+  staged=("$runner_work/runner" "$units/sync.service" "$units/sync.timer")
+  if ! cat "$ONEVPS_SCRIPT_PATH" > "${staged[0]}" || ! validate_onevps_script "${staged[0]}"; then
     err 'Incomplete OneVPS script; certificate sync runner not installed'; return 1
   fi
   cat > "$units/sync.service" <<EOF_SERVICE || return 1
@@ -1580,8 +1607,17 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-  chmod 644 "$units/sync.service" "$units/sync.timer" && chmod 700 "$tmp" && mv -Tf "$tmp" "$CADDY_SYNC_RUNNER" &&
-    mv -Tf "$units/sync.service" "$service" && mv -Tf "$units/sync.timer" "$timer" || return 1
+  chmod 644 "${staged[1]}" "${staged[2]}" && chmod 700 "${staged[0]}" || return 1
+  for index in "${!targets[@]}"; do
+    if [[ -e "${targets[index]}" || -L "${targets[index]}" ]]; then
+      cp -pP "${targets[index]}" "${backups[index]}" || return 1
+    fi
+  done
+  for index in "${!targets[@]}"; do
+    published=$((index + 1))
+    mv -Tf "${staged[index]}" "${targets[index]}" || { err 'Cannot publish certificate sync files'; return 1; }
+  done
+  complete=true
   systemctl daemon-reload && systemctl enable --now onevps-caddy-sync.timer
 )
 

@@ -212,6 +212,23 @@ check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
   reject 'failed staging write never calls systemctl' test -e "$TMP/unexpected-sync-systemctl"
 )
 (
+  ACME_UNIT_DIR="$TMP/publish-units"; mkdir "$ACME_UNIT_DIR"
+  CADDY_SYNC_RUNNER="$TMP/publish-runner"
+  printf 'old runner\n' > "$CADDY_SYNC_RUNNER"
+  printf 'old service\n' > "$ACME_UNIT_DIR/onevps-caddy-sync.service"
+  mv() {
+    if [[ "$2" == */sync.timer ]]; then return 1; fi
+    if [[ $(uname -s) == Darwin && "$1" == -Tf ]]; then
+      python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' "$2" "$3"
+    else command mv "$@"; fi
+  }
+  systemctl() { touch "$TMP/unexpected-sync-publish-systemctl"; }
+  reject 'failed timer publication stops installation' caddy_sync_install
+  check 'failed publication restores old runner' grep -Fxq 'old runner' "$CADDY_SYNC_RUNNER"
+  check 'failed publication restores old service' grep -Fxq 'old service' "$ACME_UNIT_DIR/onevps-caddy-sync.service"
+  reject 'failed publication never calls systemctl' test -e "$TMP/unexpected-sync-publish-systemctl"
+)
+(
   cp "$CADDY_SYNC_RUNNER" "$TMP/working-runner"
   ONEVPS_SCRIPT_PATH="$TMP/incomplete-script"
   : > "$ONEVPS_SCRIPT_PATH"
