@@ -252,6 +252,12 @@ for enabled in true false; do
   assert_false "reject unknown node type (enabled=$enabled)" rebuild_config
   assert_true 'invalid input leaves active configuration intact' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
 done
+for malformed in '"true"' 'null' '1'; do
+  jq --argjson enabled "$malformed" '.nodes[0] |= (.enabled=$enabled |
+    .outbound={mode:"proxy",protocol:"socks",server:"127.0.0.1",port:1080})' "$FIXTURE" > "$XRAY_NODES"
+  assert_false "reject non-boolean Reality enabled=$malformed with proxy assigned" rebuild_config
+  assert_true 'invalid Reality flag cannot replace live routing' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
+done
 cp "$FIXTURE" "$XRAY_NODES"
 
 assert_true 'node creation menu lists only Reality and HY2' bash -c '
@@ -429,6 +435,30 @@ systemctl() {
 render_config "$XRAY_NODES" "$XRAY_CONF"
 chmod 640 "$XRAY_NODES"
 chmod 600 "$XRAY_CONF"
+(
+  XRAY_DIR="$TEST_TMP/concurrent"; mkdir "$XRAY_DIR" || exit 1
+  XRAY_NODES="$XRAY_DIR/nodes.json"; XRAY_CONF="$XRAY_DIR/config.json"
+  cp "$FIXTURE" "$XRAY_NODES" && rebuild_config || exit 1
+  wait_for_marker() {
+    local attempt
+    for ((attempt=0; attempt<200; attempt++)); do [[ ! -e "$1" ]] || return 0; command sleep 0.05; done
+    return 1
+  }
+  stage_assignment() {
+    prepare_outbound_assignment "$1" "$2" "$3" <<< '{"mode":"direct"}' || return 1
+    if [[ "$3" == a1b2c3d4 ]]; then
+      touch "$XRAY_DIR/first-read" && wait_for_marker "$XRAY_DIR/second-started" || return 1
+      if flock -n "${XRAY_DIR}.lock" -c true; then return 1; fi
+    fi
+  }
+  apply_candidate_transaction stage_assignment a1b2c3d4 & first=$!
+  wait_for_marker "$XRAY_DIR/first-read" || exit 1
+  (touch "$XRAY_DIR/second-started" && apply_candidate_transaction stage_assignment b2c3d4e5) & second=$!
+  result=0; wait "$first" || result=1; wait "$second" || result=1; [[ "$result" == 0 ]] || exit 1
+  jq -e 'all(.nodes[0:2][]; .outbound.mode=="direct")' "$XRAY_NODES" >/dev/null &&
+    jq -e '[.routing.rules[] | select(.outboundTag=="direct") | .inboundTag[]] | sort == ["hy2-b2c3d4e5","reality-a1b2c3d4"]' "$XRAY_CONF" >/dev/null
+) || fail 'concurrent writers preserve both assignments in metadata and runtime config'
+pass 'concurrent writers preserve both assignments in metadata and runtime config'
 (
   pause() { :; }; confirm() { return 0; }; port_in_use() { return 1; }; ask() { echo 20001; }
   TEST_TMP="$TEST_TMP/reality-lifecycle"; mkdir "$TEST_TMP" || exit 1
@@ -671,7 +701,9 @@ done
   printf '#!/usr/bin/env bash\nprintf "old script\\n"\n' > "$ONEVPS_SCRIPT_PATH"
   chmod 750 "$ONEVPS_SCRIPT_PATH"
   cp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-before"
-  printf '#!/usr/bin/env bash\nprintf "updated script\\n"\n' > "$TEST_TMP/update-latest"
+  sed '/^main() {$/a\
+  printf "updated script\\n"; return 0
+' "$ROOT_DIR/onevps.sh" > "$TEST_TMP/update-latest"
   confirm() { return 0; }
   ensure_deps() { :; }
   download_file() {
@@ -680,12 +712,14 @@ done
     case "$update_mode" in
       failed) printf 'partial download\n' > "$destination"; return 22 ;;
       empty) : > "$destination" ;;
+      shebang) printf '#!/usr/bin/env bash\n' > "$destination" ;;
+      truncated) sed '$d' "$TEST_TMP/update-latest" > "$destination" ;;
       invalid) printf '#!/usr/bin/env bash\nif\n' > "$destination" ;;
       html) printf '<html>Not a script</html>\n' > "$destination" ;;
       *) cp "$TEST_TMP/update-latest" "$destination" ;;
     esac
   }
-  for update_mode in failed empty invalid html; do
+  for update_mode in failed empty invalid html shebang truncated; do
     if update_script; then exit 1; fi
     cmp "$ONEVPS_SCRIPT_PATH" "$TEST_TMP/update-before" || exit 1
   done

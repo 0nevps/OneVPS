@@ -60,7 +60,8 @@ reject 'TCP socket independent' port_in_use 24443 tcp
 unset -f ss
 # No host services, permissions or firewall changes in unit tests.
 # shellcheck disable=SC2034
-XRAY_DIR="$TEST_TMP"
+XRAY_DIR="$TEST_TMP/xray"
+mkdir "$XRAY_DIR"
 XRAY_CONF="$TEST_TMP/live.json"
 cp "$TEST_TMP/config.json" "$XRAY_CONF"
 printf '#!/usr/bin/env bash\nprintf "Xray 26.10.21\\n"\n' > "$TEST_TMP/core"

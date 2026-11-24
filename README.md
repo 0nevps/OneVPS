@@ -177,7 +177,7 @@ Danger zone:
 ```
 
 Option `6` (**Update script**) downloads OneVPS from the repository `main` branch after confirmation,
-checks Bash syntax, and starts the updated menu. No script version is displayed. A local script is replaced
+checks the script entry points, end of file and Bash syntax, then starts the updated menu. A local script is replaced
 only after validation. The convenience command downloads a complete temporary file so certificate sync can install
 its runner. Download or validation failures leave the current script unchanged. Updating the script does not update
 Xray or Realm.
@@ -236,6 +236,7 @@ credentials; use it only over a trusted/protected path. UDP availability depends
 and server, not merely on a valid link.
 
 Outbound changes require an installed Xray binary and successful configuration validation before activation.
+Configuration writes use `flock` (util-linux): a second OneVPS session waits for the first to commit or roll back.
 They preserve backups and restart Xray, which may start a previously stopped service. Detected activation
 failures restore the previous metadata/configuration and attempt to restore the previous service state.
 Recovery failures are reported separately; this is not a guarantee against power loss during file replacement.

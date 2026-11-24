@@ -300,22 +300,22 @@ secure_xray_files() {
   fi
 }
 
-install_xray() {
+install_xray() (
   ensure_deps
+  xray_write_lock || return 1
   local tmp
   tmp=$(mktemp)
   info "downloading official Xray installer..."
   download_file "$XRAY_INSTALL_URL" -o "$tmp" || { rm -f "$tmp"; die "download failed"; }
-  run_with_progress 'Installing/updating Xray-core and geodata' bash "$tmp" install \
+  run_with_progress 'Installing/updating Xray-core and geodata' bash "$tmp" install 7>&- \
     || { rm -f "$tmp"; die "Xray install failed"; }
   rm -f "$tmp"
 
   mkdir -p "$XRAY_DIR"
-  [[ -f "$XRAY_NODES" ]] || echo '{"nodes":[]}' > "$XRAY_NODES"
   write_service
-  rebuild_config || return 1
+  rebuild_config_locked || return 1
   ok "Xray $(installed_version) installed"
-}
+)
 
 # ----------------------------------------------------------------------------
 # Firewall / ports
@@ -609,7 +609,19 @@ HTML
 # ----------------------------------------------------------------------------
 # [3] Node storage + config generation
 # ----------------------------------------------------------------------------
-ensure_nodes_file() {
+xray_write_lock() {
+  command -v flock >/dev/null || { err 'Xray configuration writes require flock (util-linux)'; return 1; }
+  mkdir -p "$(dirname "$XRAY_DIR")" || return 1
+  exec 7>>"${XRAY_DIR}.lock" || return 1
+  flock -x 7 || { err 'Cannot lock Xray configuration'; return 1; }
+}
+
+ensure_nodes_file() (
+  [[ ! -f "$XRAY_NODES" ]] || return 0
+  xray_write_lock && ensure_nodes_file_locked
+)
+
+ensure_nodes_file_locked() {
   [[ ! -f "$XRAY_NODES" ]] || return 0
   mkdir -p "$XRAY_DIR" && echo '{"nodes":[]}' > "$XRAY_NODES"
 }
@@ -946,8 +958,12 @@ render_config() {
     }' > "$output"
 }
 
-rebuild_config() {
-  ensure_nodes_file || return 1
+rebuild_config() (
+  xray_write_lock && rebuild_config_locked
+)
+
+rebuild_config_locked() {
+  ensure_nodes_file_locked || return 1
   local tmp_conf chk_err
   tmp_conf=$(mktemp_json)
   render_config "$XRAY_NODES" "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
@@ -988,17 +1004,20 @@ validate_node_metadata() {
   done <<<"$outbounds"
   jq -e '
     def nonempty: type == "string" and length > 0;
+    def port: type == "number" and floor == . and . >= 1 and . <= 65535;
     (.nodes | type == "array") and
     ([.nodes[].id] | length == (unique | length)) and
     all(.nodes[];
       . as $n |
       (.id | nonempty) and
+      (.enabled | type == "boolean") and (.tag | nonempty) and (.port | port) and
       (if .type == "hysteria2" then
-        (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
         (.domain | type == "string" and test("^[A-Za-z0-9.-]+$")) and
         (.tls_cert | type == "string" and startswith("/")) and
-        (.tls_key | type == "string" and startswith("/")) and
-        (.enabled | type == "boolean") and (.tag | nonempty)
+        (.tls_key | type == "string" and startswith("/"))
+       elif .type == "vless-reality" then
+        all(.reality_sni, .reality_target, .reality_public_key, .reality_private_key, .reality_short_id; nonempty) and
+        (if has("reality_target_port") then .reality_target_port | port else true end)
        else true end) and
       (if .type == "vless-reality" then (.uuid | nonempty)
        elif .type == "hysteria2" then (.password | nonempty)
@@ -1025,6 +1044,7 @@ apply_candidate_transaction() (
   local prepare="$1"
   shift
   umask 077
+  xray_write_lock || return 1
   local tx active=false touched=false committed=false preserve=false hop_changed=false hop_touched=false
   [[ -x "$XRAY_BIN" && -f "$XRAY_NODES" && -f "$XRAY_CONF" ]] || {
     err "installed Xray and existing configuration required"; return 1;
@@ -1447,6 +1467,14 @@ caddy_sync_all() (
   return "$failed"
 )
 
+validate_onevps_script() {
+  local file="$1" first_line
+  [[ -f "$file" && -s "$file" ]] && IFS= read -r first_line < "$file" &&
+    [[ "$first_line" == '#!/usr/bin/env bash' ]] && grep -Fxq 'caddy_sync_all() (' "$file" &&
+    grep -Fxq 'main() {' "$file" && [[ $(tail -n 1 "$file") == 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi' ]] &&
+    bash -n "$file"
+}
+
 caddy_sync_install() {
   local tmp
   if [[ ! -f "$ONEVPS_SCRIPT_PATH" || ! -s "$ONEVPS_SCRIPT_PATH" ]]; then
@@ -1454,8 +1482,7 @@ caddy_sync_install() {
   fi
   mkdir -p "$(dirname "$CADDY_SYNC_RUNNER")" || return 1
   tmp=$(mktemp "${CADDY_SYNC_RUNNER}.XXXXXXXX") || return 1
-  if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! grep -Fxq 'caddy_sync_all() (' "$tmp" ||
-     [[ $(tail -n 1 "$tmp") != 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi' ]] || ! bash -n "$tmp"; then
+  if ! cat "$ONEVPS_SCRIPT_PATH" > "$tmp" || ! validate_onevps_script "$tmp"; then
     rm -f "$tmp"; err 'Incomplete OneVPS script; certificate sync runner not installed'; return 1
   fi
   chmod 700 "$tmp" && mv -f "$tmp" "$CADDY_SYNC_RUNNER" || { rm -f "$tmp"; return 1; }
@@ -2034,8 +2061,7 @@ prepare_reality_change() {
         else error("unknown Reality change") end end
     else error("unknown Reality node") end' > "$output" || return 1
   validate_node_metadata "$output" || return 1
-  jq -e '[.nodes[] | select(.type=="vless-reality") | .port] |
-    all(.[]; type=="number" and floor==. and .>=1 and .<=65535) and length==(unique|length)' "$output" >/dev/null
+  jq -e '[.nodes[] | select(.type=="vless-reality") | .port] | length==(unique|length)' "$output" >/dev/null
 }
 
 add_reality_node() {
@@ -2450,10 +2476,11 @@ restart_service() {
   pause
 }
 
-uninstall() {
+uninstall() (
   warn "Uninstall removes Xray binary, config, onevps nodes and logs"
   warn "(BBR/system tuning configs and the swap file are kept)"
   confirm "Confirm uninstall?" n || return
+  xray_write_lock || return 1
   if [[ -e "$HY2_HOP_DIR" || -e "$HY2_HOP_UNIT" ]]; then
     hy2_hop_apply /dev/null || { err 'cannot remove managed hopping rules; uninstall cancelled'; return 1; }
   fi
@@ -2468,7 +2495,7 @@ uninstall() {
   rm -rf "$XRAY_DIR" /usr/local/share/xray /var/log/xray
   ok "uninstalled"
   pause
-}
+)
 
 # ----------------------------------------------------------------------------
 # Realm relay (independent of Xray)
@@ -2748,7 +2775,7 @@ realm_menu() {
 # Main menu
 # ----------------------------------------------------------------------------
 update_script() (
-  local target="$ONEVPS_SCRIPT_PATH" tmp first_line=""
+  local target="$ONEVPS_SCRIPT_PATH" tmp
   warn "This downloads and runs OneVPS from the repository main branch."
   confirm "Update script now?" || return 1
   ensure_deps || return 1
@@ -2769,8 +2796,7 @@ update_script() (
     err "script download failed; current script unchanged"
     return 1
   fi
-  IFS= read -r first_line < "$tmp/onevps.sh" || true
-  if [[ "$first_line" != '#!/usr/bin/env bash' ]] || ! bash -n "$tmp/onevps.sh"; then
+  if ! validate_onevps_script "$tmp/onevps.sh"; then
     err "downloaded script is invalid; current script unchanged"
     return 1
   fi
