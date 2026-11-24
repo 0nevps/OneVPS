@@ -163,6 +163,7 @@ confirm() { return 0; }
 open_port() { printf 'open %s %s\n' "$@" >> "$TEST_TMP/firewall"; }
 close_port() { printf 'close %s %s\n' "$@" >> "$TEST_TMP/firewall"; }
 ask() { printf '24444\n'; }
+ss() { :; }
 check 'edit HY2 UDP port' edit_port hy2
 check 'UDP firewall only' grep -qx 'open 24444 udp' "$TEST_TMP/firewall"
 check 'old UDP port closed' grep -qx 'close 24443 udp' "$TEST_TMP/firewall"
@@ -170,6 +171,7 @@ check 'toggle via management action' toggle_enabled hy2
 check 'toggle persists' jq -e '.nodes[0].enabled == false' "$XRAY_NODES"
 check 'delete via management action' del_node hy2
 check 'node removed' jq -e '.nodes == []' "$XRAY_NODES"
+unset -f ss
 cp "$TEST_TMP/before.json" "$XRAY_NODES"
 cp "$TEST_TMP/config.json" "$XRAY_CONF"
 reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP/bad.json" another add \

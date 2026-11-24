@@ -368,6 +368,18 @@ assert_true "realm accepts maximum port" realm_valid_port 65535
     socket_list_has_port 443 <<< 'udp UNCONN 0 0 [::]:443 [::]:*'
 ) || fail 'listener detection consumes large ss listings and matches local ports exactly'
 pass 'listener detection consumes large ss listings and matches local ports exactly'
+(
+  ss() { return 73; }
+  pause() { :; }; ask() { echo 8443; }
+  port_taken_by_node() { return 1; }
+  apply_port_change() { touch "$TEST_TMP/unexpected-port-after-ss-failure"; }
+  result=0; port_in_use 8443 tcp || result=$?
+  [[ "$result" == 2 ]] || exit 1
+  if rand_port; then exit 1; fi
+  if edit_port a1b2c3d4; then exit 1; fi
+  [[ ! -e "$TEST_TMP/unexpected-port-after-ss-failure" ]]
+) || fail 'failed socket inspection cannot be treated as a free port'
+pass 'failed socket inspection cannot be treated as a free port'
 for port in 0 65536 080 -1 '22;id' ''; do
   assert_false "realm rejects invalid port '$port'" realm_valid_port "$port"
 done

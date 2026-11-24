@@ -158,7 +158,9 @@ rand_port() {
   while :; do
     p=$(( ( (RANDOM << 15) | RANDOM ) % 55535 + 10000 ))
     port_taken_by_node "$p" tcp 2>/dev/null && continue
-    port_in_use "$p" tcp && continue
+    if port_in_use "$p" tcp; then continue; else
+      [[ $? == 1 ]] || return 1
+    fi
     echo "$p"; return
   done
 }
@@ -354,13 +356,14 @@ open_port() { update_firewall_port open "$@"; }
 close_port() { update_firewall_port close "$@"; }
 
 port_in_use() {
-  local p="$1" proto="${2:-both}" flags=-tunl
+  local p="$1" proto="${2:-both}" flags=-tunl sockets
   [[ "$proto" != udp ]] || flags=-unl
   [[ "$proto" != tcp ]] || flags=-tnl
   if command -v ss >/dev/null 2>&1; then
-    ss "$flags" 2>/dev/null | socket_list_has_port "$p"
+    sockets=$(ss "$flags") || { err "Cannot inspect $proto port $p"; return 2; }
+    socket_list_has_port "$p" <<< "$sockets"
   else
-    return 1
+    err 'Port inspection requires ss (iproute2/iproute)'; return 2
   fi
 }
 
@@ -2037,8 +2040,11 @@ add_hysteria_node() {
     port=$(ask 'UDP listen port (Caddy HTTP/3 may already use UDP 443)' 443)
     realm_valid_port "$port" || { warn 'invalid port'; continue; }
     port=$((10#$port))
-    if port_taken_by_node "$port" udp || port_in_use "$port" udp; then
+    if port_taken_by_node "$port" udp; then
       warn 'UDP port is already in use'; continue
+    fi
+    if port_in_use "$port" udp; then warn 'UDP port is already in use'; continue; else
+      [[ $? == 1 ]] || { pause; return 1; }
     fi
     break
   done
@@ -2240,8 +2246,12 @@ add_reality_node() {
   id=$(openssl rand -hex 4)
 
   default_port=443
-  if port_taken_by_node "$default_port" tcp || port_in_use "$default_port" tcp; then
-    default_port=$(rand_port)
+  if port_taken_by_node "$default_port" tcp; then
+    default_port=$(rand_port) || { pause; return 1; }
+  elif port_in_use "$default_port" tcp; then
+    default_port=$(rand_port) || { pause; return 1; }
+  else
+    [[ $? == 1 ]] || { pause; return 1; }
   fi
 
   while :; do
@@ -2250,6 +2260,8 @@ add_reality_node() {
     if port_taken_by_node "$port" tcp; then warn "TCP port $port already used by another node"; continue; fi
     if port_in_use "$port" tcp; then
       confirm "Port $port appears to be in use. Use anyway?" n || continue
+    else
+      [[ $? == 1 ]] || { pause; return 1; }
     fi
     break
   done
@@ -2470,9 +2482,13 @@ edit_port() {
     if port_taken_by_node "$newp" "$proto" "$id"; then
       warn "port used by another node"; continue
     fi
-    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]] && port_in_use "$newp" "$proto"; then
-      if [[ "$proto" == udp ]]; then warn 'UDP port is already in use'; continue; fi
-      confirm "Port $newp appears to be in use. Use anyway?" n || continue
+    if [[ "$newp" != "$(jq -r '.port' <<<"$n")" ]]; then
+      if port_in_use "$newp" "$proto"; then
+        if [[ "$proto" == udp ]]; then warn 'UDP port is already in use'; continue; fi
+        confirm "Port $newp appears to be in use. Use anyway?" n || continue
+      else
+        [[ $? == 1 ]] || { pause; return 1; }
+      fi
     fi
     break
   done
@@ -3050,7 +3066,7 @@ node_menu() {
     printf '\nNodes / share links:\n1) Add VLESS Reality\n3) Add Hysteria2\n4) Manage nodes / users / outbound\n5) Show share links\n0) Back\n'
     case "$(ask 'Select')" in
       1) add_reality_node || warn 'Reality setup did not finish' ;;
-      3) add_hysteria_node ;;
+      3) add_hysteria_node || warn 'HY2 setup did not finish' ;;
       4) manage_nodes ;;
       5) show_links ;;
       0|"") return ;;
