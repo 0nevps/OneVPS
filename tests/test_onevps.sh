@@ -101,6 +101,23 @@ if TERM=dumb bash -c 'source "$1"; run_with_progress "test errexit" false; print
   fail 'progress failure obeys errexit'
 fi
 assert_false 'direct progress failure stops the caller' command grep -q 'unreachable' "$TEST_TMP/progress-errexit"
+(
+  XRAY_BIN="$TEST_TMP/verbose-version-core"
+  cat > "$XRAY_BIN" <<'CORE'
+#!/usr/bin/env bash
+printf 'Xray 26.10.21\n'
+for ((idx=0;idx<20000;idx++)); do printf 'additional version output %s\n' "$idx"; done
+CORE
+  chmod +x "$XRAY_BIN"
+  version=$(installed_version) && [[ "$version" == 26.10.21 ]]
+) || fail 'version lookup consumes verbose core output without SIGPIPE'
+pass 'version lookup consumes verbose core output without SIGPIPE'
+assert_true 'failed version query leaves status menu usable under errexit' bash -c '
+  source "$1"; XRAY_BIN=$(type -P bash)
+  installed_version() { return 42; }; systemctl() { return 1; }; sysctl() { return 1; }; node_count() { echo 0; }
+  status_line
+  printf "STATUS_SURVIVED\n"
+' _ "$ROOT_DIR/onevps.sh"
 
 (
   state=before

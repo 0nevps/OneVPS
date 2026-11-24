@@ -186,7 +186,7 @@ require_xray() {
 
 installed_version() {
   [[ -x "$XRAY_BIN" ]] || { echo ""; return; }
-  "$XRAY_BIN" version 2>/dev/null | awk '/^Xray /{print $2; exit}'
+  "$XRAY_BIN" version 2>/dev/null | awk '/^Xray / && !seen {print $2; seen=1}'
 }
 
 urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
@@ -3021,7 +3021,8 @@ update_script() (
 status_line() {
   if [[ -x "$XRAY_BIN" ]]; then
     local v st bbr_cc
-    v=$(installed_version)
+    v=$(installed_version) || v=unknown
+    [[ -n "$v" ]] || v=unknown
     st=$(systemctl is-active xray 2>/dev/null || echo unknown)
     bbr_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
     printf '%sXray %s - service:%s - nodes:%s - TCP:%s%s\n' \
