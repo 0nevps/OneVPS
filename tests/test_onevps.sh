@@ -475,7 +475,10 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
     if flock -n "${XRAY_DIR}.lock" -c true; then return 1; fi
     printf 'open %s %s\n' "$@" >> "$TEST_TMP/fw"; return "${OPEN_STATUS:-0}"
   }
-  close_port() { printf 'close %s %s\n' "$@" >> "$TEST_TMP/fw"; }
+  close_port() {
+    if flock -n "${XRAY_DIR}.lock" -c true; then return 1; fi
+    printf 'close %s %s\n' "$@" >> "$TEST_TMP/fw"
+  }
   cp "$XRAY_NODES" "$TEST_TMP/reality-before"; cp "$XRAY_CONF" "$TEST_TMP/config-before"
   for failure in validation restart; do
     for operation in edit_port del_node; do
@@ -495,7 +498,7 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
   if OPEN_STATUS=1 apply_port_change a1b2c3d4 9444; then exit 1; fi
   [[ $(cat "$TEST_TMP/fw") == 'open 9444 tcp' ]] || exit 1
   ask() { echo 443; }; edit_port a1b2c3d4 || exit 1
-  : > "$TEST_TMP/fw"; ask() { echo 20001; }
+  : > "$TEST_TMP/fw"; ask() { if [[ ! -e "$TEST_TMP/oversized" ]]; then touch "$TEST_TMP/oversized"; echo 18446744073709552059; else echo 20001; fi; }
   edit_port a1b2c3d4
   [[ $(cat "$TEST_TMP/fw") == $'open 20001 tcp\nclose 443 tcp' ]] || exit 1
   del_node a1b2c3d4
@@ -503,11 +506,12 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
   jq -e 'all(.nodes[]; .id!="a1b2c3d4")' "$XRAY_NODES" >/dev/null || exit 1
   jq '.nodes |= map(select(.type=="hysteria2") | .port=443)' "$FIXTURE" > "$XRAY_NODES"
   render_config "$XRAY_NODES" "$XRAY_CONF" || exit 1
-  open_port() { printf 'open %s %s\n' "$@" >> "$TEST_TMP/fw"; }
+  : > "$TEST_TMP/fw"
   ask() { case "$1" in 'Node name') echo mixed ;; 'Listen port') echo "$2" ;; *) return 1 ;; esac; }
   ask_uuid() { echo '123e4567-e89b-12d3-a456-426614174099'; }; pick_reality_target() { echo example.org; }
   gen_x25519() { echo 'fixture-private fixture-public'; }; pub_ip() { echo 192.0.2.20; }
   add_reality_node > "$TEST_TMP/add-reality" || exit 1
+  [[ $(cat "$TEST_TMP/fw") == 'open 443 tcp' ]] || exit 1
   jq -e '[.nodes[].port]==[443,443]' "$XRAY_NODES" >/dev/null || exit 1
   cp "$TEST_TMP/reality-before" "$XRAY_NODES" && cp "$TEST_TMP/config-before" "$XRAY_CONF"
 ) || fail 'Reality rollback, firewall ordering and shared TCP/UDP port'

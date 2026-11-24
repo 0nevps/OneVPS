@@ -517,11 +517,11 @@ EOF
     CADDYFILE="$cf"
   fi
 
-  systemctl enable caddy >/dev/null 2>&1 || true
-  if ! systemctl is-active caddy >/dev/null 2>&1; then
-    run_with_progress 'Starting Caddy service' systemctl start caddy >/dev/null || true
+  systemctl enable caddy >/dev/null || { err 'Cannot enable Caddy'; return 1; }
+  if ! systemctl is-active --quiet caddy; then
+    run_with_progress 'Starting Caddy service' systemctl start caddy >/dev/null || return 1
   fi
-  return 0
+  systemctl is-active --quiet caddy || { err 'Caddy is not active'; return 1; }
 }
 
 find_caddyfile() {
@@ -1459,6 +1459,7 @@ setup_static_site() (
   [[ -f "$file" && ! -L "$file" ]] || { err 'Missing or unsupported Caddyfile'; return 1; }
   caddy_domain_ensure "$domain" "$file" static || return 1
   open_port 80 tcp && open_port 443 tcp || return 1
+  systemctl is-active --quiet caddy || { err 'Caddy is not active; static site unavailable'; return 1; }
   ok "Static site configured: https://$domain (HTTP 403 after certificate issuance)"
   info "Edit $(caddy_site_root "$domain")/index.html; allow TCP 80/443 in your cloud firewall."
 )
@@ -1914,12 +1915,9 @@ add_hysteria_node() {
     '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:$password,
       port:$port,tls_cert:$cert,tls_key:$key,enabled:true} +
       (if $hopping == null then {} else {hopping:$hopping} end)') || return 1
-  if apply_candidate_transaction prepare_hy2_change "$id" add "$node"; then
-    open_port "$port" udp || { err 'Node saved; check the host firewall before connecting'; pause; return; }
+  if apply_node_add "$node"; then
     ok 'Hysteria2 node added; allow the advertised UDP ports in your cloud firewall'
     node_link "$node"
-  else
-    err 'Hysteria2 node not added'
   fi
   pause
 }
@@ -2108,9 +2106,7 @@ add_reality_node() {
 
   while :; do
     port=$(ask "Listen port" "$default_port")
-    [[ "$port" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
-    port=$((10#$port))
-    (( port >= 1 && port <= 65535 )) || { warn "port out of range"; continue; }
+    realm_valid_port "$port" || { warn 'invalid TCP port (1-65535)'; continue; }
     if port_taken_by_node "$port" tcp; then warn "TCP port $port already used by another node"; continue; fi
     if port_in_use "$port" tcp; then
       confirm "Port $port appears to be in use. Use anyway?" n || continue
@@ -2146,12 +2142,9 @@ add_reality_node() {
       enabled: true
     }')
 
-  if apply_candidate_transaction prepare_reality_change "$id" add "$node"; then
-    open_port "$port" tcp || { err 'Node saved; check the host firewall before connecting'; pause; return; }
+  if apply_node_add "$node"; then
     ok "Reality node added"
     node_link "$node" || warn 'Node saved without displaying a share link'
-  else
-    err 'Reality node not added'
   fi
   pause
 }
@@ -2317,15 +2310,22 @@ apply_port_change() (
   ok "port changed to $newp"
 )
 
+apply_node_add() (
+  local node="$1" id port proto=tcp prepare=prepare_reality_change
+  id=$(jq -er '.id' <<<"$node") && port=$(jq -er '.port' <<<"$node") || return 1
+  if [[ $(jq -r '.type' <<<"$node") == hysteria2 ]]; then proto=udp; prepare=prepare_hy2_change; fi
+  xray_write_lock || return 1
+  apply_candidate_transaction_locked "$prepare" "$id" add "$node" || { err 'Node not added'; return 1; }
+  open_port "$port" "$proto" || { err 'Node saved; check the host firewall before connecting'; return 1; }
+)
+
 edit_port() {
   local id="$1" n newp proto=tcp
   n=$(node_by_id "$id")
   [[ $(jq -r '.type' <<<"$n") != hysteria2 ]] || proto=udp
   while :; do
     newp=$(ask "New port" "$(jq -r '.port' <<<"$n")")
-    [[ "$newp" =~ ^[0-9]+$ ]] || { warn "invalid port"; continue; }
-    newp=$((10#$newp))
-    (( newp >= 1 && newp <= 65535 )) || { warn "port out of range"; continue; }
+    realm_valid_port "$newp" || { warn 'invalid port (1-65535)'; continue; }
     if port_taken_by_node "$newp" "$proto" "$id"; then
       warn "port used by another node"; continue
     fi
@@ -2382,19 +2382,23 @@ toggle_enabled() {
 }
 
 del_node() {
-  local id="$1" n port type proto=tcp prepare=prepare_reality_change
   confirm "Delete this node?" n || return
-  n=$(node_by_id "$id")
+  apply_node_delete "$1" && ok 'deleted'
+  pause
+}
+
+apply_node_delete() (
+  local id="$1" n port type proto=tcp prepare=prepare_reality_change
+  xray_write_lock || return 1
+  n=$(node_by_id "$id") && [[ -n "$n" ]] || { err 'Node no longer exists'; return 1; }
   port=$(jq -r '.port' <<<"$n")
   type=$(jq -r '.type' <<<"$n")
   if [[ "$type" == hysteria2 ]]; then
     proto=udp; prepare=prepare_hy2_change
   fi
-  if apply_candidate_transaction "$prepare" "$id" delete; then
-    close_port "$port" "$proto" && ok 'deleted' || err "Node deleted; check the firewall rule for $port/$proto"
-  else err 'delete failed'; fi
-  pause
-}
+  apply_candidate_transaction_locked "$prepare" "$id" delete || { err 'delete failed'; return 1; }
+  close_port "$port" "$proto" || { err "Node deleted; check the firewall rule for $port/$proto"; return 1; }
+)
 
 # ----------------------------------------------------------------------------
 # BBR acceleration

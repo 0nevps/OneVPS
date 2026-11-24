@@ -83,10 +83,22 @@ caddy() {
 }
 printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
 (
+  caddy_present() { return 0; }
+  systemctl() {
+    case "$1" in enable) return "$enable_status" ;; start) return "$start_status" ;; is-active) return "$active_status" ;; *) return 1 ;; esac
+  }
+  enable_status=1; start_status=0; active_status=0
+  reject 'Caddy enable failure stops setup' ensure_caddy
+  enable_status=0; start_status=1; active_status=1
+  reject 'Caddy start failure stops setup' ensure_caddy
+  start_status=0
+  reject 'inactive Caddy after start stops setup' ensure_caddy
+)
+(
   CADDYFILE="$TMP/menu-Caddyfile"; printf ':80 {\n respond 200\n}\n' > "$CADDYFILE"
   ask() { printf '%s\n' site.example.com; }; ensure_deps() { :; }; flock() { :; }
   ensure_caddy() { touch "$TMP/caddy-prepared"; }; ss() { printf '%s' "${SOCKETS:-}"; }
-  systemctl() { [[ "$1" == show ]] && printf '123\n'; }
+  systemctl() { case "$1" in show) echo 123 ;; is-active) return "${active_status:-0}" ;; *) return 1 ;; esac; }
   XRAY_NODES="$TMP/site-nodes.json"
   printf '{"nodes":[{"type":"vless-reality","enabled":true,"port":443}]}' > "$XRAY_NODES"
   reject 'Reality reservation stops site setup' setup_static_site
@@ -100,6 +112,7 @@ printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
   reject 'static-only certificate not exported' test -f "$CADDY_STATE/domains/site.example.com.json"
   printf 'my custom 403\n' > "$TMP/sites/site.example.com/index.html"
   check 'repeat static setup' setup_static_site
+  active_status=1; reject 'existing site with inactive Caddy cannot report success' setup_static_site; active_status=0
   check 'custom content retained' grep -qx 'my custom 403' "$TMP/sites/site.example.com/index.html"
   check 'HY2 can reuse static domain' caddy_domain_ensure site.example.com "$CADDYFILE"
   check 'explicit certificate request enrolls site for sync' test -f "$CADDY_STATE/domains/site.example.com.json"
