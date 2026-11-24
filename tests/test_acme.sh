@@ -9,6 +9,7 @@ CADDY_STATE="$TMP/caddy-state"
 ACME_CERT_DIR="$TMP/certs"
 # shellcheck disable=SC2034
 ACME_UNIT_DIR="$TMP/units"
+XRAY_DIR="$TMP/xray"
 XRAY_NODES="$TMP/nodes.json"
 XRAY_CONF="$TMP/xray.json"
 mkdir -p "$CADDY_STATE/staging/example.com" "$ACME_UNIT_DIR"
@@ -39,6 +40,13 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert
   -days 2 -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
 cp "$TMP/cert.pem" "$CADDY_STATE/staging/example.com/fullchain.pem"
 cp "$TMP/key.pem" "$CADDY_STATE/staging/example.com/key.pem"
+(
+  mkdir -p "$ACME_CERT_DIR/example.com/current"
+  reject 'unmanaged current path rejected' acme_deploy example.com
+  shopt -s nullglob; versions=("$ACME_CERT_DIR/example.com/"cert.*)
+  check 'rejected path leaves no temporary certificate directories' test "${#versions[@]}" = 0
+  rmdir "$ACME_CERT_DIR/example.com/current"
+)
 check 'validated pair deployment' acme_deploy example.com
 check 'fullchain deployed' cmp "$TMP/cert.pem" "$ACME_CERT_DIR/example.com/current/fullchain.pem"
 previous=$(readlink "$ACME_CERT_DIR/example.com/current")
@@ -50,6 +58,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert
   -days 3 -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
 cp "$TMP/cert.pem" "$CADDY_STATE/staging/example.com/fullchain.pem"
 cp "$TMP/key.pem" "$CADDY_STATE/staging/example.com/key.pem"
+cp "$XRAY_NODES" "$TMP/good-metadata"
+printf 'invalid json\n' > "$XRAY_NODES"
+reject 'unreadable metadata blocks renewal' acme_deploy example.com
+check 'metadata failure preserves current certificate' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
+cp "$TMP/good-metadata" "$XRAY_NODES"
 restarts=0
 systemctl() {
   if [[ "$1" == restart ]]; then restarts=$((restarts+1)); (( restarts > 1 )); else return 0; fi
@@ -60,7 +73,7 @@ systemctl() { return 0; }
 validate_xray_config() { return 1; }
 reject 'invalid Xray config rolls certificate back' acme_deploy example.com
 check 'previous pair retained after validation failure' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
-validate_xray_config() { return 0; }
+validate_xray_config() { ! flock -n "${XRAY_DIR}.lock" -c true; }
 check 'renewal deploys new pair' acme_deploy example.com
 reject 'new certificate becomes current' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
 

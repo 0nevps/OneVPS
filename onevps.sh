@@ -1601,10 +1601,10 @@ acme_deploy() (
   ng=$(id -gn nobody) || return 1
   mkdir -p "$dir" || return 1
   chown root:"$ng" "$dir" && chmod 750 "$dir" || return 1
-  version=$(mktemp -d "$dir/cert.XXXXXXXX") || return 1
-  check_log="$version/check.log"
   if [[ -L "$dir/current" ]]; then previous=$(readlink "$dir/current") || return 1
   elif [[ -e "$dir/current" ]]; then err 'refusing unmanaged current certificate'; return 1; fi
+  version=$(mktemp -d "$dir/cert.XXXXXXXX") || return 1
+  check_log="$version/check.log"
   deploy_cleanup() {
     local status=$? failed=false
     trap - EXIT INT TERM HUP
@@ -1627,8 +1627,12 @@ acme_deploy() (
   chown -R root:"$ng" "$version" && chmod 750 "$version" || return 1
   if [[ -n "$previous" ]] && cmp -s "$version/fullchain.pem" "$dir/current/fullchain.pem" &&
     cmp -s "$version/key.pem" "$dir/current/key.pem"; then return 0; fi
-  if [[ -f "$XRAY_NODES" ]] && jq -e --arg path "$dir/current/fullchain.pem" \
-    'any(.nodes[]; .enabled == true and .tls_cert == $path)' "$XRAY_NODES" >/dev/null; then used=true; fi
+  xray_write_lock || return 1
+  if [[ -e "$XRAY_NODES" ]]; then
+    used=$(jq -sr --arg path "$dir/current/fullchain.pem" '
+      if length==1 and (.[0].nodes | type=="array") then any(.[0].nodes[]; .enabled==true and .tls_cert==$path)
+      else error("invalid node metadata") end' "$XRAY_NODES") || { err 'Cannot determine which nodes use the certificate'; return 1; }
+  fi
   if $used && systemctl is-active --quiet xray; then active=true; fi
   ln -s "$(basename "$version")" "$version/next" || return 1
   switched=true
