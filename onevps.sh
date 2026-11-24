@@ -265,9 +265,13 @@ ensure_deps() {
 # ----------------------------------------------------------------------------
 # [2] Install / update Xray
 # ----------------------------------------------------------------------------
-write_service() {
+write_service() (
+  local staged
+  [[ ! -d "$XRAY_SERVICE" ]] || { err 'Xray service path is a directory'; return 1; }
   mkdir -p "$XRAY_DIR" /var/log/xray || return 1
-  cat > "$XRAY_SERVICE" <<EOF || return 1
+  staged=$(mktemp "${XRAY_SERVICE}.XXXXXXXX") || return 1
+  trap 'rm -f "$staged"' EXIT
+  cat > "$staged" <<EOF || return 1
 [Unit]
 Description=Xray Service (OneVPS)
 Documentation=https://github.com/XTLS/Xray-core
@@ -292,8 +296,9 @@ ReadWritePaths=/var/log/xray
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 "$staged" && mv -f "$staged" "$XRAY_SERVICE" || return 1
   systemctl daemon-reload && systemctl enable xray >/dev/null
-}
+)
 
 secure_xray_files() {
   local candidate="$1" group

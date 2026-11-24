@@ -593,6 +593,16 @@ pass 'restart action restarts once and propagates service failures'
 ) || fail 'Xray service setup propagates reload and enable failures'
 pass 'Xray service setup propagates reload and enable failures'
 (
+  XRAY_SERVICE="$TEST_TMP/partial-service-test"
+  printf 'original service\n' > "$XRAY_SERVICE"
+  mkdir() { :; }
+  cat() { printf 'partial service\n'; return 1; }
+  systemctl() { touch "$TEST_TMP/unexpected-partial-service-reload"; }
+  if write_service; then exit 1; fi
+  [[ $(command cat "$XRAY_SERVICE") == 'original service' && ! -e "$TEST_TMP/unexpected-partial-service-reload" ]]
+) || fail 'partial Xray service write preserves the existing unit'
+pass 'partial Xray service write preserves the existing unit'
+(
   xray_write_lock() { :; }; confirm() { :; }; pause() { :; }
   HY2_HOP_DIR="$TEST_TMP/hop-present"; mkdir "$HY2_HOP_DIR" || exit 1
   hy2_hop_apply() { echo hopping >> "$TEST_TMP/uninstall-steps"; }
