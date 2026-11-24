@@ -335,6 +335,15 @@ jq -n --argjson endpoint "$endpoint" '{endpoints:[$endpoint]}' > "$REALM_DIR/con
 assert_true "realm verifies owned TCP and UDP listeners" realm_restart
 MOCK_UDP_BOUND=false
 assert_false "realm detects partial listener failure despite active service" realm_restart
+(
+  systemctl() { touch "$TEST_TMP/unexpected-realm-restart"; return 1; }
+  for broken in 'bad json' '{}' '{"endpoints":[]}' '{"endpoints":[{"listen":"0.0.0.0:1","network":{"use_udp":false}},{"listen":"bad"}]}' ; do
+    printf '%s\n' "$broken" > "$REALM_DIR/config.json"
+    if realm_restart; then exit 1; fi
+    [[ ! -e "$TEST_TMP/unexpected-realm-restart" ]] || exit 1
+  done
+) || fail 'invalid Realm listeners rejected before service changes'
+pass 'invalid Realm listeners rejected before service changes'
 printf '{"endpoints":[]}\n' > "$REALM_DIR/config.json"
 
 # Mock all runtime effects; rollback must restore both data and service state.

@@ -2694,7 +2694,15 @@ realm_install() {
 }
 
 realm_restart() {
-  local pid port udp sockets
+  local pid port udp sockets listeners
+  listeners=$(jq -ers '
+    if length != 1 or (.[0].endpoints | type) != "array" or (.[0].endpoints | length)==0 then
+      error("expected at least one relay rule") else .[0].endpoints[] end |
+    (.listen | capture("^0\\.0\\.0\\.0:(?<port>[1-9][0-9]{0,4})\\z") // error("invalid relay listener")) as $listen |
+    if ($listen.port|tonumber)>65535 or (.network.use_udp|type)!="boolean" then error("invalid relay listener")
+    else "\($listen.port) \(.network.use_udp)" end' "$REALM_DIR/config.json") || {
+    err 'Cannot restart Realm: no valid listener configuration'; return 1;
+  }
   run_with_progress 'Restarting Realm service' systemctl restart onevps-realm || return 1
   run_with_progress 'Waiting for Realm listeners' sleep 2
   systemctl is-active --quiet onevps-realm || return 1
@@ -2708,7 +2716,7 @@ realm_restart() {
       sockets=$(ss -H -lnup "sport = :$port") || return 1
       [[ "$sockets" == *"pid=$pid,"* ]] || return 1
     fi
-  done < <(jq -r '.endpoints[] | "\(.listen | split(":") | last) \(.network.use_udp)"' "$REALM_DIR/config.json")
+  done <<< "$listeners"
 }
 
 realm_apply() {
