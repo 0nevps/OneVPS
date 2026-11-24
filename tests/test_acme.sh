@@ -151,6 +151,27 @@ reject 'unknown site not overwritten' caddy_domain_ensure external.example.com "
 reject 'matching wildcard site not shadowed' caddy_domain_ensure one.wild.example.com "$CADDYFILE"
 check 'external site is untouched' cmp "$CADDYFILE" "$TMP/before-domain-failure"
 (
+  CADDY_STATE="$TMP/rollback-state"; mkdir "$CADDY_STATE" || exit 1
+  CADDYFILE="$TMP/rollback-Caddyfile"; cp "$TMP/before-domain-failure" "$CADDYFILE" || exit 1
+  cp() { if [[ "${!#}" == "$CADDYFILE" ]]; then return 1; fi; command cp "$@"; }
+  caddy_reload() { return 1; }
+  reject 'failed site reload with failed restore reports failure' caddy_domain_ensure restore.example.org "$CADDYFILE" static 2> "$TMP/site-restore-error"
+  shopt -s nullglob; backups=("$CADDY_STATE"/.domain.*)
+  check 'failed site restore keeps exactly one backup' test "${#backups[@]}" = 1
+  check 'retained site backup contains original configuration' cmp "${backups[0]}" "$TMP/before-domain-failure"
+  check 'failed site restore reports backup path' grep -Fq "${backups[0]}" "$TMP/site-restore-error"
+)
+(
+  CADDY_STATE="$TMP/reload-rollback-state"; mkdir "$CADDY_STATE" || exit 1
+  CADDYFILE="$TMP/reload-rollback-Caddyfile"; cp "$TMP/before-domain-failure" "$CADDYFILE" || exit 1
+  caddy_reload() { return 1; }
+  reject 'failure reloading original Caddyfile reports failure' caddy_domain_ensure reload.example.org "$CADDYFILE" static 2> "$TMP/site-reload-error"
+  check 'original Caddyfile restored on disk' cmp "$CADDYFILE" "$TMP/before-domain-failure"
+  shopt -s nullglob; backups=("$CADDY_STATE"/.domain.*)
+  check 'failed rollback reload retains original backup' test "${#backups[@]}" = 1
+  check 'failed rollback reload reports backup path' grep -Fq "${backups[0]}" "$TMP/site-reload-error"
+)
+(
   cat() { if (($# == 0)); then printf '# partial site block\n'; return 1; fi; command cat "$@"; }
   caddy_reload() { touch "$TMP/unexpected-site-reload"; }
   reject 'partial site write fails before reload' caddy_domain_ensure write.example.org "$CADDYFILE" static

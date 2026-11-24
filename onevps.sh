@@ -1378,6 +1378,19 @@ caddy_tcp_https() {
   rm -f "$tmp"
 }
 
+caddy_restore_site() {
+  local backup="$1" file="$2" reload="$3"
+  if ! cp -p "$backup" "$file"; then
+    err "Cannot restore Caddyfile; backup retained: $backup"
+  elif [[ "$reload" == true ]] && ! caddy_reload "$file"; then
+    err "Caddyfile restored but reload failed; backup retained: $backup"
+  else
+    rm -f "$backup"
+    return
+  fi
+  return 1
+}
+
 caddy_domain_ensure() {
   local domain="$1" file="$2" mode="${3:-certificate}" backup site_root record static_record occupied probe
   acme_domain_valid "$domain" || return 1
@@ -1445,15 +1458,19 @@ $domain {
 # OneVPS-domain:$domain END
 EOF_SITE
   then
-    if cp -p "$backup" "$file"; then rm -f "$backup"; err 'Cannot write Caddy site configuration';
-    else err "Cannot restore Caddyfile after write failure; backup retained: $backup"; fi
+    err 'Cannot write Caddy site configuration'
+    caddy_restore_site "$backup" "$file" false || return 1
     return 1
   fi
   if ! caddy_reload "$file"; then
-    cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup"; return 1
+    caddy_restore_site "$backup" "$file" true || return 1
+    return 1
   fi
   if ! jq -n --arg file "$file" '{caddy_file:$file}' > "$record"; then
-    cp -p "$backup" "$file"; caddy_reload "$file" || true; rm -f "$backup" "$record"; return 1
+    err "Cannot write Caddy site record: $record"
+    if ! rm -f "$record"; then err "Cannot remove incomplete site record: $record"; fi
+    caddy_restore_site "$backup" "$file" true || return 1
+    return 1
   fi
   rm -f "$backup"
 }
