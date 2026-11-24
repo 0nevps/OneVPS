@@ -222,6 +222,15 @@ check 'timer syncs every minute' grep -q '^OnUnitActiveSec=1min' "$ACME_UNIT_DIR
 check 'runner dispatches Caddy sync' grep -q -- '--caddy-sync' "$CADDY_SYNC_RUNNER"
 check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
 (
+  flock() { return "$mock_lock_status"; }
+  caddy_sync_domain() { touch "$TMP/unexpected-locked-sync"; }
+  mock_lock_status=1
+  check 'busy certificate sync lock skips overlapping run' caddy_sync_all
+  mock_lock_status=73
+  reject 'certificate sync lock error is not reported as success' caddy_sync_all
+  reject 'lock failure never enters certificate deployment' test -e "$TMP/unexpected-locked-sync"
+)
+(
   ACME_UNIT_DIR="$TMP/blocked-units"; mkdir -p "$ACME_UNIT_DIR/onevps-caddy-sync.service"
   CADDY_SYNC_RUNNER="$TMP/blocked-sync-runner"
   systemctl() { touch "$TMP/unexpected-sync-systemctl"; }

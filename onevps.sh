@@ -1541,9 +1541,13 @@ caddy_sync_domain() {
 
 caddy_sync_all() (
   [[ -f "$CADDY_STATE/.onevps-owned" ]] || return 0
-  exec 9> "$CADDY_STATE/operation.lock"
-  flock -n 9 || return 0
-  local meta failed=0
+  exec 9> "$CADDY_STATE/operation.lock" || { err 'Cannot open certificate sync lock'; return 1; }
+  local meta failed=0 lock_status
+  if flock -n 9; then :; else
+    lock_status=$?
+    if ((lock_status == 1)); then return 0; fi
+    err "Cannot lock certificate sync (exit $lock_status)"; return "$lock_status"
+  fi
   for meta in "$CADDY_STATE/domains/"*.json; do
     [[ -f "$meta" ]] || continue
     caddy_sync_domain "$(basename "$meta" .json)" || failed=1
