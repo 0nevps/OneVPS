@@ -297,17 +297,12 @@ EOF
 }
 
 secure_xray_files() {
-  local ng
-  mkdir -p "$XRAY_DIR" /var/log/xray
-  ng=$(id -gn nobody 2>/dev/null || true)
-  if [[ -n "$ng" ]]; then
-    chown root:"$ng" "$XRAY_DIR" 2>/dev/null || true
-    chmod 750 "$XRAY_DIR" 2>/dev/null || true
-    [[ -f "$XRAY_CONF" ]] && chown root:"$ng" "$XRAY_CONF" && chmod 640 "$XRAY_CONF"
-    [[ -f "$XRAY_NODES" ]] && chown root:"$ng" "$XRAY_NODES" && chmod 640 "$XRAY_NODES"
-    chown nobody:"$ng" /var/log/xray 2>/dev/null || true
-    chmod 750 /var/log/xray 2>/dev/null || true
-  fi
+  local candidate="$1" group
+  group=$(id -gn nobody) && [[ -n "$group" ]] &&
+    mkdir -p "$XRAY_DIR" /var/log/xray &&
+    chown root:"$group" "$XRAY_DIR" "$XRAY_NODES" "$candidate" &&
+    chmod 750 "$XRAY_DIR" && chmod 640 "$XRAY_NODES" "$candidate" &&
+    chown nobody:"$group" /var/log/xray && chmod 750 /var/log/xray
 }
 
 install_xray() (
@@ -658,13 +653,6 @@ validate_xray_config() {
   "$XRAY_BIN" run -test -config "$conf" >"$err_file" 2>&1
 }
 
-mktemp_json() {
-  local t
-  t=$(mktemp)
-  rm -f "$t"
-  echo "${t}.json"
-}
-
 # Decode a URI component exactly once; '+' is not a form-space.
 # Keep secret-bearing data in shell variables/stdin, never external argv.
 outbound_decode() {
@@ -976,27 +964,24 @@ rebuild_config() (
   xray_write_lock && rebuild_config_locked
 )
 
-rebuild_config_locked() {
+rebuild_config_locked() (
   ensure_nodes_file_locked || return 1
-  local tmp_conf chk_err
-  tmp_conf=$(mktemp_json)
-  render_config "$XRAY_NODES" "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
-  chk_err=$(mktemp)
-  if ! validate_xray_config "$tmp_conf" "$chk_err"; then
+  local work
+  work=$(mktemp -d "$XRAY_DIR/.rebuild.XXXXXXXX") || return 1
+  trap 'rm -rf "$work"' EXIT
+  render_config "$XRAY_NODES" "$work/config.json" || return 1
+  if ! validate_xray_config "$work/config.json" "$work/check.log"; then
     err "generated config failed validation (details withheld to protect credentials)"
-    rm -f "$tmp_conf" "$chk_err"
     return 1
   fi
-  rm -f "$chk_err"
-
-  mv "$tmp_conf" "$XRAY_CONF" || { rm -f "$tmp_conf"; return 1; }
-  secure_xray_files || return 1
+  secure_xray_files "$work/config.json" || { err 'Cannot prepare Xray file permissions'; return 1; }
+  mv "$work/config.json" "$XRAY_CONF" || return 1
   if [[ -x "$XRAY_BIN" ]]; then
     run_with_progress 'Restarting Xray service' systemctl restart xray && systemctl is-active --quiet xray || {
       err 'Xray did not restart successfully'; return 1;
     }
   fi
-}
+)
 
 node_clients() {
   jq -c '

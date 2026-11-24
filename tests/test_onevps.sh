@@ -256,6 +256,15 @@ assert_file_jq "does not block UDP/443 by default" "$XRAY_CONF" \
   'all(.routing.rules[]; (.network? == "udp" and .port? == "443") | not)'
 
 cp "$XRAY_CONF" "$TEST_TMP/valid-config"
+assert_true 'Xray ownership failure preserves the existing config' bash -c '
+  source "$1"; XRAY_DIR="$2"; XRAY_NODES="$3"; XRAY_CONF="$4"; XRAY_BIN=$(type -P bash)
+  printf "{\"inbounds\":[]}\n" > "$XRAY_CONF"; cp "$XRAY_CONF" "$XRAY_DIR/before-rebuild"
+  validate_xray_config() { :; }
+  mkdir() { :; }; id() { echo nobody; }; chown() { return 1; }; chmod() { :; }
+  systemctl() { touch "$XRAY_DIR/restart-called"; return 0; }
+  if rebuild_config; then exit 1; fi
+  [[ ! -e "$XRAY_DIR/restart-called" ]] && cmp "$XRAY_CONF" "$XRAY_DIR/before-rebuild"
+' _ "$ROOT_DIR/onevps.sh" "$XRAY_DIR" "$XRAY_NODES" "$TEST_TMP/permission-config.json"
 for documents in empty truncated concatenated; do
   case "$documents" in
     empty) : > "$XRAY_NODES" ;;
