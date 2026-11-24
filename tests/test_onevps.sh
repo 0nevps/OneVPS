@@ -285,6 +285,12 @@ for malformed in '"true"' 'null' '1'; do
   assert_false "reject non-boolean Reality enabled=$malformed with proxy assigned" rebuild_config
   assert_true 'invalid Reality flag cannot replace live routing' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
 done
+for enabled in true false; do
+  jq --argjson enabled "$enabled" '.nodes[1] |= (.tag="reality-a1b2c3d4" | .enabled=$enabled) |
+    .nodes[0].outbound={mode:"proxy",protocol:"socks",server:"proxy.example.com",port:1080}' "$FIXTURE" > "$XRAY_NODES"
+  assert_false "duplicate inbound tag rejected (enabled=$enabled)" rebuild_config
+  assert_true 'tag collision leaves active routing intact' cmp "$XRAY_CONF" "$TEST_TMP/valid-config"
+done
 cp "$FIXTURE" "$XRAY_NODES"
 
 (

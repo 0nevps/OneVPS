@@ -1038,6 +1038,7 @@ validate_node_metadata() {
     select(length == 1) | .[0] |
     (.nodes | type == "array") and
     ([.nodes[].id] | length == (unique | length)) and
+    ([.nodes[].tag] | length == (unique | length)) and
     all(.nodes[];
       . as $n |
       (.id | nonempty) and
