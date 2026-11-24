@@ -882,6 +882,11 @@ assert_jq "plain SIP002 decodes once and preserves plus" "$parsed" '.password ==
 parsed=$(parse_test_link 'socks5://user%3Aname:p%40ss%3A%25+@[::1]:1080#test')
 assert_jq "SOCKS percent auth round trip" "$(build_proxy_outbound socks-test <<<"$parsed")" '.settings.servers[0].users == [{user:"user:name",pass:"p@ss:%+"}]'
 assert_jq "SOCKS anonymous has no users" "$(parse_test_link 'socks5://localhost:1080' | build_proxy_outbound test)" '.settings.servers[0] | has("users") | not'
+for malformed_bytes in '%FF' '%C0%AF' '%ED%A0%80' '%E4%B8'; do
+  assert_false 'invalid UTF-8 credentials cannot be silently rewritten' parse_test_link "socks5://user:pass$malformed_bytes@example.com:1080"
+done
+assert_jq 'valid UTF-8 credentials survive percent decoding unchanged' \
+  "$(parse_test_link 'socks5://user:%E4%B8%AD%E6%96%87@example.com:1080')" '.password == "中文"'
 for network in tcp ws grpc; do
   extra=''
   case "$network" in ws) extra='&host=cdn.example&path=%2Fws%3Fed%3D2048' ;; grpc) extra='&serviceName=service&mode=multi' ;; esac

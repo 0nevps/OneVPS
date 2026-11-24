@@ -667,7 +667,7 @@ validate_xray_config() {
 # Decode a URI component exactly once; '+' is not a form-space.
 # Keep secret-bearing data in shell variables/stdin, never external argv.
 outbound_decode() {
-  local rest="$1" out='' char hex
+  local rest="$1" out='' char hex normalized LC_ALL=C
   while [[ -n "$rest" ]]; do
     char=${rest:0:1}; rest=${rest:1}
     if [[ "$char" == '%' ]]; then
@@ -680,6 +680,8 @@ outbound_decode() {
     [[ "$char" != [[:cntrl:]] ]] || return 1
     out+="$char"
   done
+  normalized=$(printf '%s' "$out" | jq -Rs '.' | jq -jr '.') || return 1
+  [[ "$normalized" == "$out" ]] || return 1
   printf '%s' "$out"
 }
 
