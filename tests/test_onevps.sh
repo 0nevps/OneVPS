@@ -278,6 +278,15 @@ for malformed in '"true"' 'null' '1'; do
 done
 cp "$FIXTURE" "$XRAY_NODES"
 
+(
+  list_nodes() { :; }; ask() { printf '%s\n' "$choice"; }
+  for choice in 18446744073709551617 08 0 4; do
+    [[ -z $(pick_node) ]] || exit 1
+  done
+  choice=2; [[ $(pick_node) == b2c3d4e5 ]]
+) || fail 'invalid node selection cannot wrap to a valid index'
+pass 'invalid node selection cannot wrap to a valid index'
+
 assert_true 'node creation menu lists only Reality and HY2' bash -c '
   source "$1"; XRAY_NODES="$2"; ask() { printf "0\n"; }
   output=$(node_menu)

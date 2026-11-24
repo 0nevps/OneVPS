@@ -2047,6 +2047,11 @@ auto_pick_reality_target() {
   fi
 }
 
+valid_menu_index() {
+  local input="$1" count="$2"
+  [[ "$input" =~ ^[1-9][0-9]*$ && ${#input} -le ${#count} ]] && ((input <= count))
+}
+
 pick_reality_target() {
   echo >&2
   info "Reality handshake target (major TLS site; TLS 1.3 + H2 preferred):" >&2
@@ -2062,7 +2067,7 @@ pick_reality_target() {
     target=$(auto_pick_reality_target)
   elif [[ "$sel" == "0" ]]; then
     target=$(normalize_domain "$(ask "Target domain")")
-  elif [[ "$sel" =~ ^[0-9]+$ ]] && ((sel>=1 && sel<=${#REALITY_DESTS[@]})); then
+  elif valid_menu_index "$sel" "${#REALITY_DESTS[@]}"; then
     target="${REALITY_DESTS[$((sel-1))]}"
   else
     target="${REALITY_DESTS[0]}"
@@ -2235,8 +2240,7 @@ pick_node() {
   [[ "$cnt" -gt 0 ]] || { echo ""; return; }
   list_nodes >&2
   sel=$(ask $'Select node number (Enter to go back)' "")
-  [[ "$sel" =~ ^[0-9]+$ ]] || { echo ""; return; }
-  (( sel>=1 && sel<=cnt )) || { echo ""; return; }
+  valid_menu_index "$sel" "$cnt" || { echo ""; return; }
   jq -r --argjson i "$((sel-1))" '.nodes[$i].id' "$XRAY_NODES"
 }
 
@@ -2788,7 +2792,7 @@ realm_delete() {
   count=$(jq '.endpoints | length' "$REALM_DIR/config.json")
   index=$(ask 'Rule number to delete (empty cancels)')
   [[ -n "$index" ]] || return 0
-  [[ "$index" =~ ^[1-9][0-9]{0,5}$ ]] && (( index <= count )) || { err "invalid rule number"; return 1; }
+  valid_menu_index "$index" "$count" || { err "invalid rule number"; return 1; }
   confirm "Delete rule $index?" || return 0
   candidate=$(mktemp "$REALM_DIR/.candidate.XXXXXX") || return 1
   if jq --argjson index "$((index - 1))" 'del(.endpoints[$index])' "$REALM_DIR/config.json" > "$candidate" &&
