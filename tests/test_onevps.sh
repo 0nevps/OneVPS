@@ -753,7 +753,10 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
     cmp "$XRAY_NODES" "$TEST_TMP/before-keygen" && cmp "$XRAY_CONF" "$TEST_TMP/config-before-keygen" && [[ ! -s "$TEST_TMP/fw" ]]
   ) || exit 1
   gen_x25519() { echo 'fixture-private fixture-public'; }; pub_ip() { echo 192.0.2.20; }
+  rand_short_id() { echo 0a1b2c3d4e5f6071; }
+  jq() { printf '%s\n' "$@" >> "$TEST_TMP/reality-jq-argv"; command jq "$@"; }
   add_reality_node > "$TEST_TMP/add-reality" || exit 1
+  if grep -Eq 'fixture-private|123e4567-e89b-12d3-a456-426614174099|0a1b2c3d4e5f6071' "$TEST_TMP/reality-jq-argv"; then exit 1; fi
   [[ $(cat "$TEST_TMP/fw") == 'open 443 tcp' ]] || exit 1
   jq -e '[.nodes[].port]==[443,443]' "$XRAY_NODES" >/dev/null || exit 1
   cp "$TEST_TMP/reality-before" "$XRAY_NODES" && cp "$TEST_TMP/config-before" "$XRAY_CONF"

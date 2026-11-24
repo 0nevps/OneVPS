@@ -2281,28 +2281,28 @@ add_reality_node() {
   keypair=$(gen_x25519) && read -r pk pubk <<< "$keypair" || { err 'key generation failed'; pause; return 1; }
   sid=$(rand_short_id)
 
-  node=$(jq -n \
+  node=$(printf '%s\n' "$uuid" "$pk" "$pubk" "$sid" | jq -Rsc \
     --arg id "$id" --arg name "$name" --arg tag "reality-$id" \
-    --argjson port "$port" --arg uuid "$uuid" \
-    --arg target "$target" --arg pk "$pk" --arg pubk "$pubk" --arg sid "$sid" '
+    --argjson port "$port" --arg target "$target" '
+    split("\n") as $credentials |
     {
       id: $id,
       type: "vless-reality",
       name: $name,
       tag: $tag,
       port: $port,
-      uuid: $uuid,
+      uuid: $credentials[0],
       flow: "xtls-rprx-vision",
       fingerprint: "chrome",
       reality_sni: $target,
       reality_target: $target,
       reality_target_port: 443,
-      reality_private_key: $pk,
-      reality_public_key: $pubk,
-      reality_short_id: $sid,
+      reality_private_key: $credentials[1],
+      reality_public_key: $credentials[2],
+      reality_short_id: $credentials[3],
       spider_x: "/",
       enabled: true
-    }')
+    }') || return 1
 
   if apply_node_add "$node"; then
     ok "Reality node added"
