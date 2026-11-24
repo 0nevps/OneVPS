@@ -164,10 +164,20 @@ rand_port() {
 }
 
 pub_ip() {
-  [[ -n "$PUBIP" ]] && { echo "$PUBIP"; return; }
-  PUBIP=$(run_with_progress 'Looking up public IP (ipify)' curl -fsSL4 --max-time 8 https://api.ipify.org \
-       || run_with_progress 'Looking up public IP (ifconfig.me)' curl -fsSL4 --max-time 8 https://ifconfig.me || true)
-  echo "$PUBIP"
+  local addr="$PUBIP" url
+  if [[ -n "$addr" ]] && realm_valid_host "$addr"; then printf '%s\n' "$addr"; return; fi
+  for url in https://api.ipify.org https://ifconfig.me; do
+    addr=$(run_with_progress 'Looking up public IPv4 address' curl -fsSL4 --max-time 8 "$url") || continue
+    if [[ "$addr" =~ ^[0-9.]+$ ]] && realm_valid_host "$addr"; then printf '%s\n' "$addr"; return; fi
+  done
+  err 'Cannot determine a valid public IP for the Reality link'
+  [[ -t 0 ]] || return 1
+  while :; do
+    read -rp 'Public IP or domain (Enter to skip link): ' addr || return 1
+    [[ -n "$addr" ]] || return 1
+    if realm_valid_host "$addr"; then printf '%s\n' "$addr"; return; fi
+    err 'Enter a bare IP address or hostname, without a scheme or port'
+  done
 }
 
 require_xray() {
@@ -1041,10 +1051,13 @@ validate_node_metadata() {
 # A subshell scopes traps. Backups and candidates stay on the target filesystem.
 # Rollback covers detectable failures, not power-loss atomicity across two files.
 apply_candidate_transaction() (
+  xray_write_lock && apply_candidate_transaction_locked "$@"
+)
+
+apply_candidate_transaction_locked() (
   local prepare="$1"
   shift
   umask 077
-  xray_write_lock || return 1
   local tx active=false touched=false committed=false preserve=false hop_changed=false hop_touched=false
   [[ -x "$XRAY_BIN" && -f "$XRAY_NODES" && -f "$XRAY_CONF" ]] || {
     err "installed Xray and existing configuration required"; return 1;
@@ -1226,7 +1239,7 @@ manage_node_users() {
         selected=$(pick_node_users "$n") || continue
         [[ $(jq length <<<"$selected") == 1 ]] || { warn 'select exactly one user'; continue; }
         uid=$(jq -r '.[0]' <<<"$selected")
-        if [[ "$action" == 3 ]]; then node_user_link "$n" "$uid"; pause; continue; fi
+        if [[ "$action" == 3 ]]; then node_user_link "$n" "$uid" || warn 'Share link unavailable'; pause; continue; fi
         [[ "$uid" != default ]] || { warn 'default client cannot be deleted'; continue; }
         name=$(jq -r --arg uid "$uid" '.users[] | select(.id == $uid) | .name' <<<"$n")
         confirm "Delete user $name from node $(jq -r '.name' <<<"$n")? Its credential will stop working." n || continue
@@ -1344,7 +1357,7 @@ caddy_tcp_https() {
 }
 
 caddy_domain_ensure() {
-  local domain="$1" file="$2" mode="${3:-certificate}" backup site_root record static_record occupied
+  local domain="$1" file="$2" mode="${3:-certificate}" backup site_root record static_record occupied probe
   acme_domain_valid "$domain" || return 1
   record="$CADDY_STATE/domains/$domain.json"
   static_record="$CADDY_STATE/sites/$domain.json"
@@ -1362,11 +1375,25 @@ caddy_domain_ensure() {
     fi
     return 0
   fi
-  occupied=$(caddy adapt --adapter caddyfile --config "$file" | jq -er --arg domain "$domain" '
+  probe="onevps-listener-$(openssl rand -hex 12).invalid"
+  occupied=$(cd -- "$(dirname -- "$file")" &&
+    { cat -- "$(basename -- "$file")" && printf '\n%s {\n respond 204\n}\n' "$probe"; } |
+    caddy adapt --adapter caddyfile --config - | jq -er --arg domain "$domain" --arg probe "$probe" '
     def covers($name): ascii_downcase | rtrimstr(".") | split(".") as $pattern |
       ($name | split(".")) as $labels | ($pattern | length) == ($labels | length) and
       all(range(0; $labels | length); . as $idx | $pattern[$idx] == "*" or $pattern[$idx] == $labels[$idx]);
-    any(.apps.http.servers[]?.routes[]? | recurse(.handle[]?.routes[]?) | .match[]?.host[]?; covers($domain)) | tostring') || {
+    def hosts: .routes[]? | recurse(.handle[]?.routes[]?) | .match[]?.host[]?;
+    def endpoint: capture("^(?:(?<net>tcp[46]?)/)?(?<addr>[^/]*):(?<port>[0-9]+)$");
+    def families: if .net=="tcp4" then [4] elif .net=="tcp6" then [6]
+      elif .addr=="" or .addr=="[::]" then [4,6] elif (.addr|startswith("[")) then [6] else [4] end;
+    def wildcard: . == "" or . == "0.0.0.0" or . == "[::]";
+    def overlaps($old): .port==$old.port and any(families[]; . as $family | ($old|families|index($family))!=null) and
+      (.addr==$old.addr or (.addr|wildcard) or ($old.addr|wildcard));
+    [.apps.http.servers[]?] as $servers |
+    [$servers[] | select(any(hosts; . == $probe)) | .listen[] | endpoint] as $target |
+    if ($target|length)==0 then error("unknown site listener") else
+      any($servers[] | select(any(.listen[] | endpoint; . as $old | any($target[]; overlaps($old)))) | hosts;
+        . != $probe and covers($domain)) | tostring end') || {
     err 'Cannot inspect existing Caddy routes'; return 1;
   }
   if [[ "$occupied" == true ]]; then err "unmanaged Caddy route already matches $domain"; return 1; fi
@@ -2122,7 +2149,7 @@ add_reality_node() {
   if apply_candidate_transaction prepare_reality_change "$id" add "$node"; then
     open_port "$port" tcp || { err 'Node saved; check the host firewall before connecting'; pause; return; }
     ok "Reality node added"
-    node_link "$node"
+    node_link "$node" || warn 'Node saved without displaying a share link'
   else
     err 'Reality node not added'
   fi
@@ -2140,7 +2167,8 @@ node_link() {
   link=""
 
   if [[ "$type" == "vless-reality" ]]; then
-    addr="$(pub_ip)"
+    addr=$(pub_ip) || return 1
+    [[ "$addr" != *:* ]] || addr="[$addr]"
     uuid=$(jq -r '.uuid' <<<"$n")
     sni=$(jq -r '.reality_sni' <<<"$n")
     pubk=$(jq -r '.reality_public_key' <<<"$n")
@@ -2172,7 +2200,9 @@ show_links() {
   ensure_nodes_file || return 1
   [[ "$(node_count)" -gt 0 ]] || { warn "no nodes"; pause; return; }
   local n
-  while IFS= read -r n; do node_link "$n"; done < <(jq -c '.nodes[]' "$XRAY_NODES")
+  local rows
+  rows=$(jq -c '.nodes[]' "$XRAY_NODES") || return 1
+  while IFS= read -r n; do node_link "$n" <&3 || continue; done 3<&0 <<< "$rows"
   pause
 }
 
@@ -2219,11 +2249,11 @@ manage_nodes() {
 
   while :; do
     clear
-    node_link "$n" || { pause; return; }
+    node_link "$n" || warn 'Share link unavailable; node management is still available'
     if [[ "$type" == "hysteria2" ]]; then
       printf '\nConnection settings:\n1) Change UDP port\n2) Reset default password\n3) Set UDP port hopping\n\nUsers / outbound:\n7) Manage node users\n8) Set node outbound\n\nNode status:\n5) Enable/disable node\n\nDanger zone:\n6) Delete node\n\n0) Back\n'
       case "$(ask 'Select')" in
-        1) edit_port "$id" ;;
+        1) edit_port "$id" || continue ;;
         2) reset_hy2_password "$id" ;;
         3) hopping=$(ask_hy2_hopping) || return 1
            apply_candidate_transaction prepare_hy2_change "$id" hopping "$hopping" && ok 'updated; allow advertised UDP ports in cloud firewall' || err 'port hopping unchanged'; pause ;;
@@ -2256,7 +2286,7 @@ manage_nodes() {
    0) Back
 EOF
       case "$(ask 'Select')" in
-        1) edit_port "$id" ;;
+        1) edit_port "$id" || continue ;;
         2) reset_uuid "$id" ;;
         3) rotate_reality_secret "$id" ;;
         4) edit_reality_target "$id" ;;
@@ -2273,8 +2303,22 @@ EOF
   done
 }
 
+apply_port_change() (
+  local id="$1" newp="$2" oldp proto=tcp prepare=prepare_reality_change node
+  xray_write_lock || return 1
+  node=$(node_by_id "$id") && [[ -n "$node" ]] || { err 'Node no longer exists'; return 1; }
+  oldp=$(jq -r '.port' <<<"$node") || return 1
+  if [[ $(jq -r '.type' <<<"$node") == hysteria2 ]]; then proto=udp; prepare=prepare_hy2_change; fi
+  apply_candidate_transaction_locked "$prepare" "$id" port "$newp" || { err 'port change failed'; return 1; }
+  open_port "$newp" "$proto" || { err "Node port saved as $newp/$proto; check the firewall. The old rule was not removed."; return 1; }
+  if [[ "$oldp" != "$newp" ]]; then
+    close_port "$oldp" "$proto" || { err "Node port saved as $newp/$proto; check the old firewall rule for $oldp/$proto"; return 1; }
+  fi
+  ok "port changed to $newp"
+)
+
 edit_port() {
-  local id="$1" n newp oldp proto=tcp prepare=prepare_reality_change
+  local id="$1" n newp proto=tcp
   n=$(node_by_id "$id")
   [[ $(jq -r '.type' <<<"$n") != hysteria2 ]] || proto=udp
   while :; do
@@ -2291,14 +2335,7 @@ edit_port() {
     fi
     break
   done
-  oldp=$(jq -r '.port' <<<"$n")
-  [[ "$proto" != udp ]] || prepare=prepare_hy2_change
-  if apply_candidate_transaction "$prepare" "$id" port "$newp"; then
-    if ! open_port "$newp" "$proto"; then err "Node port saved as $newp/$proto; check the firewall. The old rule was not removed."
-    elif [[ "$newp" != "$oldp" ]] && ! close_port "$oldp" "$proto"; then err "Node port saved as $newp/$proto; check the old firewall rule for $oldp/$proto"
-    else ok "port changed to $newp"; fi
-  else err 'port change failed'
-  fi
+  apply_port_change "$id" "$newp" || { pause; return 1; }
   pause
 }
 

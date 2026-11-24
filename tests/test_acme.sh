@@ -76,7 +76,10 @@ caddy_reload() { return "${RELOAD_STATUS:-0}"; }
 ADAPTED_CONFIG='{}'
 caddy() {
   [[ "$1" == adapt ]] || return 1
-  printf '%s\n' "$ADAPTED_CONFIG"
+  local probe
+  probe=$(awk '/^onevps-listener-.*\.invalid \{/ {print $1}') || return 1
+  jq --arg probe "$probe" '.apps.http.servers.web.listen=[":443"] |
+    .apps.http.servers.web.routes += [{match:[{host:[$probe]}]}]' <<<"$ADAPTED_CONFIG"
 }
 printf ':80 {\n respond "existing"\n}\n' > "$CADDYFILE"
 (
@@ -185,6 +188,9 @@ if [[ -n ${CADDY_TEST_BIN:-} ]]; then
     printf '{\n admin off\n auto_https disable_redirects\n https_port %s\n}\n' "$port" > "$CADDYFILE"
     (
       fixture="$TMP/domain-match-Caddyfile"
+      printf '{\n https_port 4443\n default_bind 127.0.0.1\n}\nalt.example.com:8443 {\n respond ok\n}\naddr.example.com:4443 {\n bind 127.0.0.2\n respond ok\n}\n' > "$fixture"
+      check 'same host on different port can coexist' caddy_domain_ensure alt.example.com "$fixture" static
+      check 'disjoint bind addresses can coexist' caddy_domain_ensure addr.example.com "$fixture" static
       printf '# live.example.com\nimport imported-sites\n' > "$fixture"
       printf 'sub.live.example.com, *.private.example.com {\n respond "live.example.com"\n}\n' > "$TMP/imported-sites"
       reject 'imported exact site name blocks setup' caddy_domain_ensure sub.live.example.com "$fixture" static

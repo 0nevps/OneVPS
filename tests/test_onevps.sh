@@ -219,6 +219,15 @@ assert_jq "enables Vision and route-only sniffing" "$reality_inbound" \
 # shellcheck disable=SC2034
 PUBIP="203.0.113.10"
 reality_link_output=$(node_link "$reality_node")
+(
+  export PUBIP=''; curl() { printf '<html>unavailable</html>'; }
+  if node_link "$reality_node" </dev/null > "$TEST_TMP/no-address" 2>/dev/null; then exit 1; fi
+  [[ ! -s "$TEST_TMP/no-address" ]] || exit 1
+  curl() { if [[ "${!#}" == *ifconfig.me ]]; then echo 203.0.113.42; else echo unavailable; fi; }
+  [[ $(node_link "$reality_node") == *'@203.0.113.42:443?'* ]] || exit 1
+  PUBIP='2001:db8::1'; [[ $(node_link "$reality_node") == *'@[2001:db8::1]:443?'* ]]
+) || fail 'Reality suppresses invalid links and validates fallback addresses'
+pass 'Reality suppresses invalid links and validates fallback addresses'
 assert_contains "builds a complete VLESS share link" "$reality_link_output" \
   "vless://123e4567-e89b-12d3-a456-426614174000@203.0.113.10:443?"
 assert_contains "encodes VLESS path and display name" "$reality_link_output" \
@@ -462,7 +471,10 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
 (
   pause() { :; }; confirm() { return 0; }; port_in_use() { return 1; }; ask() { echo 20001; }
   TEST_TMP="$TEST_TMP/reality-lifecycle"; mkdir "$TEST_TMP" || exit 1
-  open_port() { printf 'open %s %s\n' "$@" >> "$TEST_TMP/fw"; }
+  open_port() {
+    if flock -n "${XRAY_DIR}.lock" -c true; then return 1; fi
+    printf 'open %s %s\n' "$@" >> "$TEST_TMP/fw"; return "${OPEN_STATUS:-0}"
+  }
   close_port() { printf 'close %s %s\n' "$@" >> "$TEST_TMP/fw"; }
   cp "$XRAY_NODES" "$TEST_TMP/reality-before"; cp "$XRAY_CONF" "$TEST_TMP/config-before"
   for failure in validation restart; do
@@ -476,6 +488,14 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
     done
   done
   MOCK_VALIDATE_FAIL=false; MOCK_SERVICE_MODE=ok
+  ask() { (ask() { echo 8443; }; edit_port a1b2c3d4) >&2; echo 9443; }
+  edit_port a1b2c3d4 || exit 1
+  [[ $(cat "$TEST_TMP/fw") == $'open 8443 tcp\nclose 443 tcp\nopen 9443 tcp\nclose 8443 tcp' ]] || exit 1
+  : > "$TEST_TMP/fw"
+  if OPEN_STATUS=1 apply_port_change a1b2c3d4 9444; then exit 1; fi
+  [[ $(cat "$TEST_TMP/fw") == 'open 9444 tcp' ]] || exit 1
+  ask() { echo 443; }; edit_port a1b2c3d4 || exit 1
+  : > "$TEST_TMP/fw"; ask() { echo 20001; }
   edit_port a1b2c3d4
   [[ $(cat "$TEST_TMP/fw") == $'open 20001 tcp\nclose 443 tcp' ]] || exit 1
   del_node a1b2c3d4
@@ -483,6 +503,7 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
   jq -e 'all(.nodes[]; .id!="a1b2c3d4")' "$XRAY_NODES" >/dev/null || exit 1
   jq '.nodes |= map(select(.type=="hysteria2") | .port=443)' "$FIXTURE" > "$XRAY_NODES"
   render_config "$XRAY_NODES" "$XRAY_CONF" || exit 1
+  open_port() { printf 'open %s %s\n' "$@" >> "$TEST_TMP/fw"; }
   ask() { case "$1" in 'Node name') echo mixed ;; 'Listen port') echo "$2" ;; *) return 1 ;; esac; }
   ask_uuid() { echo '123e4567-e89b-12d3-a456-426614174099'; }; pick_reality_target() { echo example.org; }
   gen_x25519() { echo 'fixture-private fixture-public'; }; pub_ip() { echo 192.0.2.20; }
