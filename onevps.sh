@@ -2755,21 +2755,27 @@ realm_apply() {
   return 1
 }
 
-realm_add() {
+realm_write_lock() {
+  command -v flock >/dev/null || { err 'Realm changes require flock (util-linux)'; return 1; }
+  mkdir -p "$(dirname "$REALM_DIR")" && exec 8>>"${REALM_DIR}.lock" && flock -x 8
+}
+
+realm_add() (
   local port host remote_port mode endpoint candidate sockets
   port=$(ask 'Local listening port')
   host=$(ask 'Destination IP or hostname (IPv6 without brackets)')
   remote_port=$(ask 'Destination port')
   mode=$(ask 'Protocol: tcp or both (TCP+UDP)' tcp)
   endpoint=$(realm_endpoint "$port" "$host" "$remote_port" "$mode") || { err "invalid relay input"; return 1; }
+  warn "relay listens on all IPv4 interfaces; it adds no authentication or encryption"
+  confirm "Forward port $port to $host:$remote_port ($mode)?" || return 0
+  realm_write_lock || return 1
   if [[ "$mode" == both ]] && port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; fi
   command -v ss >/dev/null 2>&1 || { err "ss is required to check listening ports; install iproute2/iproute"; return 1; }
   sockets=$(ss -H -lntu) || { err "cannot inspect listening ports"; return 1; }
   if socket_list_has_port "$port" <<<"$sockets"; then
     err "port $port is already in use"; return 1
   fi
-  warn "relay listens on all IPv4 interfaces; it adds no authentication or encryption"
-  confirm "Forward port $port to $host:$remote_port ($mode)?" || return 0
   realm_install || return 1
   if jq -e --arg listen "0.0.0.0:$port" 'any(.endpoints[]; .listen == $listen)' "$REALM_DIR/config.json" >/dev/null; then
     err "a rule already uses this port"; return 1
@@ -2781,39 +2787,46 @@ realm_add() {
   else
     rm -f "$candidate"; return 1
   fi
-}
+)
 
 realm_list() {
   jq -r '.endpoints | to_entries[] | "\(.key + 1)) \(.value.listen) -> \(.value.remote) [\(if .value.network.use_udp then "TCP+UDP" else "TCP" end)]"' \
-    "$REALM_DIR/config.json"
+    "${1:-$REALM_DIR/config.json}"
 }
 
-realm_delete() {
-  local index count candidate
-  realm_list
-  count=$(jq '.endpoints | length' "$REALM_DIR/config.json")
+realm_delete() (
+  local index count candidate snapshot selected
+  snapshot=$(jq -cse 'select(length==1) | .[0] | select(.endpoints | type=="array")' "$REALM_DIR/config.json") || return 1
+  realm_list /dev/stdin <<<"$snapshot" || return 1
+  count=$(jq '.endpoints | length' <<<"$snapshot") || return 1
   index=$(ask 'Rule number to delete (empty cancels)')
   [[ -n "$index" ]] || return 0
   valid_menu_index "$index" "$count" || { err "invalid rule number"; return 1; }
-  confirm "Delete rule $index?" || return 0
+  selected=$(jq -ce --argjson index "$((index - 1))" '.endpoints[$index]' <<<"$snapshot") || return 1
+  confirm "Delete $(jq -r '.listen + " -> " + .remote' <<<"$selected")?" || return 0
+  realm_write_lock && realm_owned || return 1
   candidate=$(mktemp "$REALM_DIR/.candidate.XXXXXX") || return 1
-  if jq --argjson index "$((index - 1))" 'del(.endpoints[$index])' "$REALM_DIR/config.json" > "$candidate" &&
+  if jq --argjson selected "$selected" '
+      [.endpoints | to_entries[] | select(.value==$selected) | .key] as $matches |
+      if ($matches|length)==1 then del(.endpoints[$matches[0]]) else error("relay rule changed; select it again") end' \
+      "$REALM_DIR/config.json" > "$candidate" &&
      realm_apply "$candidate"; then
     ok "rule removed"
   else
     rm -f "$candidate"; return 1
   fi
-}
+)
 
-realm_uninstall() {
+realm_uninstall() (
   realm_owned || { err "refusing to remove unmanaged realm installation"; return 1; }
   confirm 'Remove OneVPS realm and all its relay rules?' || return 0
+  realm_write_lock && realm_owned || return 1
   systemctl stop onevps-realm && systemctl disable onevps-realm || return 1
   rm -f "$REALM_BIN" "$REALM_SERVICE"
   rm -rf "$REALM_DIR"
   systemctl daemon-reload
   ok "realm removed; firewall rules were not changed"
-}
+)
 
 realm_menu() {
   ensure_deps

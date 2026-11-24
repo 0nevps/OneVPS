@@ -424,6 +424,26 @@ printf 'invalid json\n' > "$candidate"
 assert_false "realm rejects malformed candidate" realm_apply "$candidate"
 assert_eq "malformed candidate leaves config intact" "$before" "$(cat "$REALM_DIR/config.json")"
 
+(
+  cp "$REALM_DIR/config.json" "$TEST_TMP/saved-relays"
+  confirm() { return 0; }
+  for selection in 1 2; do
+    jq -n --argjson first "$endpoint" --argjson second "$second" '{endpoints:[$first,$second]}' > "$REALM_DIR/config.json"
+    ask() {
+      jq -n --argjson remaining "$second" '{endpoints:[$remaining]}' > "$REALM_DIR/config.json" || return 1
+      echo "$selection"
+    }
+    if [[ "$selection" == 1 ]]; then
+      if realm_delete; then exit 1; fi
+      jq -e --argjson remaining "$second" '.endpoints==[$remaining]' "$REALM_DIR/config.json" >/dev/null || exit 1
+    else
+      realm_delete && jq -e '.endpoints==[]' "$REALM_DIR/config.json" >/dev/null || exit 1
+    fi
+  done
+  cp "$TEST_TMP/saved-relays" "$REALM_DIR/config.json"
+) || fail 'Realm deletion checks the selected rule against the current configuration'
+pass 'Realm deletion checks the selected rule against the current configuration'
+
 cp "$FIXTURE" "$XRAY_NODES"
 node_candidate="$TEST_TMP/node-candidate.json"
 assert_true "render default node configuration" render_config "$XRAY_NODES" "$TEST_TMP/rendered.json"
