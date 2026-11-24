@@ -182,6 +182,7 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
   validate_hy2_certificate() { return 0; }
   ss() { :; }
   runuser() { :; }
+  jq() { printf '%s\n' "$@" >> "$TEST_TMP/hy2-jq-argv"; command jq "$@"; }
   ask() {
     case "$1" in
       'Node name') printf 'Created from menu\n' ;;
@@ -195,6 +196,8 @@ reject 'duplicate HY2 port rejected' prepare_hy2_change "$XRAY_NODES" "$TEST_TMP
   check 'creation flow integrates storage, service and UDP firewall' add_hysteria_node
   check 'created HY2 retained alongside existing node' jq -e '.nodes | length == 2' "$XRAY_NODES"
   check 'creation opens UDP only' grep -qx 'open 24445 udp' "$TEST_TMP/firewall"
+  reject 'created password never enters jq argv' grep -Fq 'new-menu-password' "$TEST_TMP/hy2-jq-argv"
+  reject 'existing user password never enters jq argv' grep -Fq 'alice-secret' "$TEST_TMP/hy2-jq-argv"
   cp "$TEST_TMP/before.json" "$XRAY_NODES"
   caddy_certificate_issue() { printf '%s\n' "$1" > "$TEST_TMP/acme-domain"; }
   ask() {

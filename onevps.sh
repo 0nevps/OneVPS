@@ -193,7 +193,7 @@ installed_version() {
   "$XRAY_BIN" version 2>/dev/null | awk '/^Xray / && !seen {print $2; seen=1}'
 }
 
-urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
+urlenc() { printf '%s' "$1" | jq -Rrs '@uri'; }
 
 normalize_domain() {
   local d="$1"
@@ -1991,14 +1991,14 @@ ask_hy2_hopping() {
 build_hysteria_inbound() {
   local n="$1" users
   users=$(node_clients "$n") || return 1
-  jq -c --argjson users "$users" '{
+  printf '%s\n%s\n' "$n" "$users" | jq -sc '.[0] as $node | .[1] as $users | $node | {
     tag,listen:"0.0.0.0",port,protocol:"hysteria",
     settings:{version:2,users:$users},
     streamSettings:{network:"hysteria",security:"tls",
       tlsSettings:{serverName:.domain,alpn:["h3"],certificates:[{
         usage:"encipherment",certificateFile:.tls_cert,keyFile:.tls_key}]},
       hysteriaSettings:{version:2}}
-  }' <<<"$n"
+  }'
 }
 
 # HY2 mutations use the existing validated configuration/service transaction.
@@ -2008,7 +2008,7 @@ prepare_hy2_change() {
   if [[ "$action" == add ]]; then
     jq -e --arg id "$id" 'all(.nodes[]; .id != $id)' "$source" >/dev/null || return 1
     jq -e --arg id "$id" '.id == $id and .type == "hysteria2"' <<<"$value" >/dev/null || return 1
-    jq --argjson node "$value" '.nodes += [$node]' "$source" > "$output" || return 1
+    printf '%s\n' "$value" | jq --slurpfile source "$source" '. as $node | $source[0] | .nodes += [$node]' > "$output" || return 1
   else
     jq -e --arg id "$id" 'any(.nodes[]; .id == $id and .type == "hysteria2")' "$source" >/dev/null || return 1
     case "$action" in
@@ -2058,9 +2058,9 @@ add_hysteria_node() {
   hopping=$(ask_hy2_hopping) || return 1
   password=$(ask 'Password (Enter for random)' "$(rand_password)")
   id=$(openssl rand -hex 4)
-  node=$(jq -nc --arg id "$id" --arg name "$name" --arg domain "$domain" \
-    --arg password "$password" --arg cert "$cert" --arg key "$key" --argjson port "$port" --argjson hopping "$hopping" \
-    '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:$password,
+  node=$(printf '%s\n' "$password" | jq -Rc --arg id "$id" --arg name "$name" --arg domain "$domain" \
+    --arg cert "$cert" --arg key "$key" --argjson port "$port" --argjson hopping "$hopping" \
+    '{id:$id,name:$name,tag:("hy2-"+$id),type:"hysteria2",domain:$domain,password:.,
       port:$port,tls_cert:$cert,tls_key:$key,enabled:true} +
       (if $hopping == null then {} else {hopping:$hopping} end)') || return 1
   if apply_node_add "$node"; then
