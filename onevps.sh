@@ -2542,20 +2542,30 @@ restart_service() {
 uninstall() (
   warn "Uninstall removes Xray binary, config, onevps nodes and logs"
   warn "(BBR/system tuning configs and the swap file are kept)"
-  confirm "Confirm uninstall?" n || return
+  confirm "Confirm uninstall?" n || return 0
   xray_write_lock || return 1
+  local load_state active_state
+  load_state=$(systemctl show -p LoadState --value xray) || { err 'Cannot inspect the Xray service; uninstall cancelled'; return 1; }
+  [[ -n "$load_state" ]] || { err 'Unknown Xray service state; uninstall cancelled'; return 1; }
+  if [[ "$load_state" != not-found ]]; then
+    if ! systemctl stop xray || ! active_state=$(systemctl show -p ActiveState --value xray) ||
+       [[ "$active_state" != inactive && "$active_state" != failed ]]; then
+      err 'Cannot confirm Xray stopped; uninstall cancelled'; return 1
+    fi
+    systemctl disable xray || { err 'Cannot disable Xray; uninstall cancelled'; return 1; }
+  fi
+  if [[ -f "$ACME_UNIT_DIR/onevps-caddy-sync.timer" ]]; then
+    systemctl disable --now onevps-caddy-sync.timer || { err 'Cannot disable certificate sync; uninstall cancelled'; return 1; }
+  fi
   if [[ -e "$HY2_HOP_DIR" || -e "$HY2_HOP_UNIT" ]]; then
     hy2_hop_apply /dev/null || { err 'cannot remove managed hopping rules; uninstall cancelled'; return 1; }
   fi
-  systemctl disable --now onevps-caddy-sync.timer 2>/dev/null || true
   warn 'Caddy domain sites and certificates are retained; certificate sync to Xray is disabled.'
-  systemctl stop xray 2>/dev/null || true
-  systemctl disable xray 2>/dev/null || true
-  rm -f "$XRAY_SERVICE" /etc/systemd/system/xray@.service
-  rm -rf /etc/systemd/system/xray.service.d
-  systemctl daemon-reload
-  rm -f "$XRAY_BIN"
-  rm -rf "$XRAY_DIR" /usr/local/share/xray /var/log/xray
+  rm -f "$XRAY_SERVICE" /etc/systemd/system/xray@.service &&
+    rm -rf /etc/systemd/system/xray.service.d && systemctl daemon-reload &&
+    rm -f "$XRAY_BIN" && rm -rf "$XRAY_DIR" /usr/local/share/xray /var/log/xray || {
+    err 'Xray cleanup did not finish; check the error and retry uninstall'; return 1;
+  }
   ok "uninstalled"
   pause
 )
@@ -2974,7 +2984,7 @@ EOF
       4) realm_menu ;;
       5) network_menu ;;
       6) if update_script; then return 0; else pause; fi ;;
-      9) uninstall ;;
+      9) uninstall || pause ;;
       0|"") exit 0 ;;
       *) warn 'invalid selection' ;;
     esac

@@ -501,6 +501,27 @@ printf 'active\n' > "$SERVICE_STATE"
   [[ $(wc -l < "$TEST_TMP/menu-restarts") -eq 3 ]]
 ) || fail 'restart action restarts once and propagates service failures'
 pass 'restart action restarts once and propagates service failures'
+(
+  xray_write_lock() { :; }; confirm() { :; }; pause() { :; }
+  HY2_HOP_DIR="$TEST_TMP/hop-present"; mkdir "$HY2_HOP_DIR" || exit 1
+  hy2_hop_apply() { echo hopping >> "$TEST_TMP/uninstall-steps"; }
+  rm() { echo remove >> "$TEST_TMP/uninstall-steps"; }
+  systemctl() {
+    case "$1" in
+      show) if [[ "$3" == LoadState ]]; then echo "$mock_load_state"; else echo "$mock_active_state"; fi ;;
+      stop) return "$stop_status" ;;
+      *) return 0 ;;
+    esac
+  }
+  mock_load_state=loaded; stop_status=1
+  if uninstall > "$TEST_TMP/uninstall-output" 2>&1; then exit 1; fi
+  [[ ! -e "$TEST_TMP/uninstall-steps" ]] && ! grep -q 'uninstalled' "$TEST_TMP/uninstall-output" || exit 1
+  stop_status=0; mock_active_state=active
+  if uninstall >/dev/null 2>&1 || [[ -e "$TEST_TMP/uninstall-steps" ]]; then exit 1; fi
+  mock_active_state=inactive; uninstall >/dev/null || exit 1
+  grep -qx remove "$TEST_TMP/uninstall-steps"
+) || fail 'uninstall preserves files and hopping rules when Xray cannot stop'
+pass 'uninstall preserves files and hopping rules when Xray cannot stop'
 MOCK_SERVICE_MODE=ok
 systemctl() {
   case "$1" in
