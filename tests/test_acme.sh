@@ -209,6 +209,15 @@ check 'runner parses' bash -n "$CADDY_SYNC_RUNNER"
 if [[ -n ${CADDY_TEST_BIN:-} ]]; then
   (
     caddy() { "$CADDY_TEST_BIN" "$@"; }
+    (
+      confirm() { return 0; }
+      mkdir "$TMP/import-test"
+      printf 'import child.caddy\n' > "$TMP/import-test/Caddyfile"
+      printf 'import.example.org {\n respond ok\n}\n' > "$TMP/import-test/child.caddy"
+      check 'reserve HY2 UDP port with relative Caddy imports' caddy_tcp_https "$TMP/import-test/Caddyfile"
+      caddy adapt --adapter caddyfile --config "$TMP/import-test/Caddyfile" | jq -e \
+        'any(.apps.http.servers[]; .protocols==["h1","h2"] and any(.routes[].match[]?.host[]?; .=="import.example.org"))' >/dev/null
+    )
     CADDYFILE="$TMP/https-Caddyfile"
     port=$(python3 -c 'import socket; sock=socket.socket(); sock.bind(("127.0.0.1",0)); print(sock.getsockname()[1])')
     printf '{\n admin off\n auto_https disable_redirects\n https_port %s\n}\n' "$port" > "$CADDYFILE"

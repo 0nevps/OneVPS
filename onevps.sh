@@ -1354,10 +1354,11 @@ caddy_tcp_https() {
     {print}
     END {if (!seen) {print "{"; settings(); print "}"}}
   ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-  if ! caddy adapt --adapter caddyfile --config "$tmp" >/dev/null 2>&1; then
+  if ! (cd -- "$(dirname -- "$file")" && caddy adapt --adapter caddyfile --config -) < "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"; err 'existing Caddy global options conflict; configuration was not changed'; return 1
   fi
-  cat "$tmp" > "$file"; rm -f "$tmp"
+  cat "$tmp" > "$file" || { rm -f "$tmp"; err 'cannot write Caddy HTTPS settings'; return 1; }
+  rm -f "$tmp"
 }
 
 caddy_domain_ensure() {
