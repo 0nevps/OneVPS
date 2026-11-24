@@ -1715,7 +1715,10 @@ acme_deploy() (
         ln -s "$previous" "$version/rollback" && mv -Tf "$version/rollback" "$dir/current" || failed=true
       else rm -f "$dir/current" || failed=true; fi
       if $active; then systemctl restart xray && systemctl is-active --quiet xray || failed=true; fi
-      if $failed; then err "certificate rollback failed; retained $version"; exit 1; fi
+      if $failed; then
+        touch "$version/.recovery-required" || err "Cannot mark certificate recovery directory: $version"
+        err "certificate rollback failed; retained $version"; exit 1
+      fi
     fi
     if ! $committed; then rm -rf "$version"; fi
     exit "$status"
@@ -1747,6 +1750,7 @@ acme_deploy() (
   local old
   for old in "$dir/"cert.*; do
     [[ -d "$old" && ! -L "$old" && "$old" != "$version" && "$(basename "$old")" != "$previous" ]] || continue
+    [[ ! -e "$old/.recovery-required" && ! -L "$old/rollback" ]] || continue
     rm -rf "$old"
   done
   ok "certificate deployed: $domain"

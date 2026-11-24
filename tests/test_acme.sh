@@ -73,6 +73,29 @@ systemctl() { return 0; }
 validate_xray_config() { return 1; }
 reject 'invalid Xray config rolls certificate back' acme_deploy example.com
 check 'previous pair retained after validation failure' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
+(
+  mv() {
+    if [[ "$2" == */rollback ]]; then return 1; fi
+    if [[ $(uname -s) == Darwin && "$1" == -Tf ]]; then
+      python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' "$2" "$3"
+    else command mv "$@"; fi
+  }
+  reject 'certificate rollback replacement failure is reported' acme_deploy example.com
+  recovery=$(readlink "$ACME_CERT_DIR/example.com/current")
+  [[ -d "$ACME_CERT_DIR/example.com/$recovery" ]] || exit 1
+  unlink "$ACME_CERT_DIR/example.com/current"
+  ln -s "$previous" "$ACME_CERT_DIR/example.com/current"
+  mv() {
+    if [[ $(uname -s) == Darwin && "$1" == -Tf ]]; then
+      python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' "$2" "$3"
+    else command mv "$@"; fi
+  }
+  validate_xray_config() { return 0; }
+  check 'retry certificate deployment succeeds' acme_deploy example.com
+  check 'successful retry preserves failed rollback recovery files' test -d "$ACME_CERT_DIR/example.com/$recovery"
+  unlink "$ACME_CERT_DIR/example.com/current"
+  ln -s "$previous" "$ACME_CERT_DIR/example.com/current"
+)
 validate_xray_config() { ! flock -n "${XRAY_DIR}.lock" -c true; }
 check 'renewal deploys new pair' acme_deploy example.com
 reject 'new certificate becomes current' test "$previous" = "$(readlink "$ACME_CERT_DIR/example.com/current")"
