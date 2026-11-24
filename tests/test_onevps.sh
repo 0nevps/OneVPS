@@ -276,6 +276,12 @@ assert_true 'node creation menu lists only Reality and HY2' bash -c '
 ' _ "$ROOT_DIR/onevps.sh" "$XRAY_NODES"
 
 assert_true "realm accepts maximum port" realm_valid_port 65535
+(
+  ss() { awk 'BEGIN {print "LISTEN 0 128 *:443 *:*"; for (idx=0;idx<20000;idx++) print "LISTEN 0 128 *:1443 *:*"}'; }
+  port_in_use 443 tcp && ! port_in_use 80 tcp &&
+    socket_list_has_port 443 <<< 'udp UNCONN 0 0 [::]:443 [::]:*'
+) || fail 'listener detection consumes large ss listings and matches local ports exactly'
+pass 'listener detection consumes large ss listings and matches local ports exactly'
 for port in 0 65536 080 -1 '22;id' ''; do
   assert_false "realm rejects invalid port '$port'" realm_valid_port "$port"
 done

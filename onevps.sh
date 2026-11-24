@@ -360,10 +360,14 @@ port_in_use() {
   [[ "$proto" != udp ]] || flags=-unl
   [[ "$proto" != tcp ]] || flags=-tnl
   if command -v ss >/dev/null 2>&1; then
-    ss "$flags" 2>/dev/null | awk '{print $(NF-1)}' | grep -qE ":$p$"
+    ss "$flags" 2>/dev/null | socket_list_has_port "$p"
   else
     return 1
   fi
+}
+
+socket_list_has_port() {
+  awk -v port="$1" 'NF >= 2 && $(NF-1) ~ (":" port "$") {found=1} END {exit !found}'
 }
 
 port_taken_by_node() {
@@ -2745,7 +2749,7 @@ realm_add() {
   if [[ "$mode" == both ]] && port_taken_by_node "$port" udp; then err 'UDP port reserved by Xray'; return 1; fi
   command -v ss >/dev/null 2>&1 || { err "ss is required to check listening ports; install iproute2/iproute"; return 1; }
   sockets=$(ss -H -lntu) || { err "cannot inspect listening ports"; return 1; }
-  if awk '{print $5}' <<<"$sockets" | grep -qE ":$port$"; then
+  if socket_list_has_port "$port" <<<"$sockets"; then
     err "port $port is already in use"; return 1
   fi
   warn "relay listens on all IPv4 interfaces; it adds no authentication or encryption"
