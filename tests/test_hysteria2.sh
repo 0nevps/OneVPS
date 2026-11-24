@@ -129,6 +129,19 @@ systemctl() { return 0; }
   check 'install persistent forwarding' apply_candidate_transaction prepare_hy2_change hy2 hopping "$hop"
   check 'scoped local IPv4 forwarding' grep -Fq 'iifname "eth0" fib daddr type local udp dport { 21000,22000-22002 } counter redirect to :24443' "$HY2_HOP_DIR/rules.nft"
   check 'service restores rules on boot' grep -Fq "$HY2_HOP_DIR/rules.nft" "$HY2_HOP_UNIT"
+  (
+    mv "$HY2_HOP_DIR/rules.nft" "$TEST_TMP/saved-hop-rules"
+    mkdir "$HY2_HOP_DIR/rules.nft"
+    reject 'directory cannot replace persistent hopping rules' apply_candidate_transaction prepare_hy2_change hy2 port 24444
+    check 'invalid rules path preserves listening port' jq -e '.nodes[0].port==24443' "$XRAY_NODES"
+    rmdir "$HY2_HOP_DIR/rules.nft"
+    mv "$TEST_TMP/saved-hop-rules" "$HY2_HOP_DIR/rules.nft"
+    printf 'external data\n' > "$TEST_TMP/external-rules"
+    ln -s "$TEST_TMP/external-rules" "$HY2_HOP_DIR/rules.next"
+    reject 'symlink cannot receive staged hopping rules' apply_candidate_transaction prepare_hy2_change hy2 port 24444
+    check 'external symlink target not modified' grep -Fxq 'external data' "$TEST_TMP/external-rules"
+    unlink "$HY2_HOP_DIR/rules.next"
+  )
   touch "$TEST_TMP/fail-nft"
   reject 'nft failure rolls back changed listener' apply_candidate_transaction prepare_hy2_change hy2 port 24444
   check 'previous listener restored' jq -e '.nodes[0].port==24443' "$XRAY_NODES"

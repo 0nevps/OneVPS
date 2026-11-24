@@ -1873,6 +1873,12 @@ hy2_hop_owned() {
     { [[ ! -e "$HY2_HOP_UNIT" ]] || grep -qxF '# Managed by OneVPS HY2' "$HY2_HOP_UNIT"; } || {
     err 'refusing to overwrite unmanaged HY2 hopping files'; return 1;
   }
+  local path
+  for path in "$HY2_HOP_DIR/.onevps-managed" "$HY2_HOP_DIR/rules.nft" "$HY2_HOP_DIR/rules.next" "$HY2_HOP_UNIT"; do
+    if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+      err "Unsupported HY2 hopping file type: $path"; return 1
+    fi
+  done
 }
 
 hy2_hop_table_delete_rule() {
