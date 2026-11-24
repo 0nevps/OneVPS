@@ -2251,7 +2251,7 @@ manage_nodes() {
         3) hopping=$(ask_hy2_hopping) || return 1
            apply_candidate_transaction prepare_hy2_change "$id" hopping "$hopping" && ok 'updated; allow advertised UDP ports in cloud firewall' || err 'port hopping unchanged'; pause ;;
         5) toggle_enabled "$id" ;;
-        6) del_node "$id"; return ;;
+        6) del_node "$id" || true; return 0 ;;
         7) manage_node_users "$id" || true ;;
         8) manage_outbound "$id" || true ;;
         0|"") return ;;
@@ -2284,7 +2284,7 @@ EOF
         3) rotate_reality_secret "$id" ;;
         4) edit_reality_target "$id" ;;
         5) toggle_enabled "$id" ;;
-        6) del_node "$id"; return ;;
+        6) del_node "$id" || true; return 0 ;;
         7) manage_node_users "$id" || true ;;
         8) manage_outbound "$id" || true ;;
         0|"") return ;;
@@ -2382,8 +2382,9 @@ toggle_enabled() {
 }
 
 del_node() {
-  confirm "Delete this node?" n || return
-  apply_node_delete "$1" && ok 'deleted'
+  confirm "Delete this node?" n || return 0
+  apply_node_delete "$1" || { pause; return 1; }
+  ok 'deleted'
   pause
 }
 

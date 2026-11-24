@@ -485,7 +485,7 @@ pass 'concurrent writers preserve both assignments in metadata and runtime confi
       if [[ "$failure" == validation ]]; then MOCK_VALIDATE_FAIL=true; else
         MOCK_VALIDATE_FAIL=false; MOCK_SERVICE_MODE=once; rm -f "$TEST_TMP/restart-failed"
       fi
-      "$operation" a1b2c3d4 > "$TEST_TMP/reality-error" 2>&1
+      if "$operation" a1b2c3d4 > "$TEST_TMP/reality-error" 2>&1; then exit 1; fi
       grep -q 'failed' "$TEST_TMP/reality-error" && cmp "$TEST_TMP/reality-before" "$XRAY_NODES" &&
         cmp "$TEST_TMP/config-before" "$XRAY_CONF" && [[ ! -e "$TEST_TMP/fw" ]] || exit 1
     done
